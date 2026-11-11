@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goethe-engine"
+version = "0.1.0"
+description = "Token-level LLM serving core: scheduling, KV blocks, prefix cache, sampling, speculative rounds"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+serve = ["transformers"]
+grammar = ["xgrammar"]
+test = ["pytest"]
+
+[project.scripts]
+goethe-engine = "goethe_engine.cli:main"
+
+[tool.setuptools]
+packages = ["goethe_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: needs a GPU box and a real pack"]
