@@ -17,7 +17,7 @@ def test_loader_is_the_pinned_abi():
 def test_caps_and_numerics_of_a_bucket(toy, key):
     m = P.verify(toy[0], trusted=(key.kid,))
     b = P.select(m, sku="mock", B=8)
-    assert numerics_of(m, b) == dict(contract="BI", bodies={}, desc=None)
+    assert numerics_of(m, b) == dict(contract="K1", bodies={}, desc=None)
     assert caps_of_bucket(b)["tree"] and caps_of_bucket(b)["taps"] == {"result_norm": 4}
 
 
@@ -205,3 +205,15 @@ def test_pinned_key_is_the_release_key():
     pem = ("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcvBeilUyHdQbvn9eHVjUZkn0Og4n\n"
            "QvHAoaZr1KzcHGsBptYLZktabraS2V1K6eC6lDlagNe/6mOmPCcYLkK4kg==\n-----END PUBLIC KEY-----\n")
     assert sign.key_id(pem.encode()) in sign.TRUSTED_KEY_IDS
+
+
+def test_contract_and_body_labels_are_opaque():
+    def bk(i, c, **kw):
+        return dict(id=i, role="target", sku="s", contract=c, ncol=1, batch=False, maxctx=8, bodies=kw.get("bodies"))
+    m = dict(contracts=["Zq", "Yp"], runtime=dict(kind="gc-c", version=1), buckets=[bk("a", "Yp"), bk("b", "Zq", bodies={"f": "w9"})],
+             contract_desc={"Zq": "text"})
+    b = P.select(m, sku="s")
+    assert b["id"] == "b"                                    # default = first label the pack lists, any string
+    assert P.select(m, sku="s", contract="Yp")["id"] == "a"  # exact-string match
+    assert numerics_of(m, b) == dict(contract="Zq", bodies={"f": "w9"}, desc="text")
+    assert P.usable(m, b) == ""

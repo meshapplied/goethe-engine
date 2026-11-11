@@ -22,10 +22,8 @@ SCHEMA = "gc-pack"
 RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
 MAX_JSON = 16 << 20                 # bytes: larger manifests are refused before parsing
 ROLES = ("target", "drafter")
-CONTRACTS = ("BIH", "BI", "E0")    # preference order: the default is the first one a pack has
 POLICIES = {"ar": ("K",), "walk": ("gate", "succ", "pred", "feats"),   # speculative round kinds and their fields
             "mtp": ("K", "feats", "tap", "own", "w_in", "w_own")}
-BODIES = {"q8_0": ("a8", "a16")}   # buckets[].bodies (1.1): per weight format, the body a BIH bucket runs
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -259,7 +257,7 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
         need(dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"]),
              f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}")
     need(sku is not None, "no SKU: pass a device or a SKU")
-    c = contract or next((x for x in m["contracts"] if x in CONTRACTS), None)
+    c = contract or next(iter(m["contracts"]), None)   # opaque labels: the pack lists its preference order
     skip = {b["id"]: usable(m, b) for b in m["buckets"] if usable(m, b)}
     cand = [b for b in m["buckets"] if b["sku"] == sku and b["contract"] == c and b["role"] == role
             and b["id"] not in skip
@@ -272,14 +270,14 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
 
 
 def usable(m, b):
-    """Why this loader cannot run bucket b ("" if it can): an enum value it does not know."""
+    """Why this loader cannot run bucket b ("" if it can): a runtime or role it does not know. Contract and body labels
+    are opaque strings the pack declares: matched by exact string, never enumerated here."""
     rt = b.get("runtime") or m["runtime"]
     if rt.get("kind") not in RUNTIMES or rt.get("version") not in RUNTIMES[rt.get("kind")]:
         return f"runtime {rt.get('kind')} {rt.get('version')}"
-    if b["role"] not in ROLES or b["contract"] not in CONTRACTS:
-        return f"role / contract {b['role']} / {b['contract']}"
-    bad = {f: v for f, v in (b.get("bodies") or {}).items() if v not in BODIES.get(f, ())}
-    return f"bodies {bad}" if bad else ""
+    if b["role"] not in ROLES:
+        return f"role {b['role']}"
+    return ""
 
 
 def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):

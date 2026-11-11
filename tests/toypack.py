@@ -55,16 +55,16 @@ def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="1.1.0", arch="sm_1
                 recurrent_commit=[], accept=[], drafter_roles=[])
 
     def bucket(i, role, nc, batch=True, io=None):
-        return dict(id=i, role=role, sku="mock", contract="BI", ncol=nc, batch=batch, maxctx=256, weights=int(role == "drafter"),
+        return dict(id=i, role=role, sku="mock", contract="K1", ncol=nc, batch=batch, maxctx=256, weights=int(role == "drafter"),
                     spec_caps=caps, files=files, lib="libgck.so", plan="plan.json", io=io, tune={}, requires=req,
                     variant_of=None, klass=None, variants=[])
-    bs = [bucket("target.mock.BI.2.256", "target", 2), bucket("target.mock.BI.8.256", "target", 8)]
+    bs = [bucket("target.mock.K1.2.256", "target", 2), bucket("target.mock.K1.8.256", "target", 8)]
     sp = []
     if spec:
-        bs = [bucket("target.mock.BI.4v.256", "target", 4, False, dict(accept=True)), bucket("drafter.mock.BI.1.256", "drafter", 1)]
+        bs = [bucket("target.mock.K1.4v.256", "target", 4, False, dict(accept=True)), bucket("drafter.mock.K1.1.256", "drafter", 1)]
         sp = [dict(target=bs[0]["id"], drafter=bs[1]["id"], policy=dict(kind="ar", K="3"))]
     m = dict(schema="gc-pack", abi=abi, compiler=dict(commit="0" * 40, dirty=False), arch=arch, cuda="12.8",
-             hw=dict(mock="0" * 64), runtime=dict(kind=runtime, version=1), contracts=["BI"], buckets=bs, spec=sp,
+             hw=dict(mock="0" * 64), runtime=dict(kind=runtime, version=1), contracts=["K1"], buckets=bs, spec=sp,
              model=dict(key="t", stage="t", graph_sha256="0" * 64, weights=[
                  dict(file="w.gguf", bytes=8, sha256=hashlib.sha256(b"weights0").hexdigest()),
                  dict(file="d.gguf", bytes=8, sha256=hashlib.sha256(b"drafter0").hexdigest())]))

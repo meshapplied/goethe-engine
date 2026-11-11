@@ -16,7 +16,8 @@ def caps_of_bucket(b, spec=None):
 
 
 def numerics_of(m, b):
-    """{contract, bodies, desc} of bucket b: its numerics contract, the per-format GEMV body a BIH bucket runs (ABI 1.1
-    buckets[].bodies, {} where the pack does not say) and the manifest's contract_desc text (None before 1.1)."""
+    """{contract, bodies, desc} of bucket b: its numerics contract, the per-format body labels the pack declares for it
+    (ABI 1.1 buckets[].bodies, {} where it does not say) and the manifest's contract_desc text (None before 1.1).
+    All strings pass through unchanged."""
     return dict(contract=b["contract"], bodies=b.get("bodies") or {},
                 desc=(m.get("contract_desc") or {}).get(b["contract"]))

@@ -1,7 +1,7 @@
 """Conformance of a gc-c pack runtime behind GcBackend and the Engine. Backend-agnostic properties (batch invariance,
 chunking, prefix cache, small pool and preemption, seeded sampling, tree verify + commit, error codes) run against
 the mock libgck by default. Against real packs (on a GPU box):
-  GC_CONF_PACK=<signed pack dir> GC_CONF_WEIGHTS=<file>[:<file>...] [GC_CONF_SKU=<sku>] [GC_CONF_CONTRACT=BI]
+  GC_CONF_PACK=<signed pack dir> GC_CONF_WEIGHTS=<file>[:<file>...] [GC_CONF_SKU=<sku>] [GC_CONF_CONTRACT=K1]
   [GC_CONF_KEYID=<key id>]  python -m pytest tests/test_gc_conformance.py
 (GC_CONF_KEYID trusts that key for this run; without it the pinned allow-list applies). Mock-only checks compare
 against the closed-form oracle of conftest.py."""
