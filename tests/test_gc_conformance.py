@@ -80,10 +80,12 @@ def test_prefix_cache_and_copy_blocks(make):
 
 
 def test_small_pool_preempts_and_matches(make):
-    be = make(pool_blocks=14)
-    ps = prompts(be, 6)
-    cfg = dict(max_model_len=be.max_len, prefix_cache=False)
     big = make()
+    ps = prompts(big, 6)
+    need = [-(-(len(p) + 20) // big.layout.block_size) for p in ps]
+    assert sum(need) > max(need) + 1
+    be = make(pool_blocks=max(need) + 1)  # the longest request fits, all six together do not
+    cfg = dict(max_model_len=be.max_len, prefix_cache=False)
     ref = [o[0] for o in Engine(big, Config(max_num_seqs=1, **cfg)).generate([(p, SamplingParams(max_tokens=20)) for p in ps])]
     eng = Engine(be, Config(max_num_seqs=6, **cfg))
     got = eng.generate([(p, SamplingParams(max_tokens=20)) for p in ps])
