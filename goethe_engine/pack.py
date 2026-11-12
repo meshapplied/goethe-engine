@@ -372,7 +372,12 @@ def materialize(st, b, out=None):
 
 def main(a):
     import argparse
-    ap = argparse.ArgumentParser(prog="goethe-engine pack")
+    ap = argparse.ArgumentParser(prog="goethe-engine pack", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
+verify prints {"ok": true, "sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "weights": [file names in
+manifest order: the --weights argument of serve]}. --sig defaults to FILE.sig. Exit 0 ok; 1 refused (signature missing or bad,
+key id not pinned, container malformed, a blob not hashing to its name, ABI major not 2, runtime not run here, --arch differs),
+reason on stderr.
+""")
     ap.add_argument("cmd", choices=("verify", "show"))
     ap.add_argument("file")
     ap.add_argument("--sig")

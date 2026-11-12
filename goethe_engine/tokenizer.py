@@ -30,7 +30,8 @@ class HFTokenizer:
     def chat(self, messages):
         if not getattr(self.t, "chat_template", None):
             raise ValueError("the tokenizer has no chat template: use /v1/completions")
-        return list(self.t.apply_chat_template(messages, add_generation_prompt=True, tokenize=True))
+        r = self.t.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        return list(r["input_ids"] if hasattr(r, "keys") else r)   # transformers 5 returns a mapping
 
     def decode(self, ids):
         return self.t.decode(ids, skip_special_tokens=True)

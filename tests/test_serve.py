@@ -146,3 +146,12 @@ def test_cli_refuses_unsigned_pack(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         cli.main(["serve", "--pack", str(tmp_path), "--weights", str(tmp_path / "w")])
     assert "REFUSED" in str(e.value)
+
+
+def test_hf_chat_accepts_a_mapping_result():
+    """transformers 5 returns {"input_ids": [...], ...} from apply_chat_template, older versions a list."""
+    from goethe_engine.tokenizer import HFTokenizer
+    t = HFTokenizer.__new__(HFTokenizer)
+    for r in ({"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}, [1, 2, 3]):
+        t.t = type("T", (), dict(chat_template="x", apply_chat_template=lambda self, *a, r=r, **k: r))()
+        assert t.chat([{"role": "user", "content": "hi"}]) == [1, 2, 3]

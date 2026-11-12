@@ -116,7 +116,16 @@ def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):
 
 def main(argv, trusted=None):
     """`index verify` and `pack match`: exit 0 ok, 1 refused (signature, key, schema, rollback, expiry), 3 no pack."""
-    ap = argparse.ArgumentParser(prog="goethe-engine")
+    ap = argparse.ArgumentParser(prog="goethe-engine", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
+Commands (cmd = verify for `index verify`, match for `pack match`); offline, JSON on stdout.
+  index verify  -> {"serial", "expires", "keyid", "entries"}
+  pack match    -> the best entry whose model.files all exist in --model-dir with those sha256 (other files in the dir are
+                   ignored), for --arch, ABI major 2, a runtime this engine runs and min_engine <= --engine-version; a pair
+                   (more files) outranks its target, then tier, then file_sha256. Entry fields: model, arch, abi_major,
+                   runtime, tier, file_sha256, size, sig (gc-sig-1 object: write it to FILE.gcpack.sig), min_engine.
+Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last-serial, expired), reason on stderr;
+      3 pack match only: valid index, no entry fits; 2 usage.
+""")
     ap.add_argument("cmd", choices=("verify", "match"))
     ap.add_argument("--index", required=True)
     ap.add_argument("--sig", required=True)
