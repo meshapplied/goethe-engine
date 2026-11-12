@@ -77,10 +77,10 @@ def arr(ctype, xs):
 
 
 class GcBackend:
-    def __init__(self, pack_dir, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
+    def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1):
         self.h = self.stage = None
-        self.stage = P.stage(pack_dir, trusted=trusted)
+        self.stage = P.stage(pack, trusted=trusted)
         try:
             self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device)
         except BaseException:

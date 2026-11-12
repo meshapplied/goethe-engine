@@ -25,10 +25,10 @@ class SignatureError(Exception):
     """A missing, malformed, untrusted or wrong signature: the signed file is not used."""
 
 
-def _openssl(*args, data=None):
+def _openssl(*args, data=None, timeout=30):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "OPENSSL_CONF": os.devnull}   # argument list, no shell
     try:
-        r = subprocess.run(["openssl", *args], input=data, capture_output=True, timeout=30, env=env)
+        r = subprocess.run(["openssl", *args], input=data, capture_output=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         raise SignatureError(f"openssl unavailable: {e}")
     return r
@@ -46,7 +46,7 @@ def key_id(pub_pem):
 
 
 def verify(data, sig, trusted=None):
-    """Checks sig (bytes of the signature file, None if absent) over data; returns the signer's key id.
+    """Checks sig (bytes of the signature file, None if absent) over data (bytes, or the path of a file); returns the signer's key id.
     trusted: key ids to accept (default TRUSTED_KEY_IDS). With the dev override set: returns "UNSIGNED" unchecked."""
     if os.environ.get(ALLOW_UNSIGNED_ENV) == "1":
         print(f"*** {ALLOW_UNSIGNED_ENV}=1: signature check disabled, content is NOT authenticated (development only) ***",
@@ -69,11 +69,11 @@ def verify(data, sig, trusted=None):
     if key_id(pub) != kid:
         raise SignatureError("embedded public key does not match its key id (refused)")
     with tempfile.TemporaryDirectory() as d:
-        for n, b in (("pub.pem", pub), ("sig.bin", raw), ("data", data)):
+        for n, b in (("pub.pem", pub), ("sig.bin", raw)) + (() if isinstance(data, (str, os.PathLike)) else (("data", data),)):
             with open(os.path.join(d, n), "wb") as f:
                 f.write(b)
         r = _openssl("dgst", "-sha256", "-verify", os.path.join(d, "pub.pem"), "-signature",
-                     os.path.join(d, "sig.bin"), os.path.join(d, "data"))
+                     os.path.join(d, "sig.bin"), os.fspath(data) if isinstance(data, (str, os.PathLike)) else os.path.join(d, "data"), timeout=900)
     if r.returncode or b"Verified OK" not in r.stdout:
         raise SignatureError("signature does not verify (refused)")
     return kid

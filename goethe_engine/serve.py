@@ -314,7 +314,7 @@ def build(args):
                           max_seqs=seqs)
     else:
         if not (args.pack and args.weights):
-            raise SystemExit("serve needs --pack DIR and --weights PATH... (or --ref for the CPU reference model)")
+            raise SystemExit("serve needs --pack FILE and --weights PATH... (or --ref for the CPU reference model)")
         from .gc_c import GcBackend
         if len(args.weights) > 2:
             raise SystemExit("--weights takes the target file and optionally a drafter file (speculative pair)")
@@ -338,7 +338,7 @@ def parser():
     ap.add_argument("--max-running-requests", type=int)
     ap.add_argument("--served-model-name")
     ap.add_argument("--api-key")
-    ap.add_argument("--pack", metavar="DIR", help="signed kernel pack directory")
+    ap.add_argument("--pack", metavar="FILE", help="signed kernel pack (.gcpack, signature in FILE.sig)")
     ap.add_argument("--weights", nargs="+", metavar="PATH", help="target weights, then a drafter's for a speculative pair")
     ap.add_argument("--tokenizer", metavar="DIR", help="Hugging Face tokenizer dir (default: the weights' dir)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")

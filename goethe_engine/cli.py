@@ -1,10 +1,11 @@
-"""goethe-engine: serve | index verify|match | pack verify|show."""
+"""goethe-engine: serve | index verify | pack match|verify|show."""
 import sys
 
 USAGE = """usage: goethe-engine serve [--host H --port P --context-length N --max-running-requests N --served-model-name S
-                            --api-key K --pack DIR --weights PATH... [--tokenizer DIR]]
-       goethe-engine index verify|match --index F --sig F [--last-serial N] [--arch sm_XX --file NAME=SHA256 ...]
-       goethe-engine pack verify DIR [--arch sm_XX] | pack blobs DIR | pack show DIR
+                            --api-key K --pack FILE.gcpack --weights PATH... [--tokenizer DIR]]
+       goethe-engine index verify --index F --sig F [--last-serial N]
+       goethe-engine pack match --index F --sig F --model-dir DIR --arch sm_XX [--last-serial N] [--tier T]
+       goethe-engine pack verify FILE [--sig F] [--arch sm_XX] | pack show FILE [--sig F]
        goethe-engine --version"""
 
 
@@ -17,10 +18,10 @@ def main(argv=None):
     if a[:1] == ["serve"]:
         from . import serve
         return serve.main(a[1:]) or 0
-    if a[:1] == ["index"]:
+    if a[:2] == ["index", "verify"] or a[:2] == ["pack", "match"]:
         from . import index
         return index.main(a[1:])
-    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["blobs"]):
+    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"]):
         from . import pack
         pack.main(a[1:])
         return 0

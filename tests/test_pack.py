@@ -11,7 +11,7 @@ from toypack import toy_pack
 
 
 def test_loader_is_the_pinned_abi():
-    assert P.ABI == "1.1.0" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c"]
+    assert P.ABI == "2.0.0" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c"]
 
 
 def test_caps_and_numerics_of_a_bucket(toy, key):
@@ -23,11 +23,11 @@ def test_caps_and_numerics_of_a_bucket(toy, key):
 
 def test_other_majors_refused_newer_minor_read():
     with pytest.raises(P.PackError, match="major"):
-        P.validate(dict(schema=P.SCHEMA, abi="2.0.0"))
+        P.validate(dict(schema=P.SCHEMA, abi="1.1.0"))
     with pytest.raises(P.PackError):
-        P.validate(dict(schema="other", abi="1.0.0"))
+        P.validate(dict(schema="other", abi="2.0.0"))
     with pytest.raises(P.PackError, match="lacks"):
-        P.validate(dict(schema=P.SCHEMA, abi="1.7.0"))  # a newer minor parses; this one lacks its fields
+        P.validate(dict(schema=P.SCHEMA, abi="2.7.0"))  # a newer minor parses; this one lacks its fields
 
 
 # --- fail-closed load: signature, key, hashes, ABI, arch, runtime
@@ -44,7 +44,7 @@ def test_default_allow_list_is_pinned_and_refuses(toy):
 
 
 def test_missing_and_bad_signature_refused(toy, key):
-    sig = os.path.join(toy[0], "manifest.sig")
+    sig = toy[0] + ".sig"
     good = open(sig, "rb").read()
     j = json.loads(good)
     j["sig"] = j["sig"][:-8] + "AAAAAAA="
@@ -56,9 +56,15 @@ def test_missing_and_bad_signature_refused(toy, key):
         P.verify(toy[0], trusted=(key.kid,))
 
 
-def test_tampered_manifest_refused(toy, key):
-    mp = os.path.join(toy[0], "manifest.json")
-    open(mp, "ab").write(b" ")
+def test_any_tampered_byte_refused(toy, key):
+    raw = bytearray(open(toy[0], "rb").read())
+    for i in (0, len(raw) // 2, len(raw) - 1):
+        t = bytearray(raw)
+        t[i] ^= 1
+        open(toy[0], "wb").write(t)
+        with pytest.raises(P.PackError, match="does not verify"):
+            P.verify(toy[0], trusted=(key.kid,))
+    open(toy[0], "ab").write(b" ")
     with pytest.raises(P.PackError, match="does not verify"):
         P.verify(toy[0], trusted=(key.kid,))
 
@@ -68,12 +74,34 @@ def test_unpinned_key_refused(toy, key):
         P.verify(toy[0], trusted=("0" * 64,))
 
 
-def test_tampered_blob_refused(toy, key):
-    b = os.path.join(toy[0], "blobs")
-    f = os.path.join(b, sorted(os.listdir(b))[0])
-    open(f, "ab").write(b"x")
+def test_blob_not_hashing_to_its_name_refused_even_if_signed(tmp_path, key, mocklib):
+    from toypack import gcpack
+    d = str(tmp_path)
+    pack = toy_pack(d, key, mocklib)[0]
+    raw = open(pack, "rb").read()
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(raw[16:16 + n])
+    base = 16 + n
+    m = raw[base:base + hdr["manifest"][1]]
+    blobs = {h: raw[base + o:base + o + l] for h, (o, l) in hdr["blobs"].items()}
+    h = sorted(blobs)[0]
+    blobs[h] = blobs[h] + b"x"
+    gcpack(pack, m, blobs)
+    key.sign_file(pack)
     with pytest.raises(P.PackError, match="does not hash"):
-        P.verify(toy[0], trusted=(key.kid,))
+        P.verify(pack, trusted=(key.kid,))
+    gcpack(pack, m, {k: v for k, v in blobs.items() if k != h})
+    key.sign_file(pack)
+    with pytest.raises(P.PackError, match="missing"):
+        P.verify(pack, trusted=(key.kid,))
+
+
+def test_not_a_gcpack_refused(tmp_path, key):
+    f = str(tmp_path / "x.gcpack")
+    open(f, "wb").write(b"not a pack at all")
+    key.sign_file(f)
+    with pytest.raises(P.PackError, match="magic"):
+        P.verify(f, trusted=(key.kid,))
 
 
 def test_arch_abi_runtime_refused(tmp_path, key, mocklib):
@@ -83,7 +111,7 @@ def test_arch_abi_runtime_refused(tmp_path, key, mocklib):
     pack = toy_pack(d, key, mocklib)[0]
     with pytest.raises(P.PackError, match="arch"):
         P.verify(pack, trusted=t, arch="sm_90a")
-    for kw, pat in ((dict(abi="2.0.0"), "major"), (dict(runtime="mystery-rt"), "runtime")):
+    for kw, pat in ((dict(abi="1.1.0"), "major"), (dict(runtime="mystery-rt"), "runtime")):
         d = str(tmp_path / pat)
         os.makedirs(d)
         with pytest.raises(P.PackError, match=pat):
@@ -91,48 +119,28 @@ def test_arch_abi_runtime_refused(tmp_path, key, mocklib):
 
 
 def test_dev_override_is_loud_and_off_by_default(toy, key, monkeypatch, capsys):
-    os.remove(os.path.join(toy[0], "manifest.sig"))
+    os.remove(toy[0] + ".sig")
     with pytest.raises(P.PackError):
         P.verify(toy[0])
     monkeypatch.setenv(sign.ALLOW_UNSIGNED_ENV, "1")
     assert P.verify(toy[0])["arch"] == "sm_120a"
     assert "NOT authenticated" in capsys.readouterr().err
-    open(os.path.join(toy[0], "manifest.sha256"), "w").write("0" * 64)
-    with pytest.raises(P.PackError, match="does not hash"):   # the hashes still run under the override
-        P.verify(toy[0])
-
-
-def test_manifest_hash_file_must_match(toy, key):
-    open(os.path.join(toy[0], "manifest.sha256"), "w").write("0" * 64)
-    with pytest.raises(P.PackError, match="does not hash"):
-        P.verify(toy[0], trusted=(key.kid,))
 
 
 def test_reader_has_no_writer():
-    assert not any(hasattr(P, n) for n in ("write", "add_blob", "bucket_entry", "bucket_files", "RUNTIME", "load"))
-
-
-def test_blobs_lists_missing(toy, monkeypatch, capsys):
-    import shutil
-    with pytest.raises(SystemExit, match="REFUSED"):   # default allow-list: refused, nothing listed
-        P.main(["blobs", toy[0]])
-    monkeypatch.setenv(sign.ALLOW_UNSIGNED_ENV, "1")
-    shutil.rmtree(os.path.join(toy[0], "blobs"))
-    P.main(["blobs", toy[0]])
-    assert len(capsys.readouterr().out.split()) == 2
+    assert not any(hasattr(P, n) for n in ("write", "add_blob", "bucket_entry", "bucket_files", "RUNTIME", "load", "blobs"))
 
 
 # --- staging: verify then load the same bytes
 
 def test_stage_is_private_and_independent_of_the_source(toy, key):
-    import stat
+    import stat, hashlib
     st = P.stage(toy[0], trusted=(key.kid,))
     assert stat.S_IMODE(os.stat(st.dir).st_mode) == 0o700
-    blobs = os.path.join(toy[0], "blobs")
-    for f in os.listdir(blobs):
-        open(os.path.join(blobs, f), "ab").write(b"tamper")   # the source changes after staging
+    assert st.sha256 == hashlib.sha256(open(toy[0], "rb").read()).hexdigest() and st.keyid == key.kid
+    assert not os.path.exists(os.path.join(st.dir, "pack.gcpack"))
+    open(toy[0], "ab").write(b"tamper")   # the source changes after staging
     h = sorted(os.listdir(os.path.join(st.dir, "blobs")))[0]
-    import hashlib
     assert hashlib.sha256(open(os.path.join(st.dir, "blobs", h), "rb").read()).hexdigest() == h
     d = P.materialize(st, P.select(st.manifest, sku="mock", B=2))
     assert d.startswith(st.dir)
@@ -144,7 +152,7 @@ def test_failed_stage_leaves_no_dir(toy, key, tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     import tempfile
     tempfile.tempdir = None
-    os.remove(os.path.join(toy[0], "manifest.sig"))
+    os.remove(toy[0] + ".sig")
     with pytest.raises(P.PackError):
         P.stage(toy[0], trusted=(key.kid,))
     assert [d for d in os.listdir(tmp_path) if d.startswith("goethe-engine-")] == []
@@ -152,25 +160,14 @@ def test_failed_stage_leaves_no_dir(toy, key, tmp_path, monkeypatch):
 
 
 def test_symlinks_refused(toy, key, tmp_path):
-    pack = toy[0]
-    mp = os.path.join(pack, "manifest.json")
-    os.rename(mp, str(tmp_path / "m.json"))
-    os.symlink(str(tmp_path / "m.json"), mp)
+    os.symlink(toy[0], str(tmp_path / "l.gcpack"))
+    os.symlink(toy[0] + ".sig", str(tmp_path / "l.gcpack.sig"))
     with pytest.raises(P.PackError, match="symlink"):
-        P.stage(pack, trusted=(key.kid,))
-    os.remove(mp)
-    os.rename(str(tmp_path / "m.json"), mp)
-    b = os.path.join(pack, "blobs", sorted(os.listdir(os.path.join(pack, "blobs")))[0])
-    os.rename(b, str(tmp_path / "blob"))
-    os.symlink(str(tmp_path / "blob"), b)
-    with pytest.raises(P.PackError, match="blob"):
-        P.stage(pack, trusted=(key.kid,))
-    os.remove(b)
-    os.rename(str(tmp_path / "blob"), b)
-    os.rename(os.path.join(pack, "blobs"), str(tmp_path / "bl"))
-    os.symlink(str(tmp_path / "bl"), os.path.join(pack, "blobs"))
+        P.stage(str(tmp_path / "l.gcpack"), trusted=(key.kid,))
+    os.rename(toy[0] + ".sig", str(tmp_path / "s"))
+    os.symlink(str(tmp_path / "s"), toy[0] + ".sig")
     with pytest.raises(P.PackError, match="symlink"):
-        P.stage(pack, trusted=(key.kid,))
+        P.stage(toy[0], trusted=(key.kid,))
 
 
 @pytest.mark.parametrize("name", ["../x", "/abs/x", "a/../b", "a//b", "./a", "a/./b", "a\\b", "", "a\0b"])
@@ -187,14 +184,22 @@ def test_oversized_json_refused_before_parsing(toy, key, monkeypatch):
     with pytest.raises(P.PackError, match="larger than"):
         P.stage(toy[0], trusted=(key.kid,))
     monkeypatch.undo()
-    sig = os.path.join(toy[0], "manifest.sig")
-    open(sig, "ab").write(b" " * sign.MAX_SIG)
+    open(toy[0] + ".sig", "ab").write(b" " * sign.MAX_SIG)
     with pytest.raises(P.PackError, match="larger than|too large"):
         P.stage(toy[0], trusted=(key.kid,))
 
 
+def test_cli_verify_prints_json(toy, key, monkeypatch, capsys):
+    monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
+    P.main(["verify", toy[0], "--arch", "sm_120a"])
+    j = json.loads(capsys.readouterr().out)
+    assert j["ok"] and j["keyid"] == key.kid and j["buckets"] == 2 and len(j["sha256"]) == 64
+    with pytest.raises(SystemExit, match="REFUSED"):
+        P.main(["verify", toy[0], "--arch", "sm_90a"])
+
+
 def test_weights_must_not_be_world_writable(toy, key):
-    m = P.manifest(toy[0], trusted=(key.kid,))
+    m = P.verify(toy[0], trusted=(key.kid,))
     P.check_weights(m, [toy[1], toy[2]])
     os.chmod(toy[1], 0o666)
     with pytest.raises(P.PackError, match="world-writable"):

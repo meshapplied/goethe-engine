@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""Kernel pack reader. A pack is a directory for one model and GPU architecture:
+"""Kernel pack reader. A pack is ONE file, NAME.gcpack, for one model and GPU architecture, with a detached signature
+NAME.gcpack.sig (gc-sig-1, over the exact file bytes). Layout (stdlib framing):
 
-  manifest.json   the manifest;  manifest.sha256  its sha256 (hex, one line)
-  manifest.sig    detached signature over the exact bytes of manifest.json (see sign.py)
-  blobs/<sha256>  every file of every bucket, named by the sha256 of its bytes
+  b"GCPACK2\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len]}})  payload
+  offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by its sha256
 Weights are not in the pack: the manifest names them by sha256 and the loader checks the file it is given.
 
-stage() copies the pack into a private 0700 directory and verifies the signature, the hashes, the ABI major, the arch
-and the runtime on those copies; everything that is loaded afterwards comes from there. Any failure raises PackError.
+stage() copies the file into a private 0700 directory while hashing it, verifies the signature on that copy, extracts the
+manifest and blobs there (each blob re-hashed), checks ABI major, arch and runtime, and drops the copy; everything loaded
+afterwards comes from the extracted directory. Any failure raises PackError.
 
-  python -m goethe_engine.pack verify DIR [--arch sm_XX]   stage and verify everything, then discard
-  python -m goethe_engine.pack show DIR                    one line per bucket
-  python -m goethe_engine.pack blobs DIR                   blob hashes the signed manifest names that DIR lacks
+  python -m goethe_engine.pack verify FILE [--sig F] [--arch sm_XX]  stage and verify everything, then discard
+  python -m goethe_engine.pack show FILE [--sig F]                   one line per bucket
 """
 import atexit, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 from . import sign
 
-ABI = "1.1.0"                       # pack ABI semver: additive within a major
+ABI = "2.0.0"                       # pack ABI semver: additive within a major
+MAGIC = b"GCPACK2\n"
+MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
 RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
 MAX_JSON = 16 << 20                 # bytes: larger manifests are refused before parsing
@@ -131,22 +133,8 @@ def read_capped(path, cap=None):
     return data
 
 
-def read_manifest_files(d):
-    """(manifest.json bytes, signature bytes or None, manifest.sha256 text) of a pack dir."""
-    need(os.path.exists(os.path.join(d, "manifest.json")) and os.path.exists(os.path.join(d, "manifest.sha256")),
-         f"{d}: no manifest.json / manifest.sha256")
-    sp = os.path.join(d, "manifest.sig")
-    return (read_capped(os.path.join(d, "manifest.json")), read_capped(sp, sign.MAX_SIG) if os.path.lexists(sp) else None,
-            read_capped(os.path.join(d, "manifest.sha256"), 1024).decode("ascii", "replace").strip())
-
-
-def check_manifest(raw, sig, digest, loader_abi=ABI, trusted=None, arch=None):
-    """The manifest dict of these bytes: signature by a pinned key, sha256, schema, ABI major, runtime, arch."""
-    try:
-        sign.verify(raw, sig, trusted)
-    except sign.SignatureError as e:
-        raise PackError(str(e))
-    need(hashlib.sha256(raw).hexdigest() == digest, "manifest.json does not hash to manifest.sha256")
+def check_manifest(raw, loader_abi=ABI, arch=None):
+    """The manifest dict of these bytes: schema, ABI major, runtime, arch."""
     try:
         m = json.loads(raw)
     except ValueError as e:
@@ -159,19 +147,12 @@ def check_manifest(raw, sig, digest, loader_abi=ABI, trusted=None, arch=None):
     return m
 
 
-def manifest(pack, loader_abi=ABI, trusted=None, arch=None):
-    """The checked manifest of a pack dir, without staging it (for listing; load through stage)."""
-    try:
-        return check_manifest(*read_manifest_files(pack), loader_abi, trusted, arch)
-    except PackError as e:
-        raise PackError(f"{pack}: {e}")
-
-
 class Staged:
-    """A verified private copy of a pack: dir (mode 0700, ours alone) and manifest. close() removes it."""
+    """A verified private extraction of a pack: dir (mode 0700, ours alone; manifest.json, manifest.sha256, blobs/),
+    manifest, sha256 of the pack file and the signer's key id. close() removes it."""
 
     def __init__(self):
-        self.dir, self.manifest = tempfile.mkdtemp(prefix="goethe-engine-"), None
+        self.dir, self.manifest, self.sha256, self.keyid = tempfile.mkdtemp(prefix="goethe-engine-"), None, None, None
         atexit.register(self.close)
 
     def close(self):
@@ -180,48 +161,86 @@ class Staged:
             self.dir = None
 
 
-def _put(path, data):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+def _create(path):
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb")
 
 
-def stage(pack, loader_abi=ABI, trusted=None, arch=None):
-    """Copy the pack into a private dir, hashing each blob as it is written, and verify the manifest from the copies.
-    What is loaded later comes from Staged.dir, so nothing verified can change underneath."""
+def _section(f, off, ln, total, what):
+    need(isinstance(off, int) and isinstance(ln, int) and 0 <= off and 0 <= ln and off + ln <= total, f"{what}: section out of range")
+
+
+def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
+    """Verify a .gcpack and extract it into a private dir. sig: path of the detached signature (default PACK.sig).
+    The file is copied once (hashed on the way), the signature is checked on the copy, and what is loaded later comes
+    from Staged.dir, so nothing verified can change underneath."""
     st = Staged()
     try:
-        raw, sig, digest = read_manifest_files(pack)
-        _put(os.path.join(st.dir, "manifest.json"), raw)
-        _put(os.path.join(st.dir, "manifest.sha256"), (digest + "\n").encode())
-        if sig is not None:
-            _put(os.path.join(st.dir, "manifest.sig"), sig)
-        st.manifest = m = check_manifest(*read_manifest_files(st.dir), loader_abi, trusted, arch)
-        need(not os.path.islink(os.path.join(pack, "blobs")), "blobs is a symlink (refused)")
-        os.mkdir(os.path.join(st.dir, "blobs"), 0o700)
-        for h in sorted({h for b in m["buckets"] for h in b["files"].values()}):
-            src = os.path.join(pack, "blobs", h)
+        sp = sig or pack + ".sig"
+        sigb = read_capped(sp, sign.MAX_SIG) if os.path.lexists(sp) else None
+        try:
+            fd = os.open(pack, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as e:
+            raise PackError(f"{pack}: {e.strerror} (symlinks are refused)")
+        cp, h = os.path.join(st.dir, "pack.gcpack"), hashlib.sha256()
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise PackError(f"{pack}: not a regular file")
+        with os.fdopen(fd, "rb") as f, _create(cp) as o:
+            for chunk in iter(lambda: f.read(4 << 20), b""):
+                h.update(chunk)
+                o.write(chunk)
+        st.sha256 = h.hexdigest()
+        try:
+            st.keyid = sign.verify(cp, sigb, trusted)
+        except sign.SignatureError as e:
+            raise PackError(str(e))
+        total = os.path.getsize(cp)
+        with open(cp, "rb") as f:
+            need(f.read(len(MAGIC)) == MAGIC, "not a gcpack file (bad magic)")
+            n = int.from_bytes(f.read(8), "little")
+            need(0 < n <= MAX_HEADER, "container header size")
             try:
-                fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
-            except OSError as e:
-                raise PackError(f"blob {h}: {e.strerror}")
-            with os.fdopen(fd, "rb") as f:
-                need(stat.S_ISREG(os.fstat(fd).st_mode), f"blob {h}: not a regular file")
-                dst, hh = os.open(os.path.join(st.dir, "blobs", h), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), hashlib.sha256()
-                with os.fdopen(dst, "wb") as o:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                hdr = json.loads(f.read(n))
+                base = len(MAGIC) + 8 + n
+                mo, ml = hdr["manifest"]
+                blobs = hdr["blobs"]
+                need(isinstance(blobs, dict), "container header blobs")
+            except (ValueError, KeyError, TypeError) as e:
+                raise PackError(f"container header: {e}")
+            _section(f, mo, ml, total - base, "manifest")
+            need(ml <= MAX_JSON, "manifest.json larger than the cap (refused)")
+            f.seek(base + mo)
+            raw = f.read(ml)
+            m = st.manifest = check_manifest(raw, loader_abi, arch)
+            with _create(os.path.join(st.dir, "manifest.json")) as o:
+                o.write(raw)
+            with _create(os.path.join(st.dir, "manifest.sha256")) as o:
+                o.write((hashlib.sha256(raw).hexdigest() + "\n").encode())
+            os.mkdir(os.path.join(st.dir, "blobs"), 0o700)
+            for bh in sorted({x for b in m["buckets"] for x in b["files"].values()}):
+                need(bh in blobs, f"blob {bh} missing from the pack")
+                off, ln = blobs[bh]
+                _section(f, off, ln, total - base, f"blob {bh}")
+                f.seek(base + off)
+                hh, left = hashlib.sha256(), ln
+                with _create(os.path.join(st.dir, "blobs", bh)) as o:
+                    while left:
+                        chunk = f.read(min(left, 4 << 20))
+                        need(chunk, f"blob {bh}: pack truncated")
                         hh.update(chunk)
                         o.write(chunk)
-            need(hh.hexdigest() == h, f"blob {h} does not hash to its name")
+                        left -= len(chunk)
+                need(hh.hexdigest() == bh, f"blob {bh} does not hash to its name")
+        os.unlink(cp)
         return st
     except BaseException as e:
         st.close()
         raise PackError(f"{pack}: {e}") if isinstance(e, PackError) else e
 
 
-def verify(pack, loader_abi=ABI, trusted=None, arch=None):
-    """Stage everything, check it, discard the copy; returns the manifest."""
-    st = stage(pack, loader_abi, trusted, arch)
+def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
+    """Stage everything, check it, discard the copy; returns the Staged record's manifest, file sha256 and key id."""
+    st = stage(pack, sig, loader_abi, trusted, arch)
     st.close()
     return st.manifest
 
@@ -352,22 +371,27 @@ def materialize(st, b, out=None):
 
 
 def main(a):
-    if len(a) < 2 or a[0] not in ("verify", "show", "blobs"):
-        sys.exit(__doc__)
+    import argparse
+    ap = argparse.ArgumentParser(prog="goethe-engine pack")
+    ap.add_argument("cmd", choices=("verify", "show"))
+    ap.add_argument("file")
+    ap.add_argument("--sig")
+    ap.add_argument("--arch")
+    o = ap.parse_args(a)
     try:
-        if a[0] == "verify":
-            m = verify(a[1], arch=a[a.index("--arch") + 1] if "--arch" in a else None)
-            print(f"pack {a[1]}: abi {m['abi']}, {len(m['buckets'])} buckets, every blob verified")
-        elif a[0] == "blobs":
-            m = manifest(a[1])
-            for h in sorted({h for b in m["buckets"] for h in b["files"].values()}):
-                if not os.path.exists(os.path.join(a[1], "blobs", h)):
-                    print(h)
-        else:
-            for b in manifest(a[1])["buckets"]:
-                print(f"{b['id']:40s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
+        st = stage(o.file, o.sig, arch=o.arch)
     except PackError as e:
         sys.exit(f"pack: REFUSED: {e}")
+    try:
+        m = st.manifest
+        if o.cmd == "verify":
+            print(json.dumps(dict(ok=True, sha256=st.sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
+                                  buckets=len(m["buckets"]))))
+        else:
+            for b in m["buckets"]:
+                print(f"{b['id']:40s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
+    finally:
+        st.close()
 
 
 if __name__ == "__main__":

@@ -3,7 +3,6 @@ import base64
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 
 from goethe_engine import sign
@@ -27,29 +26,37 @@ class Key:
         return json.dumps(dict(schema=sign.SCHEMA, alg=sign.ALG, keyid=self.kid, pub=self.pem,
                                sig=base64.b64encode(sig).decode())).encode()
 
-    def sign_pack(self, pack):
-        """manifest.sha256 and manifest.sig for the manifest.json in pack."""
-        raw = open(os.path.join(pack, "manifest.json"), "rb").read()
-        open(os.path.join(pack, "manifest.sha256"), "w").write(hashlib.sha256(raw).hexdigest() + "\n")
-        open(os.path.join(pack, "manifest.sig"), "wb").write(self.sign(raw))
+    def sign_file(self, path):
+        """PATH.sig: the gc-sig-1 signature over the exact bytes of path."""
+        open(path + ".sig", "wb").write(self.sign(open(path, "rb").read()))
 
 
-def blob(pack, data):
-    h = hashlib.sha256(data).hexdigest()
-    os.makedirs(os.path.join(pack, "blobs"), exist_ok=True)
-    open(os.path.join(pack, "blobs", h), "wb").write(data)
-    return h
+def gcpack(path, manifest, blobs):
+    """Write a .gcpack: manifest bytes and {sha256: bytes}."""
+    hdr, off, parts = dict(blobs={}), len(manifest), [manifest]
+    hdr["manifest"] = [0, len(manifest)]
+    for h, b in blobs.items():
+        hdr["blobs"][h] = [off, len(b)]
+        off += len(b)
+        parts.append(b)
+    hb = json.dumps(hdr).encode()
+    open(path, "wb").write(b"GCPACK2\n" + len(hb).to_bytes(8, "little") + hb + b"".join(parts))
 
 
-def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="1.1.0", arch="sm_120a", mutate=None):
-    """A signed pack dir under d with ladder buckets ncol 2 and 8 (and a spec pair if spec) over the library at lib;
-    returns (pack dir, weights path, drafter weights path)."""
-    pack = os.path.join(d, "pack")
-    os.makedirs(pack)
+def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="2.0.0", arch="sm_120a", mutate=None):
+    """A signed toy.gcpack under d with ladder buckets ncol 2 and 8 (and a spec pair if spec) over the library at lib;
+    returns (pack file, weights path, drafter weights path)."""
+    pack, blobs = os.path.join(d, "toy.gcpack"), {}
+    os.makedirs(d, exist_ok=True)
+
+    def blob(data):
+        blobs[hashlib.sha256(data).hexdigest()] = data
+        return hashlib.sha256(data).hexdigest()
+
     w, dw = os.path.join(d, "w.gguf"), os.path.join(d, "d.gguf")
     open(w, "wb").write(b"weights0")
     open(dw, "wb").write(b"drafter0")
-    files = {"libgck.so": blob(pack, open(lib, "rb").read()), "plan.json": blob(pack, b"{}")}
+    files = {"libgck.so": blob(open(lib, "rb").read()), "plan.json": blob(b"{}")}
     req = dict(arch=arch, cc="12.0", sms=170, name="toy", smem_block=1)
     caps = dict(verify_widths=[], verify=["linear", "tree"], tree_mask=True, taps=[dict(node="result_norm", n=4)],
                 recurrent_commit=[], accept=[], drafter_roles=[])
@@ -70,13 +77,6 @@ def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="1.1.0", arch="sm_1
                  dict(file="d.gguf", bytes=8, sha256=hashlib.sha256(b"drafter0").hexdigest())]))
     if mutate:
         mutate(m)
-    open(os.path.join(pack, "manifest.json"), "w").write(json.dumps(m, indent=1, sort_keys=True) + "\n")
-    key.sign_pack(pack)
+    gcpack(pack, (json.dumps(m, indent=1, sort_keys=True) + "\n").encode(), blobs)
+    key.sign_file(pack)
     return pack, w, dw
-
-
-def signed_copy(src, dst, key):
-    """A copy of an unsigned pack dir, signed by key."""
-    shutil.copytree(src, dst)
-    key.sign_pack(dst)
-    return dst
