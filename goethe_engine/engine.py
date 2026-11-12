@@ -28,10 +28,11 @@ class Engine:
     def __init__(self, backend, cfg=None, drafter=None, grammar=None, eos_ids=()):
         cfg = cfg or Config()
         g = backend.geometry
-        linear = bool(getattr(backend, "spec_width", 0)) or not getattr(backend, "paged", True)
+        linear = bool(getattr(backend, "spec_width", 0))   # a spec pair runs one stream; page packs run many (a block is a sequence page)
+        snaps = 0 if linear or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
         if cfg.max_num_seqs is None or cfg.prefix_cache is None:   # unset knobs follow what the backend can do; explicit ones are checked below
             cfg = replace(cfg, max_num_seqs=(1 if linear else min(64, backend.max_seqs)) if cfg.max_num_seqs is None else cfg.max_num_seqs,
-                          prefix_cache=(not linear and not caps_of(backend)["recurrent"]) if cfg.prefix_cache is None else cfg.prefix_cache)
+                          prefix_cache=(snaps > 0 if not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"]) if cfg.prefix_cache is None else cfg.prefix_cache)
         if g.dtype != cfg.kv_dtype:
             raise ValueError(f"backend KV dtype {g.dtype} != config {cfg.kv_dtype} (fp8 is an explicit opt-in)")
         if cfg.max_num_seqs > backend.max_seqs:

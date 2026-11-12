@@ -100,7 +100,8 @@ def test_snapshot_pages_are_evicted_least_recently_used_and_never_leak():
 
 def test_no_snapshot_pages_means_no_prefix_cache_not_one_stream():
     with pytest.raises(ValueError, match="no prefix cache"):
-        Engine(FakePages(spare=0), Config(max_model_len=60, max_num_seqs=4))
+        Engine(FakePages(spare=0), Config(max_model_len=60, max_num_seqs=4, prefix_cache=True))
+    assert not Engine(FakePages(spare=0), Config(max_model_len=60)).cfg.prefix_cache
     reqs = [(prompt(8, b), P(max_tokens=5)) for b in range(1, 6)]
     _, got, _ = go(FakePages(spare=0), reqs, max_num_seqs=4, prefix_cache=False)
     assert all(got[(i, 0)] == fake_greedy(p, 5) for i, (p, _) in enumerate(reqs))
