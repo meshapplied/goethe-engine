@@ -234,3 +234,19 @@ def test_pair_target_advertises_device_acceptance_by_io_or_spec_caps(tmp_path, k
         else:
             with pytest.raises(P.PackError, match="device acceptance"):
                 P.verify(pack, trusted=(key.kid,))
+
+
+def test_prefill_bucket_is_beside_the_ladder_never_in_it(tmp_path, key, mocklib):
+    """A non-batch W column bucket marked "prefill" is found by P.prefill (widest wins) and is not a ladder step or a
+    selectable decode bucket."""
+    def mut(m):
+        b = dict(m["buckets"][1], id="target.mock.K1.8v.256", batch=False, prefill=8)
+        w = dict(m["buckets"][1], id="target.mock.K1.32v.256", ncol=32, batch=False, prefill=32)
+        m["buckets"] += [b, w]
+    pack, _, _ = toy_pack(str(tmp_path), key, mocklib, mutate=mut)
+    m = P.verify(pack, trusted=(key.kid,))
+    b = P.select(m, sku="mock", B=8)
+    assert b["id"] == "target.mock.K1.8.256"
+    assert [x["id"] for x in P.ladder(m, b)] == ["target.mock.K1.2.256", "target.mock.K1.8.256"]
+    assert P.prefill(m, b)["id"] == "target.mock.K1.32v.256"
+    assert P.prefill(m, dict(b, maxctx=512)) is None

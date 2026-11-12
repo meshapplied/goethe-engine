@@ -101,8 +101,9 @@ class GcBackend:
         else:
             b = P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx)
             lad = P.ladder(m, b)
-            ids, pol_s, pol = [x["id"] for x in lad], None, None
-            used, allw = [x.get("weights", 0) for x in lad] + [b.get("weights", 0)], ws
+            pf = P.prefill(m, b)   # a prompt chunk of W tokens a launch (the runtime ignores it on a paged pack)
+            ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None
+            used, allw = [x.get("weights", 0) for x in lad + ([pf] if pf else [])] + [b.get("weights", 0)], ws
             self.bucket = b
         P.check_weights(m, allw, P.memo_dir(), used)
         top = lad[-1]

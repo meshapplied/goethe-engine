@@ -302,6 +302,13 @@ def ladder(m, b):
                    and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["ncol"])
 
 
+def prefill(m, b):
+    """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
+    sequence a launch beside b's ladder) with b's SKU, contract, role and maxctx, or None."""
+    return max((x for x in m["buckets"] if x.get("prefill") and not x["batch"]
+                and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["prefill"], default=None)
+
+
 def check_weights(m, weights, memo=None, used=None):
     """The weights files given (in model.weights order) hash to the manifest's sha256 values; used: the indices the
     loaded buckets read (default all), each of which must be given. A file must belong to this user or root and be
