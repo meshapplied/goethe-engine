@@ -217,3 +217,20 @@ def test_contract_and_body_labels_are_opaque():
     assert P.select(m, sku="s", contract="Yp")["id"] == "a"  # exact-string match
     assert numerics_of(m, b) == dict(contract="Zq", bodies={"f": "w9"}, desc="text")
     assert P.usable(m, b) == ""
+
+
+def test_pair_target_advertises_device_acceptance_by_io_or_spec_caps(tmp_path, key, mocklib):
+    """gc-c buckets carry no io: the pair's target says it through spec_caps.accept (pack ABI 1.1, additive)."""
+    def via(how):
+        def mut(m):
+            t = m["buckets"][0]
+            t["io"] = None
+            t["spec_caps"] = dict(t["spec_caps"], accept=how)
+        return mut
+    for i, (how, ok) in enumerate((([], False), (["exact"], True))):
+        pack, _, _ = toy_pack(str(tmp_path / str(i)), key, mocklib, spec=True, mutate=via(how))
+        if ok:
+            assert P.verify(pack, trusted=(key.kid,))["spec"]
+        else:
+            with pytest.raises(P.PackError, match="device acceptance"):
+                P.verify(pack, trusted=(key.kid,))

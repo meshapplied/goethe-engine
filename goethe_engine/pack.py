@@ -106,8 +106,8 @@ def validate(m, loader_abi=ABI):
         t, d, pol = by.get(s.get("target")), by.get(s.get("drafter")), s.get("policy") or {}
         if pol.get("kind") not in POLICIES:
             continue                                   # a policy this loader does not know: spec_pair skips it
-        need(t and t["role"] == "target" and (t.get("io") or {}).get("accept"),
-             f"spec {s}: target is not a target bucket with device acceptance")
+        need(t and t["role"] == "target" and ((t.get("io") or {}).get("accept") or (t.get("spec_caps") or {}).get("accept")),
+             f"spec {s}: target is not a target bucket with device acceptance (io.accept, or spec_caps.accept for gc-c)")
         need(d and d["role"] == "drafter" and d["sku"] == t["sku"], f"spec {s}: drafter is not a drafter bucket of "
              "the target's SKU")
         need(all(isinstance(pol.get(k), str) for k in POLICIES[pol["kind"]]),

@@ -72,6 +72,8 @@ Policies build proposals and nothing else; no algorithm name appears in the engi
 - Capabilities from the pack: target bucket `spec_caps` (pack ABI 1.x) map to
   `spec.CAPS` (`pack_backend.caps_of_bucket`); `spec.check` refuses with the first failing requirement and
   `Engine.spec_algorithms()` lists every algorithm with None or its reason.
+- A speculative pair is loaded only if its target bucket advertises device acceptance: `io.accept`, or for gc-c buckets
+  (which carry no `io`) a non-empty `spec_caps.accept` (additive, pack ABI 1.1).
 
 ## Proof
 

@@ -155,6 +155,8 @@ class GcBackend:
                            len(w.blocks), w.want))
         pw = arr(P_(Work), [C.pointer(x) for x in ws])
         rows = sum(max(w.want, lo.spec_width if w.spec else 0) for w in work)
+        if self.spec:
+            rows = max(rows, lo.spec_width)   # a pair handle wants room for a whole round on every step, a prompt chunk included
         out = StepOut(size=C.sizeof(StepOut))
         counts = (C.c_uint32 * n)()
         if greedy:
