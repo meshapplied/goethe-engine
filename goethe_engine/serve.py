@@ -318,7 +318,7 @@ def build(args):
         from .gc_c import GcBackend
         if len(args.weights) > 2:
             raise SystemExit("--weights takes the target file and optionally a drafter file (speculative pair)")
-        be = GcBackend(args.pack, args.weights[0], drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
+        be = GcBackend(args.pack, args.weights[0], B=args.max_running_requests or 8, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")

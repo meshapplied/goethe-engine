@@ -269,6 +269,20 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     return min(cand, key=lambda b: (b["ncol"], b["maxctx"], b["id"]))
 
 
+def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None):
+    """The target bucket that serves one linear stream (1 column, not a batch bucket), in the pack's contract preference
+    order or in `contract`; None if the pack has none (a handle that serves several sequences uses `select`). The contract
+    stays whatever string the pack declares: a handle keeps the one contract of its bucket."""
+    for c in ([contract] if contract else m["contracts"]):
+        try:
+            b = select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx)
+        except PackError:
+            continue
+        if b["ncol"] == 1 and not b["batch"]:
+            return b
+    return None
+
+
 def usable(m, b):
     """Why this loader cannot run bucket b ("" if it can): a runtime or role it does not know. Contract and body labels
     are opaque strings the pack declares: matched by exact string, never enumerated here."""

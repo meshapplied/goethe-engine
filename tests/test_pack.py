@@ -250,3 +250,17 @@ def test_prefill_bucket_is_beside_the_ladder_never_in_it(tmp_path, key, mocklib)
     assert [x["id"] for x in P.ladder(m, b)] == ["target.mock.K1.2.256", "target.mock.K1.8.256"]
     assert P.prefill(m, b)["id"] == "target.mock.K1.32v.256"
     assert P.prefill(m, dict(b, maxctx=512)) is None
+
+
+def test_single_stream_bucket_is_one_non_batch_column_of_any_contract():
+    """B 1 takes the pack's 1 column non-batch bucket, whatever its contract is called; a batch bucket is never one, and an
+    explicit contract is honored."""
+    def bk(i, c, n, batch):
+        return dict(id=i, role="target", sku="s", contract=c, ncol=n, batch=batch, maxctx=8)
+    m = dict(contracts=["Zq", "Yp"], runtime=dict(kind="gc-c", version=1),
+             buckets=[bk("z2", "Zq", 2, True), bk("z8", "Zq", 8, True), bk("y1", "Yp", 1, False)])
+    assert P.single_stream(m, sku="s")["id"] == "y1"
+    assert P.single_stream(m, sku="s", contract="Zq") is None
+    assert P.select(m, sku="s", B=2)["id"] == "z2"           # the default contract still serves several sequences
+    m["buckets"].pop()
+    assert P.single_stream(m, sku="s") is None

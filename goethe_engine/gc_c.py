@@ -99,7 +99,10 @@ class GcBackend:
             allw[used[0]], allw[used[1]] = ws[0], drafter_weights
             self.bucket, lad = b, [b]
         else:
-            b = P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx)
+            # one sequence: the pack's single stream bucket when it has one (a token a launch, its own numerics contract);
+            # else, and for B > 1, the smallest batch bucket
+            b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=ctx)) or \
+                P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx)
             lad = P.ladder(m, b)
             pf = P.prefill(m, b)   # a prompt chunk of W tokens a launch (the runtime ignores it on a paged pack)
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None
