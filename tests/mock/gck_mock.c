@@ -52,7 +52,7 @@ GC_API int gc_open(const gc_open_params *p, gc_handle **out) {
 GC_API int gc_layout_get(gc_handle *h, gc_layout *o) {
   if (!h || !o || o->size < 8) return GC_E_ARG;
   gc_layout l; memset(&l, 0, sizeof l); l.size = sizeof l;
-  l.flags = GC_L_DEVICE_ARGMAX | (h->spec ? GC_L_SPEC : GC_L_PAGED);
+  l.flags = GC_L_DEVICE_ARGMAX | (h->spec ? GC_L_SPEC : GC_L_PAGED) | (!h->spec && getenv("GCK_MOCK_BOUNDED") ? GC_L_BOUNDED : 0);
   l.vocab = VOCAB; l.max_cols = 4096; l.layers = 1; l.kv_heads = 1; l.head_dim = 1; l.kv_dtype = GC_KV_F16; l.feat_width = FEAT;
   if (h->spec) { l.max_seqs = 1; l.max_ctx = SPECCTX; l.block_size = SPECCTX; l.num_blocks = 1; l.spec_width = SPECW; }
   else { l.max_seqs = MAXSEQ; l.block_size = BSZ; l.num_blocks = h->nblk; l.max_ctx = h->nblk * BSZ; }

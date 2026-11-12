@@ -105,3 +105,20 @@ def test_no_snapshot_pages_means_no_prefix_cache_not_one_stream():
     reqs = [(prompt(8, b), P(max_tokens=5)) for b in range(1, 6)]
     _, got, _ = go(FakePages(spare=0), reqs, max_num_seqs=4, prefix_cache=False)
     assert all(got[(i, 0)] == fake_greedy(p, 5) for i, (p, _) in enumerate(reqs))
+
+
+def test_paged_bounded_pack_runs_many_sequences_without_block_sharing():
+    from conftest import FakeTokens
+
+    class Bounded(FakeTokens):
+        prefix_cache = False   # a GC_L_BOUNDED library: ring or recurrent state in the slot, no block sharing
+
+    be = Bounded(40, 4, seqs=4) if "seqs" in Bounded.__init__.__code__.co_varnames else Bounded(40, 4)
+    e = Engine(be, Config(max_model_len=60))
+    assert not e.cfg.prefix_cache
+    p = prompt(12)
+    for i in range(3):
+        e.add_request(i, p, P(max_tokens=6))
+    out = run(e)
+    st = [o.stats for o in out if o.finished]
+    assert len(st) == 3 and all(s["cached_tokens"] == 0 for s in st)

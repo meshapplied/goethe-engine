@@ -89,7 +89,9 @@ enum {
                                   whole sequence page (block_size = max_ctx): its KV rows, window ring and recurrent state;
                                   a sequence's table is its one page */
   GC_L_DEVICE_ARGMAX = 1u << 1,/* a greedy step can return tokens without logits */
-  GC_L_SPEC = 1u << 2          /* opened as a speculative pair: a step with GC_W_SPEC runs a round */
+  GC_L_SPEC = 1u << 2,         /* opened as a speculative pair: a step with GC_W_SPEC runs a round */
+  GC_L_BOUNDED = 1u << 3       /* 1.1: with GC_L_PAGED, a sequence also holds bounded state (window ring, recurrent state) in a slot the
+                                  library assigns at its first step and frees at gc_release: a prefix of it is not shareable by block */
 };
 
 typedef struct gc_layout {
