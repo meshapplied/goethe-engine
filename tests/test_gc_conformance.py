@@ -89,7 +89,8 @@ def test_prefix_cache_and_copy_blocks(make):
     eng = Engine(be, Config(max_model_len=min(be.max_len, 200), max_num_seqs=4))
     cold = eng.generate([(ps[0], SamplingParams(max_tokens=12))])
     warm = eng.generate([(ps[0], SamplingParams(max_tokens=12)), (ps[0] + cold[0][0], SamplingParams(max_tokens=12))])
-    assert warm[0] == cold[0] and eng.metrics()["prefix_hit_tokens"] > 0
+    assert warm[0] == cold[0]
+    assert (eng.metrics()["prefix_hit_tokens"] > 0) == getattr(be, "prefix_cache", True)   # a bounded paged pack shares no blocks
     eng.check()
 
 

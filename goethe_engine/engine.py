@@ -44,6 +44,8 @@ class Engine:
         pages = 0 if self.width or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
         if cfg.prefix_cache and not pages and (self.width or not getattr(backend, "paged", True)):
             raise ValueError("backend has no prefix cache: no paged KV and no snapshot pages")
+        if cfg.prefix_cache and not pages and not getattr(backend, "prefix_cache", True):
+            raise ValueError("backend holds bounded state (window ring, recurrent) in its slots: a prefix cannot be shared by block")
         if cfg.max_model_len > getattr(backend, "max_len", cfg.max_model_len):
             raise ValueError(f"max_model_len exceeds the backend's {backend.max_len}")
         self.caps = caps_of(backend)
