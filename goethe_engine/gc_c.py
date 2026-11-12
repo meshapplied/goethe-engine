@@ -148,11 +148,11 @@ class GcBackend:
         keep, ws = [], []
         for w in work:
             fl = (W_GREEDY if greedy else 0) | (W_SPEC if w.spec else 0) | (W_FEATS if w.feats else 0)
-            toks, blk = arr(C.c_int32, w.tokens), arr(C.c_uint32, w.blocks) if self.paged else None
+            toks, blk = arr(C.c_int32, w.tokens), arr(C.c_uint32, w.blocks)
             par = arr(C.c_int32, w.parents) if w.parents is not None else None
             keep += [toks, blk, par]
             ws.append(Work(C.sizeof(Work), fl, w.sid, w.pos, len(w.tokens), toks, par, blk,
-                           len(w.blocks) if self.paged else 0, w.want))
+                           len(w.blocks), w.want))
         pw = arr(P_(Work), [C.pointer(x) for x in ws])
         rows = sum(max(w.want, lo.spec_width if w.spec else 0) for w in work)
         out = StepOut(size=C.sizeof(StepOut))
