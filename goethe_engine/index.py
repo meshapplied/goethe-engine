@@ -21,7 +21,7 @@ from . import __version__, pack, sign
 
 SCHEMA, VERSION = "gc-pack-index", 2
 HEX = re.compile(r"^[0-9a-f]{64}$")
-RT_PREF = {"gc-c": 0}   # when several entries match: ranked by runtime, then tier, then manifest hash
+RT_PREF = {"gc-c": 0}   # when several entries match: ranked by runtime, then the most model files (a speculative pair over its target), tier, file hash
 
 
 class IndexError_(Exception):
@@ -105,13 +105,13 @@ def dir_files(entry_files, model_dir):
 
 def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):
     """Like match, with the identity read from model_dir: an entry matches when every file it names is in model_dir
-    with that sha256. Candidates are the entries for this arch, ABI, runtime and engine version."""
+    with that sha256. Candidates are the entries for this arch, ABI, runtime and engine version; best first (see RT_PREF)."""
     ev, la = vtuple(engine_version, "engine version"), pack.semver(pack.ABI)[0]
     hit = [e for e in ix["entries"] if e["arch"] == arch and e["abi_major"] == la
            and e["runtime"]["version"] in pack.RUNTIMES.get(e["runtime"]["kind"], ())
            and vtuple(e["min_engine"], "min_engine") <= ev and (tier is None or e["tier"] == tier)
            and dir_files(e["model"]["files"], model_dir) == e["model"]["files"]]
-    return sorted(hit, key=lambda e: (RT_PREF.get(e["runtime"]["kind"], 9), e["tier"], e["file_sha256"]))
+    return sorted(hit, key=lambda e: (RT_PREF.get(e["runtime"]["kind"], 9), -len(e["model"]["files"]), e["tier"], e["file_sha256"]))
 
 
 def main(argv, trusted=None):

@@ -193,7 +193,7 @@ def test_cli_verify_prints_json(toy, key, monkeypatch, capsys):
     monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
     P.main(["verify", toy[0], "--arch", "sm_120a"])
     j = json.loads(capsys.readouterr().out)
-    assert j["ok"] and j["keyid"] == key.kid and j["buckets"] == 2 and len(j["sha256"]) == 64
+    assert j["ok"] and j["keyid"] == key.kid and j["buckets"] == 2 and len(j["sha256"]) == 64 and j["weights"] == ["w.gguf", "d.gguf"]
     with pytest.raises(SystemExit, match="REFUSED"):
         P.main(["verify", toy[0], "--arch", "sm_90a"])
 

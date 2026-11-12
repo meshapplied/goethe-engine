@@ -42,6 +42,12 @@ def test_verify_match_dir(key, tmp_path):
     hit = I.match_dir(ix, str(tmp_path), "sm_120a", "0.1.0")
     assert [e["tier"] for e in hit] == ["a", "base"]   # runtime, arch, min_engine and abi filtered; tier orders
     assert I.match_dir(ix, str(tmp_path), "sm_120a", tier="base")[0]["tier"] == "base"
+    pair = dict(entry(), file_sha256=H("e"), model=dict(entry()["model"], files=dict(files, **{"d.gguf": hashlib.sha256(b"d").hexdigest()})))
+    ix2 = dict(ix, entries=ix["entries"] + [pair])
+    (tmp_path / "d.gguf").write_bytes(b"d")
+    assert I.match_dir(ix2, str(tmp_path), "sm_120a")[0]["file_sha256"] == H("e")   # the pair over its target alone
+    (tmp_path / "d.gguf").unlink()
+    assert all(e["file_sha256"] != H("e") for e in I.match_dir(ix2, str(tmp_path), "sm_120a"))
     (tmp_path / "m.gguf").write_bytes(b"other")
     assert I.match_dir(ix, str(tmp_path), "sm_120a") == []
     (tmp_path / "m.gguf").unlink()

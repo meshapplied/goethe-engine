@@ -386,7 +386,7 @@ def main(a):
         m = st.manifest
         if o.cmd == "verify":
             print(json.dumps(dict(ok=True, sha256=st.sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
-                                  buckets=len(m["buckets"]))))
+                                  buckets=len(m["buckets"]), weights=[w["file"] for w in m["model"]["weights"]])))
         else:
             for b in m["buckets"]:
                 print(f"{b['id']:40s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
