@@ -184,3 +184,27 @@ def test_mock_spec_round_matches_oracle(tmp_path, key, mocklib):
     got = eng.generate([([1, 2, 3], SamplingParams(max_tokens=11))])
     assert got[0][0] == fake_greedy([1, 2, 3], 11)
     be.close()
+
+
+@pytest.mark.skipif(bool(REAL), reason="mock library")
+def test_abi_1_0_struct_sizes_still_load(make, tmp_path, key, mocklib):
+    import ctypes as C
+    from goethe_engine import gc_c
+    be = make()
+    assert be.L.gc_abi_version() == (1 << 16 | 1) and be.state_pages == 0
+
+    class Open10(C.Structure):
+        _fields_ = gc_c.OpenParams._fields_[:-1]
+
+    class Layout10(C.Structure):
+        _fields_ = gc_c.Layout._fields_[:-2]
+    pack, w, _ = toy_pack(str(tmp_path / "old"), key, mocklib)
+    stage = gc_c.P.stage(pack, trusted=(key.kid,))
+    ws, bk = gc_c.arr(C.c_char_p, [w.encode()]), gc_c.arr(C.c_char_p, [b"target.mock.K1.2.256"])
+    p = Open10(C.sizeof(Open10), gc_c.OPEN_NO_CHECK, os.fsencode(stage.dir), ws, 1, -1, bk, 1, 0, None, None)
+    h = C.c_void_p()
+    assert be.L.gc_open(C.cast(C.byref(p), C.POINTER(gc_c.OpenParams)), C.byref(h)) == 0
+    lo = Layout10(size=C.sizeof(Layout10))
+    assert be.L.gc_layout_get(h, C.cast(C.byref(lo), C.POINTER(gc_c.Layout))) == 0 and lo.num_blocks > 0
+    be.L.gc_close(h)
+    stage.close()
