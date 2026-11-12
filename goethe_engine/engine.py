@@ -32,7 +32,7 @@ class Engine:
         snaps = 0 if linear or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
         if cfg.max_num_seqs is None or cfg.prefix_cache is None:   # unset knobs follow what the backend can do; explicit ones are checked below
             cfg = replace(cfg, max_num_seqs=(1 if linear else min(64, backend.max_seqs)) if cfg.max_num_seqs is None else cfg.max_num_seqs,
-                          prefix_cache=(snaps > 0 if not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"]) if cfg.prefix_cache is None else cfg.prefix_cache)
+                          prefix_cache=(snaps > 0 if not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"] and getattr(backend, "prefix_cache", True)) if cfg.prefix_cache is None else cfg.prefix_cache)
         if g.dtype != cfg.kv_dtype:
             raise ValueError(f"backend KV dtype {g.dtype} != config {cfg.kv_dtype} (fp8 is an explicit opt-in)")
         if cfg.max_num_seqs > backend.max_seqs:

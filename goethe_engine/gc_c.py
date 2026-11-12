@@ -16,7 +16,7 @@ from .pack_backend import caps_of_bucket, numerics_of
 ABI_MAJOR, ABI_MINOR = 1, 0   # 1.1 adds state_pages (a 1.0 library ignores the open field and reports none)
 OK, E_CAPACITY = 0, -7
 OPEN_SPEC, OPEN_NO_CHECK = 1, 2
-L_PAGED, L_DEVICE_ARGMAX, L_SPEC = 1, 2, 4
+L_PAGED, L_DEVICE_ARGMAX, L_SPEC, L_BOUNDED = 1, 2, 4, 8
 W_GREEDY, W_SPEC, W_FEATS = 1, 2, 4
 S_HOST_LOGITS = 1
 KV_DTYPE = {0: "f16", 1: "fp8"}
@@ -131,7 +131,8 @@ class GcBackend:
         self.layout = lo
         self.paged = bool(lo.flags & L_PAGED)
         self.state_pages = lo.state_pages   # snapshot pages: ids num_blocks ..., only copy_blocks addresses them
-        self.prefix_cache = not self.spec and (self.paged or self.state_pages > 0)
+        self.bounded = bool(lo.flags & L_BOUNDED)   # window ring or recurrent state in the sequence's slot: a prefix is not shareable by block
+        self.prefix_cache = not self.spec and ((self.paged and not self.bounded) or self.state_pages > 0)
         self.vocab_size, self.max_seqs, self.max_len, self.feat_width = lo.vocab, lo.max_seqs, lo.max_ctx, lo.feat_width
         self.geometry = KVGeometry(lo.block_size, lo.num_blocks, lo.layers, lo.kv_heads, lo.head_dim,
                                    KV_DTYPE.get(lo.kv_dtype, "f16"))
