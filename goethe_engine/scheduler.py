@@ -11,11 +11,11 @@ from .spec import Tree, as_tree
 
 @dataclass
 class Config:
-    max_num_seqs: int = 64
+    max_num_seqs: int | None = None  # None: the backend's capability (up to 64 sequences; 1 on a linear stream)
     max_num_batched_tokens: int = 2048
     max_model_len: int = 4096
     policy: str = "lpm"  # "fcfs" | "lpm"
-    prefix_cache: bool = True
+    prefix_cache: bool | None = None  # None: on where the backend can share KV pages (paged, no recurrent state), else off
     spec_k: int = 0
     kv_dtype: str = "f16"  # "fp8" only as an explicit opt-in
 

@@ -2,7 +2,7 @@
 acceptance live here; scheduling in scheduler.py, KV bookkeeping in kv.py, GPU work behind Backend."""
 import random
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -28,6 +28,10 @@ class Engine:
     def __init__(self, backend, cfg=None, drafter=None, grammar=None, eos_ids=()):
         cfg = cfg or Config()
         g = backend.geometry
+        linear = bool(getattr(backend, "spec_width", 0)) or not getattr(backend, "paged", True)
+        if cfg.max_num_seqs is None or cfg.prefix_cache is None:   # unset knobs follow what the backend can do; explicit ones are checked below
+            cfg = replace(cfg, max_num_seqs=(1 if linear else min(64, backend.max_seqs)) if cfg.max_num_seqs is None else cfg.max_num_seqs,
+                          prefix_cache=(not linear and not caps_of(backend)["recurrent"]) if cfg.prefix_cache is None else cfg.prefix_cache)
         if g.dtype != cfg.kv_dtype:
             raise ValueError(f"backend KV dtype {g.dtype} != config {cfg.kv_dtype} (fp8 is an explicit opt-in)")
         if cfg.max_num_seqs > backend.max_seqs:

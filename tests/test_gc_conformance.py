@@ -55,6 +55,12 @@ def gen(be, ps, k=12, params=None, **cfg):
     return [o[0] for o in out]
 
 
+def batch_only(be):
+    """A single stream pack (linear KV, one slot) has no batch to invariance-test: these properties are about paged multi sequence buckets."""
+    if not be.paged or be.max_seqs < 2:
+        pytest.skip("single stream pack: no multi sequence batch")
+
+
 def test_abi_and_layout(make):
     be = make()
     assert be.L.gc_abi_version() >> 16 == 1
@@ -65,6 +71,7 @@ def test_abi_and_layout(make):
 
 def test_batch_invariance_and_chunking(make):
     be = make()
+    batch_only(be)
     ps = prompts(be)
     alone = [gen(be, [p], 12, max_num_seqs=1, prefix_cache=False)[0] for p in ps]
     for cfg in (dict(max_num_seqs=8), dict(max_num_seqs=8, max_num_batched_tokens=7, prefix_cache=False),
@@ -74,6 +81,7 @@ def test_batch_invariance_and_chunking(make):
 
 def test_prefix_cache_and_copy_blocks(make):
     be = make()
+    batch_only(be)
     base = prompts(be, 1)[0] * 3
     ps = [base[:30] + [5, 6], base[:30] + [7], base[:30] + [5, 6], base[:19]]
     assert gen(be, ps, max_num_seqs=4) == gen(be, ps, max_num_seqs=4, prefix_cache=False)
@@ -81,6 +89,7 @@ def test_prefix_cache_and_copy_blocks(make):
 
 def test_small_pool_preempts_and_matches(make):
     big = make()
+    batch_only(big)
     ps = prompts(big, 6)
     need = [-(-(len(p) + 20) // big.layout.block_size) for p in ps]
     assert sum(need) > max(need) + 1
@@ -94,6 +103,7 @@ def test_small_pool_preempts_and_matches(make):
 
 def test_seeded_sampling_logits_path_is_batch_independent(make):
     be = make()
+    batch_only(be)
     ps = prompts(be)
     sp = SamplingParams(temperature=0.8, top_k=20, seed=11, max_tokens=10)
     alone = [gen(be, [p], params=sp, max_num_seqs=1, prefix_cache=False)[0] for p in ps]

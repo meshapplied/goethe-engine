@@ -257,15 +257,23 @@ def test_prefill_bucket_is_beside_the_ladder_never_in_it(tmp_path, key, mocklib)
     assert P.prefill(m, dict(b, maxctx=512)) is None
 
 
-def test_single_stream_bucket_is_one_non_batch_column_of_any_contract():
-    """B 1 takes the pack's 1 column non-batch bucket, whatever its contract is called; a batch bucket is never one, and an
-    explicit contract is honored."""
-    def bk(i, c, n, batch):
-        return dict(id=i, role="target", sku="s", contract=c, ncol=n, batch=batch, maxctx=8)
+def test_single_stream_bucket_is_the_cheapest_predicted_step_of_any_contract():
+    """B 1 takes the bucket of least step_us among the contracts' B 1 buckets (names opaque); without prices a 1 column non-batch
+    bucket; a batch bucket is never one by shape alone."""
+    def bk(i, c, n, batch, us=None):
+        return dict(id=i, role="target", sku="s", contract=c, ncol=n, batch=batch, maxctx=8, **({"step_us": us} if us else {}))
     m = dict(contracts=["Zq", "Yp"], runtime=dict(kind="gc-c", version=1),
-             buckets=[bk("z2", "Zq", 2, True), bk("z8", "Zq", 8, True), bk("y1", "Yp", 1, False)])
+             buckets=[bk("z2", "Zq", 2, True, 900.0), bk("z8", "Zq", 8, True, 950.0), bk("y1", "Yp", 1, False, 700.0)])
     assert P.single_stream(m, sku="s")["id"] == "y1"
-    assert P.single_stream(m, sku="s", contract="Zq") is None
-    assert P.select(m, sku="s", B=2)["id"] == "z2"           # the default contract still serves several sequences
+    m["buckets"][2]["step_us"] = 1000.0
+    assert P.single_stream(m, sku="s")["id"] == "z2"           # priced: the cheaper contract wins, whatever its shape
+    m["buckets"][0].pop("step_us")
+    assert P.single_stream(m, sku="s")["id"] == "y1"           # an unpriced bucket is not ranked
+    m["buckets"][0]["step_us"] = 900.0
+    assert P.single_stream(m, sku="s", contract="Yp")["id"] == "y1"
+    for b in m["buckets"]:
+        b.pop("step_us")
+    assert P.single_stream(m, sku="s")["id"] == "y1"           # unpriced: the 1 column bucket
     m["buckets"].pop()
     assert P.single_stream(m, sku="s") is None
+    assert P.select(m, sku="s", B=2)["id"] == "z2"

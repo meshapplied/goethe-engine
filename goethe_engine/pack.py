@@ -289,17 +289,21 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
 
 
 def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None):
-    """The target bucket that serves one linear stream (1 column, not a batch bucket), in the pack's contract preference
-    order or in `contract`; None if the pack has none (a handle that serves several sequences uses `select`). The contract
-    stays whatever string the pack declares: a handle keeps the one contract of its bucket."""
+    """The bucket a handle that serves one sequence runs: among the buckets `select` returns for B 1 (one per contract, or just
+    `contract`), the one with the least predicted step (bucket field step_us, the compiler's S2 price); a bucket without a price is
+    not ranked, and without any price the 1 column non-batch bucket if the pack has one, else None (the caller takes the batch
+    ladder). Contract names stay opaque; a handle keeps the one contract of its bucket, so a bucket that is not batch invariant
+    (batch_invariant false) is only ever chosen here, for a handle of one sequence."""
+    cs = []
     for c in ([contract] if contract else m["contracts"]):
         try:
-            b = select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx)
+            cs.append(select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx))
         except PackError:
             continue
-        if b["ncol"] == 1 and not b["batch"]:
-            return b
-    return None
+    priced = [b for b in cs if "step_us" in b]
+    if priced:
+        return min(priced, key=lambda b: b["step_us"])
+    return next((b for b in cs if b["ncol"] == 1 and not b["batch"]), None)
 
 
 def usable(m, b):
