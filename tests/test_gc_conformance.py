@@ -85,6 +85,12 @@ def test_prefix_cache_and_copy_blocks(make):
     base = prompts(be, 1)[0] * 3
     ps = [base[:30] + [5, 6], base[:30] + [7], base[:30] + [5, 6], base[:19]]
     assert gen(be, ps, max_num_seqs=4) == gen(be, ps, max_num_seqs=4, prefix_cache=False)
+    # a page pack (window ring, recurrent state) caches whole-page snapshots: the repeat of a finished prompt hits
+    eng = Engine(be, Config(max_model_len=min(be.max_len, 200), max_num_seqs=4))
+    cold = eng.generate([(ps[0], SamplingParams(max_tokens=12))])
+    warm = eng.generate([(ps[0], SamplingParams(max_tokens=12)), (ps[0] + cold[0][0], SamplingParams(max_tokens=12))])
+    assert warm[0] == cold[0] and eng.metrics()["prefix_hit_tokens"] > 0
+    eng.check()
 
 
 def test_small_pool_preempts_and_matches(make):
@@ -98,7 +104,29 @@ def test_small_pool_preempts_and_matches(make):
     ref = [o[0] for o in Engine(big, Config(max_num_seqs=1, **cfg)).generate([(p, SamplingParams(max_tokens=20)) for p in ps])]
     eng = Engine(be, Config(max_num_seqs=6, **cfg))
     got = eng.generate([(p, SamplingParams(max_tokens=20)) for p in ps])
-    assert [o[0] for o in got] == ref and eng.metrics()["preemptions"] > 0
+    # a page pack's page is a sequence's whole reservation: a short pool queues the rest and never preempts
+    assert [o[0] for o in got] == ref and (eng.metrics()["preemptions"] > 0 or not be.paged)
+
+
+def test_forced_preemption_recomputes_to_the_same_tokens(make):
+    be = make()
+    ps = prompts(be, 5)
+    ref = gen(be, ps, 14, max_num_seqs=1, prefix_cache=False)
+    for cache in (False, True):
+        eng = Engine(be, Config(max_model_len=min(be.max_len, 200), max_num_seqs=5, prefix_cache=cache))
+        for i, p in enumerate(ps):
+            eng.add_request(i, p, SamplingParams(max_tokens=14))
+        out, k = {}, 0
+        while eng.has_work():
+            for o in eng.step():
+                out.setdefault(o.rid, []).extend(o.token_ids)
+            eng.check()
+            k += 1
+            if k % 3 == 0 and eng.sched.running:
+                v = eng.sched.running[-1]
+                eng.sched._preempt(v)
+                be.release(v.sid)
+        assert [out[i] for i in range(len(ps))] == ref and eng.metrics()["preemptions"] > 2
 
 
 def test_seeded_sampling_logits_path_is_batch_independent(make):

@@ -1,5 +1,7 @@
 """Paged KV bookkeeping. BlockPool follows vLLM v1 block_pool (ref counts), RadixCache follows SGLang radix_cache
-(prefix tree, LRU leaf eviction) at block granularity, KVManager follows vLLM v1 kv_cache_manager (allocate, CoW, free)."""
+(prefix tree, LRU leaf eviction) at block granularity, KVManager follows vLLM v1 kv_cache_manager (allocate, CoW, free).
+A page pack's block is a whole sequence page (KV rows, window ring, recurrent state): the same allocator, with StateCache
+as its prefix cache."""
 import heapq
 
 
@@ -126,16 +128,63 @@ class RadixCache:
         return out
 
 
+class StateCache:
+    """Prefix cache of a page pack. A page's recurrent state and window ring are valid at one position only, so a snapshot
+    is a whole-page copy into a spare page, keyed by the exact tokens it followed, and a hit copies it back: no partial
+    sharing. Spare pages are ids first .. first + n - 1; the least recently used snapshot is evicted for a new one."""
+
+    def __init__(self, first, n):
+        self.first, self.n, self.free, self.keys, self.tick = first, n, list(range(first + n - 1, first - 1, -1)), {}, 0
+
+    def match(self, tokens, touch=True):
+        """(page, pos) of the longest snapshot that is a prefix of tokens[:-1] (its step gives the next token), else (None, 0)."""
+        self.tick += touch
+        for pos in sorted({len(k) for k in self.keys}, reverse=True):
+            e = self.keys.get(tuple(tokens[:pos])) if pos < len(tokens) else None
+            if e:
+                if touch:
+                    e[1] = self.tick
+                return e[0], pos
+        return None, 0
+
+    def put(self, tokens):
+        """The spare page to copy the page that followed tokens into, or None if cached already or there is no spare page."""
+        key = tuple(tokens)
+        self.tick += 1
+        if key in self.keys:
+            self.keys[key][1] = self.tick
+            return None
+        if not self.free and self.keys:
+            self.free.append(self.keys.pop(min(self.keys, key=lambda k: self.keys[k][1]))[0])
+        if not self.free:
+            return None
+        self.keys[key] = [self.free.pop(), self.tick]
+        return self.keys[key][0]
+
+    def check(self):
+        used = [e[0] for e in self.keys.values()]
+        assert sorted(self.free + used) == list(range(self.first, self.first + self.n)), "snapshot page leaked or twice owned"
+
+
 class KVManager:
-    def __init__(self, num_blocks, bs, prefix_cache=True):
+    def __init__(self, num_blocks, bs, prefix_cache=True, state_pages=0):
         self.bs, self.pool = bs, BlockPool(num_blocks)
-        self.cache = RadixCache(self.pool, bs) if prefix_cache else None
+        self.cache = RadixCache(self.pool, bs) if prefix_cache and not state_pages else None
+        self.snaps = StateCache(num_blocks, state_pages) if prefix_cache and state_pages else None
 
     def match(self, tokens, touch=False):
         """Cached blocks for a prompt; the last token is never cached, its step gives the next token."""
         return self.cache.match(tokens, (len(tokens) - 1) // self.bs, touch) if self.cache else []
 
+    def hit(self, tokens):
+        """Prompt tokens the prefix cache would serve."""
+        return self.snaps.match(tokens, False)[1] if self.snaps else len(self.match(tokens)) * self.bs
+
     def attach(self, seq):
+        if self.snaps:
+            seq.restore, seq.computed = self.snaps.match(seq.tokens)
+            seq.blocks, seq.tpages = [], 0
+            return
         seq.blocks = self.match(seq.tokens, touch=True)
         for b in seq.blocks:
             self.pool.incref(b)
@@ -161,13 +210,24 @@ class KVManager:
             pool.decref(seq.blocks[i])
             seq.blocks[i] = dst
         seq.blocks += pool.take(fresh)
+        if seq.restore is not None:
+            pairs.append((seq.restore, seq.blocks[0]))
+            seq.restore = None
         return pairs
 
+    def snapshot(self, seq):
+        """Copies (page, spare) that save the sequence's page at its computed position, if that is worth a snapshot."""
+        spare = self.snaps.put(seq.tokens[:seq.computed]) if self.snaps and seq.blocks and seq.computed else None
+        return [] if spare is None else [(seq.blocks[0], spare)]
+
     def commit(self, seq):
-        """Index the full blocks of the computed rows; adopt the tree's block where another sequence indexed it first."""
+        """Index the full blocks of the computed rows; adopt the tree's block where another sequence indexed it first.
+        A page pack snapshots at the last prompt token (every prompt step ends there) and returns the copies to run."""
+        if self.snaps:
+            return self.snapshot(seq) if seq.computed == seq.nprompt - 1 else []
         nf = seq.computed // self.bs
         if not self.cache or nf <= seq.tpages:
-            return
+            return []
         canon = self.cache.insert(seq.tokens, seq.blocks[:nf], seq.tpages)
         for j, c in enumerate(canon, seq.tpages):
             b = seq.blocks[j]
@@ -176,11 +236,12 @@ class KVManager:
                 self.pool.decref(b)
                 seq.blocks[j] = c
         seq.tpages = nf
+        return []
 
     def release(self, seq):
         for b in seq.blocks:
             self.pool.decref(b)
-        seq.blocks, seq.computed, seq.tpages = [], 0, 0
+        seq.blocks, seq.computed, seq.tpages, seq.restore = [], 0, 0, None
 
     def fork(self, seq, child):
         child.blocks, child.computed, child.tpages = list(seq.blocks), seq.computed, seq.tpages
@@ -200,3 +261,5 @@ class KVManager:
                 want[b] += 1
         assert want == self.pool.ref, "ref counts do not match owners"
         assert sorted(self.pool.free) == [b for b, r in enumerate(want) if r == 0], "free list mismatch"
+        if self.snaps:
+            self.snaps.check()

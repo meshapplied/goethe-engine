@@ -40,12 +40,13 @@ class Engine:
             raise ValueError("token budget below one verify step")
         self.backend, self.cfg, self.grammar, self.eos = backend, cfg, grammar, set(eos_ids)
         self.width = getattr(backend, "spec_width", 0)
-        if (self.width or not getattr(backend, "paged", True)) and (cfg.prefix_cache or cfg.max_num_seqs != 1):
-            raise ValueError("this backend runs one linear stream: max_num_seqs=1 and prefix_cache=False")
+        pages = 0 if self.width or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
+        if cfg.prefix_cache and not pages and (self.width or not getattr(backend, "paged", True)):
+            raise ValueError("backend has no prefix cache: no paged KV and no snapshot pages")
         if cfg.max_model_len > getattr(backend, "max_len", cfg.max_model_len):
             raise ValueError(f"max_model_len exceeds the backend's {backend.max_len}")
         self.caps = caps_of(backend)
-        if self.caps["recurrent"] and cfg.prefix_cache:
+        if self.caps["recurrent"] and cfg.prefix_cache and not pages:
             raise ValueError("backend has recurrent state: a prefix-cache hit would skip the rows that build it")
         if drafter is not None:
             r = check(self.caps, getattr(drafter, "needs", {}), cfg.spec_k, cfg.prefix_cache)
@@ -58,7 +59,7 @@ class Engine:
             for k, n in self.caps["taps"].items():
                 at[k], off = range(off, off + n), off + n
             self.cols = torch.tensor([c for k in need for c in at[k]])
-        self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache)
+        self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages)
         self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size)
         self.inbox, self.live, self.counter = deque(), {}, 0
         self.m = dict(steps=0, prompt_tokens=0, generation_tokens=0, prefix_hit_tokens=0, aborted=0, errors=0,
@@ -127,6 +128,8 @@ class Engine:
         if s.finished:
             return
         s.finished = reason
+        if reason in ("stop", "length"):
+            self._copy(self.kv.snapshot(s))
         self.sched.remove(s)
         self.backend.release(s.sid)
         if hasattr(self.drafter, "release"):
@@ -139,6 +142,10 @@ class Engine:
         self.m["prefix_hit_tokens"] += s.hit or 0
         self.m["errors"] += reason == "error"
         self._emit(s, [], reason, error)
+
+    def _copy(self, pairs):
+        if pairs:
+            self.backend.copy_blocks(pairs)
 
     def _flush(self):
         out, self._out = list(self._out.values()), {}
@@ -154,6 +161,7 @@ class Engine:
             if hasattr(self.drafter, "release"):
                 self.drafter.release(sid)
         if not items:
+            self._copy(copies)
             if self.sched.waiting and not self.sched.running:
                 for s in list(self.sched.waiting):
                     self._finish(s, "error", "cannot be scheduled")
@@ -163,8 +171,7 @@ class Engine:
                      it.seq.params.temperature == 0 and not it.seq.grammar, it.spec, it.parents, self.feats)
                 for it in items]
         try:
-            if copies:
-                self.backend.copy_blocks(copies)
+            self._copy(copies)
             logits, feats = self.backend.step(work), None
             if self.feats:
                 logits, feats = logits
@@ -228,7 +235,7 @@ class Engine:
             want = it.want
             s.computed += n
             if not want:
-                self.kv.commit(s)
+                self._copy(self.kv.commit(s))
                 self._feed(s, base, rows)
                 continue
             if it.spec:
@@ -288,7 +295,7 @@ class Engine:
             s.computed = len(s.tokens) - 1
             r = reason.get(s.sid)
             if r != "error":
-                self.kv.commit(s)
+                self._copy(self.kv.commit(s))
                 self._feed(s, base, rows if rows is None or not len(it.tree) else rows[pth])
             if r:
                 self._finish(s, r, "no valid token" if r == "error" else None)

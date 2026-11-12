@@ -47,7 +47,9 @@ class Backend(Protocol):
     def release(self, sid: int) -> None:
         """The sequence left the batch (finished, aborted or preempted)."""
 
-# Optional: paged (False: one linear stream, no prefix cache, max_seqs 1), max_len (longest sequence the backend runs),
+# Optional: paged (False: a block is a whole sequence page, block_size = max_len: KV rows, window ring and recurrent state),
+# state_pages (a page backend: spare pages num_blocks ... num_blocks + state_pages - 1 for copy_blocks only, its prefix cache
+# keeps snapshots there; 0: no prefix cache), max_len (longest sequence the backend runs),
 # spec_width (> 0: the backend drafts and verifies on its own, see Work.spec), caps (spec.CAPS keys: verify width,
 # tree, taps, recurrent, logits, drafters), commit(sid, base, path): after a verify, the rows base + path[j] become
 # rows base + j and the recurrent state is the one after token path[-1] (path[0] = 0; called for every item that

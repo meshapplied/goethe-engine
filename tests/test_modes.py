@@ -50,7 +50,7 @@ def test_spec_round_backend_tokens_equal_greedy_and_truncate_at_stops(width):
 
 
 def test_linear_stream_backend_config_is_checked():
-    for cfg in (Config(max_num_seqs=2, prefix_cache=False), Config(max_num_seqs=1, prefix_cache=True)):
+    for cfg in (Config(max_num_seqs=2, prefix_cache=False, max_model_len=100), Config(max_num_seqs=1, prefix_cache=True, max_model_len=100)):
         with pytest.raises(ValueError):
             Engine(FakeSpec(), cfg)
     e = Engine(FakeSpec(), Config(max_model_len=150))   # unset knobs follow the backend: one stream, no prefix cache

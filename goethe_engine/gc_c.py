@@ -13,7 +13,7 @@ from . import pack as P
 from .backend import KVGeometry
 from .pack_backend import caps_of_bucket, numerics_of
 
-ABI_MAJOR, ABI_MINOR = 1, 0
+ABI_MAJOR, ABI_MINOR = 1, 0   # 1.1 adds state_pages (a 1.0 library ignores the open field and reports none)
 OK, E_CAPACITY = 0, -7
 OPEN_SPEC, OPEN_NO_CHECK = 1, 2
 L_PAGED, L_DEVICE_ARGMAX, L_SPEC = 1, 2, 4
@@ -27,14 +27,14 @@ class OpenParams(C.Structure):
     _fields_ = [("size", C.c_uint32), ("flags", C.c_uint32), ("pack_dir", C.c_char_p), ("weights", P_(C.c_char_p)),
                 ("n_weights", C.c_uint32), ("device", C.c_int32), ("buckets", P_(C.c_char_p)),
                 ("n_buckets", C.c_uint32), ("pool_blocks", C.c_uint32), ("spec_policy", C.c_char_p),
-                ("scratch_dir", C.c_char_p)]
+                ("scratch_dir", C.c_char_p), ("state_pages", C.c_uint32)]
 
 
 class Layout(C.Structure):
     _fields_ = [("size", C.c_uint32)] + [(k, C.c_uint32) for k in (
         "flags", "vocab", "max_cols", "max_seqs", "max_ctx", "block_size", "num_blocks", "layers", "kv_heads",
         "head_dim", "kv_dtype", "spec_width", "feat_width")] + [(k, C.c_uint64) for k in (
-        "kv_bytes", "state_bytes", "device_bytes")]
+        "kv_bytes", "state_bytes", "device_bytes")] + [("state_pages", C.c_uint32), ("pad1", C.c_uint32)]
 
 
 class Work(C.Structure):
@@ -78,16 +78,17 @@ def arr(ctype, xs):
 
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
-                 drafter_weights=None, policy=None, trusted=None, device=-1):
+                 drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4):
+        """state_pages: snapshot pages a page pack (no paged KV) gets for its prefix cache; a paged pack takes none."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted)
         try:
-            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device)
+            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages):
         m = self.m = self.stage.manifest
         dev = None if sku else P.device()
         self.spec = drafter_weights is not None
@@ -116,7 +117,7 @@ class GcBackend:
         keep = [arr(C.c_char_p, [os.fsencode(w) for w in paths]), arr(C.c_char_p, [i.encode() for i in ids])]
         p = OpenParams(C.sizeof(OpenParams), OPEN_NO_CHECK | (OPEN_SPEC if self.spec else 0), os.fsencode(self.stage.dir),
                        keep[0], len(paths), device, keep[1], len(ids), pool_blocks or 0,
-                       pol_s.encode() if pol_s else None, None)
+                       pol_s.encode() if pol_s else None, None, state_pages)
         h = C.c_void_p()
         rc = self.L.gc_open(C.byref(p), C.byref(h))
         if rc:
@@ -126,6 +127,8 @@ class GcBackend:
         self._ck(self.L.gc_layout_get(h, C.byref(lo)))
         self.layout = lo
         self.paged = bool(lo.flags & L_PAGED)
+        self.state_pages = lo.state_pages   # snapshot pages: ids num_blocks ..., only copy_blocks addresses them
+        self.prefix_cache = not self.spec and (self.paged or self.state_pages > 0)
         self.vocab_size, self.max_seqs, self.max_len, self.feat_width = lo.vocab, lo.max_seqs, lo.max_ctx, lo.feat_width
         self.geometry = KVGeometry(lo.block_size, lo.num_blocks, lo.layers, lo.kv_heads, lo.head_dim,
                                    KV_DTYPE.get(lo.kv_dtype, "f16"))

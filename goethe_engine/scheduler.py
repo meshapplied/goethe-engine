@@ -25,6 +25,7 @@ class Sequence:
         self.sid, self.rid, self.index, self.params, self.seed, self.grammar = sid, rid, index, params, seed, grammar
         self.tokens, self.nprompt, self.arrival, self.limit = list(prompt), len(prompt), arrival, limit
         self.blocks, self.computed, self.tpages = [], 0, 0
+        self.restore = None  # snapshot page to copy into the sequence's page when it gets one (page packs)
         self.hit = None  # prompt tokens served by the prefix cache at first admission
         self.prefilled = 0  # rows computed for the prompt, recompute included
         self.preemptions, self.preempted = 0, []
@@ -69,7 +70,10 @@ def strict(s):
     return s.params.accept == "rejection" and s.params.temperature > 0
 
 
-def chunk(s, need):
+def chunk(s, need, snaps=False):
+    """Tokens of the next chunk: a page pack's prompt stops before its last token, where the state is snapshotted."""
+    if snaps and s.computed < s.nprompt - 1 < s.computed + need:
+        return s.nprompt - 1 - s.computed
     return need - 1 if need > 1 and s.nout and strict(s) else need
 
 
@@ -100,7 +104,7 @@ class Scheduler:
     def _order(self):
         if self.cfg.policy == "fcfs" or len(self.waiting) > 128:
             return sorted(self.waiting, key=lambda s: s.key)
-        hit = {s.sid: len(self.kv.match(s.tokens)) for s in self.waiting}
+        hit = {s.sid: self.kv.hit(s.tokens) for s in self.waiting}
         return sorted(self.waiting, key=lambda s: (s.params.priority, -hit[s.sid], s.arrival))
 
     def _chain(self, tokens, npages):
@@ -130,7 +134,7 @@ class Scheduler:
         i, empty = 0, Tree([], [])
         while i < len(self.running) and budget > 0:
             s = self.running[i]
-            need = chunk(s, len(s.tokens) - s.computed)
+            need = chunk(s, len(s.tokens) - s.computed, kv.snaps)
             t = trees.get(s.sid, empty)
             if need + len(t) > budget:
                 if len(t) and strict(s):
@@ -161,7 +165,7 @@ class Scheduler:
                 break
             if len(self.running) + s.params.n > cfg.max_num_seqs:
                 continue
-            if cfg.policy == "lpm" and kv.cache and len(kv.match(s.tokens)) * kv.bs < 32:
+            if cfg.policy == "lpm" and kv.cache and kv.hit(s.tokens) < 32:
                 lead = 0
                 for h in self._chain(s.tokens, (len(s.tokens) - 1) // kv.bs):
                     if h not in seen:
@@ -170,7 +174,7 @@ class Scheduler:
                 if lead * kv.bs >= 32:
                     continue
             kv.attach(s)
-            n = min(chunk(s, len(s.tokens) - s.computed), budget)
+            n = min(chunk(s, len(s.tokens) - s.computed, kv.snaps), budget)
             if len(s.tokens) - s.computed == 1 and strict(s) and s.nout:
                 n = 0  # the anchor alone: next step's decode carries its drafts
             pairs = kv.reserve(s, s.computed + n)

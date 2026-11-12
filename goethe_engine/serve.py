@@ -325,7 +325,7 @@ def build(args):
         tok = HFTokenizer(tdir)
         ctx = args.context_length or be.max_len
     seqs = min(args.max_running_requests or be.max_seqs, be.max_seqs)
-    eng = Engine(be, Config(max_num_seqs=seqs, max_model_len=ctx, prefix_cache=getattr(be, "paged", True)),
+    eng = Engine(be, Config(max_num_seqs=seqs, max_model_len=ctx, prefix_cache=getattr(be, "prefix_cache", True)),
                  eos_ids=tok.eos_ids)
     return eng, tok, ctx
 

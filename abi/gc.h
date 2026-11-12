@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define GC_ABI_MAJOR 1
-#define GC_ABI_MINOR 0
+#define GC_ABI_MINOR 1
 #define GC_ABI_VERSION ((GC_ABI_MAJOR << 16) | GC_ABI_MINOR)
 
 #if defined(__GNUC__)
@@ -61,7 +61,7 @@ enum {
 typedef struct gc_open_params {
   uint32_t size;
   uint32_t flags;               /* GC_OPEN_* */
-  const char *pack_dir;         /* directory with manifest.json, manifest.sha256, blobs/ */
+  const char *pack_dir;         /* extracted pack: a directory with manifest.json, manifest.sha256, blobs/ */
   const char *const *weights;   /* weight file paths in the manifest's model.weights order; a drafter's is last */
   uint32_t n_weights;
   int32_t device;               /* CUDA ordinal; -1 = the current device */
@@ -70,6 +70,7 @@ typedef struct gc_open_params {
   uint32_t pool_blocks;         /* KV blocks to allocate (0 = the pack's maximum) */
   const char *spec_policy;      /* GC_OPEN_SPEC: "ar:K" or "kind:k=v,..." (NULL = the pack's) */
   const char *scratch_dir;      /* writable dir for caches (NULL = none) */
+  uint32_t state_pages;         /* 1.1: snapshot pages to add to a page pack (see gc_layout.state_pages); 0 = none */
 } gc_open_params;
 
 /* Returns the library's ABI version: MAJOR << 16 | MINOR. */
@@ -84,7 +85,9 @@ enum { GC_KV_F16 = 0, GC_KV_FP8 = 1 };
 
 /* gc_layout.flags */
 enum {
-  GC_L_PAGED = 1u << 0,        /* KV is paged: block_size rows per block, a sequence's table maps its rows */
+  GC_L_PAGED = 1u << 0,        /* KV is paged: block_size rows per block, a sequence's table maps its rows. Clear: a block is a
+                                  whole sequence page (block_size = max_ctx): its KV rows, window ring and recurrent state;
+                                  a sequence's table is its one page */
   GC_L_DEVICE_ARGMAX = 1u << 1,/* a greedy step can return tokens without logits */
   GC_L_SPEC = 1u << 2          /* opened as a speculative pair: a step with GC_W_SPEC runs a round */
 };
@@ -107,6 +110,9 @@ typedef struct gc_layout {
   uint64_t kv_bytes;           /* device bytes of the KV pool */
   uint64_t state_bytes;        /* device bytes of recurrent state per sequence (0: none) */
   uint64_t device_bytes;       /* total device bytes held by the handle */
+  uint32_t state_pages;        /* 1.1: pages beyond num_blocks (ids num_blocks .. num_blocks + state_pages - 1) that only
+                                  gc_copy_blocks addresses: snapshots of a page pack's pages; 0 for a paged pack */
+  uint32_t pad1;
 } gc_layout;
 
 GC_API int gc_layout_get(gc_handle *h, gc_layout *out);
@@ -175,7 +181,8 @@ GC_API int gc_step(gc_handle *h, const gc_step_in *in, gc_step_out *out);
  * base .. base + n - 1. A chain backend accepts only the identity path. */
 GC_API int gc_commit(gc_handle *h, uint64_t sid, uint32_t base, const uint32_t *path, uint32_t n);
 
-/* Copies KV block src into block dst for each pair (src[i] -> dst[i]); paged KV. */
+/* Copies block src into block dst for each pair (src[i] -> dst[i]): KV rows of a paged pack, the whole page (KV rows, window
+ * ring, recurrent state) of a page pack. */
 GC_API int gc_copy_blocks(gc_handle *h, const uint32_t *src, const uint32_t *dst, uint32_t n);
 
 /* Releases a sequence's slot, recurrent state and spec state. Unknown sid is not an error. */

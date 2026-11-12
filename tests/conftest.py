@@ -145,7 +145,7 @@ class FakeTokens(FakeBackend):
 class FakeSpec(FakeBackend):
     """One linear stream that decodes by rounds of 1 .. width tokens, like a pack's target and drafter buckets."""
 
-    paged, spec_width, max_len, caps = False, 4, 200, {}
+    paged, spec_width, max_len, max_seqs, caps = False, 4, 200, 1, {}
 
     def __init__(self, width=4):
         super().__init__(200, 1)
@@ -163,6 +163,45 @@ class FakeSpec(FakeBackend):
         out = fake_greedy(self.buf, k)
         self.buf += out[:-1] if w.spec else []
         return [out]
+
+
+class FakePages:
+    """A page pack: a block is a whole sequence page (here its running hash, which a real page holds as recurrent state and
+    window ring), valid at one position only. A step on a page whose state is not at w.pos fails, so a stale, shared or
+    wrongly restored page changes the run."""
+
+    paged, caps = False, {}
+
+    def __init__(self, seqs=4, spare=2, max_len=64, vocab=V, pages=None):
+        self.geometry = KVGeometry(max_len, pages or seqs, 1, 1, 1)
+        self.max_seqs, self.max_len, self.state_pages, self.vocab_size = seqs, max_len, spare, vocab
+        self.page, self.steps, self.copies = {}, 0, []
+
+    def step(self, work):
+        rows = []
+        self.steps += 1
+        assert len({w.blocks[0] for w in work}) == len(work), "two sequences on one page"
+        for w in work:
+            pg = w.blocks[0]
+            assert pg < self.geometry.num_blocks, "running sequence on a snapshot page"
+            if w.pos == 0:
+                self.page[pg] = (7, 0)
+            h, n = self.page[pg]
+            assert n == w.pos, f"page {pg} is at position {n}, step at {w.pos}"
+            for j, t in enumerate(w.tokens):
+                h = fold(h, t, w.pos + j)
+                if j >= len(w.tokens) - w.want:
+                    rows.append(row(h, self.vocab_size))
+            self.page[pg] = (h, w.pos + len(w.tokens))
+        return torch.stack(rows) if rows else torch.empty(0, self.vocab_size)
+
+    def copy_blocks(self, pairs):
+        self.copies += pairs
+        for s, d in pairs:
+            self.page[d] = self.page[s]
+
+    def release(self, sid):
+        pass
 
 
 # --- signed packs and the mock libgck (tests/toypack.py, tests/mock/gck_mock.c)
