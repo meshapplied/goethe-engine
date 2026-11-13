@@ -121,3 +121,25 @@ def test_version_matches_package_metadata():
     import re
     import goethe_engine
     assert re.search(r'^version = "(.+)"', open(__file__.replace("tests/test_index.py", "pyproject.toml")).read(), re.M)[1] == goethe_engine.__version__
+
+
+def test_model_files_are_optional_informational_and_never_used_to_match(key, tmp_path, capsys):
+    ref = model_dir(tmp_path / "ref", TARGET)
+    files = [dict(name="m-q4.gguf", bytes=123, sha256=H("e"))]
+    e = entry(variants=(("q4", sha(ref)),))
+    e["model"]["files"] = files
+    raw, sig = signed(key, index(expires="2999-01-01T00:00:00Z", entries=[e]))
+    ix, _ = I.verify(raw, sig, 0, NOW, (key.kid,))
+    assert I.match_dir(ix, ref, "sm_120a", "0.2.1")[0]["model"]["files"] == files        # echoed
+    other = model_dir(tmp_path / "other", ALT)                                             # other file names or hashes never matter: identity is structure
+    assert I.match_dir(ix, other, "sm_120a", "0.2.1") == []
+    for bad in ([dict(name="x", bytes=1)], [dict(name="../x", bytes=1, sha256=H("e"))], [dict(name="x", bytes=-1, sha256=H("e"))], "x"):
+        e2 = entry(variants=(("q4", sha(ref)),))
+        e2["model"]["files"] = bad
+        raw, sig = signed(key, index(entries=[e2]))
+        with pytest.raises(I.IndexError_, match="model.files"):
+            I.verify(raw, sig, 0, NOW, (key.kid,))
+    (tmp_path / "index.json").write_bytes(signed(key, index(expires="2999-01-01T00:00:00Z", entries=[e]))[0])
+    (tmp_path / "index.sig").write_bytes(key.sign((tmp_path / "index.json").read_bytes()))
+    assert I.main(["match", "--index", str(tmp_path / "index.json"), "--sig", str(tmp_path / "index.sig"), "--arch", "sm_120a", "--model-dir", ref], (key.kid,)) == 0
+    assert json.loads(capsys.readouterr().out)["model"]["files"] == files

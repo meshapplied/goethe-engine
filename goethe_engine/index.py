@@ -4,7 +4,9 @@ index.json (signed by index.sig, sign.py scheme, detached over the exact bytes):
   {"schema": "gc-pack-index", "version": 3, "serial": int >= 1 (monotonic), "issued": "YYYY-MM-DDTHH:MM:SSZ",
    "expires": same format,
    "entries": [{"model": {"hf_repo": str, "revision": str, "format": "gguf" | "safetensors",    # hf_repo, revision: informational
-                          "structure": [{"variant": str, "sha256": hex, "keys": [str]}]},       # one per variant in the pack (structure.py)
+                          "structure": [{"variant": str, "sha256": hex, "keys": [str]}],        # one per variant in the pack (structure.py)
+                          "files": [{"name": str, "bytes": int, "sha256": hex}]},               # optional, informational: the model files the pack was
+                                                                                                #   verified on (what a client downloads); never used to match
                 "arch": "sm_120a", "abi_major": 3, "runtime": {"kind": str, "version": int}, "tier": str,
                 "file": "<model>.gcpack",                             # the asset name (ASCII slug), one file per model
                 "manifest_sha256": hex,                               # sha256 of the pack's manifest bytes: what `sig` signs (with the
@@ -58,6 +60,10 @@ def validate_entry(e, i):
     need(isinstance(st, list) and st and all(isinstance(x, dict) and isinstance(x.get("variant"), str) and HEX.match(str(x.get("sha256")))
                                              and isinstance(x.get("keys"), list) and all(isinstance(k, str) for k in x["keys"]) for x in st),
          f"{w}: model.structure is a list of {{variant, sha256, keys}}")
+    fl = m.get("files")
+    need(fl is None or (isinstance(fl, list) and all(isinstance(x, dict) and isinstance(x.get("name"), str) and x["name"] and "/" not in x["name"]
+                                                     and isinstance(x.get("bytes"), int) and x["bytes"] >= 0 and HEX.match(str(x.get("sha256")))
+                                                     for x in fl)), f"{w}: model.files is a list of {{name, bytes, sha256}}")
     need(isinstance(e.get("arch"), str) and re.fullmatch(r"sm_\d+[a-z]?", e["arch"]), f"{w}: arch is not sm_XX")
     need(e.get("abi_major") == 3, f"{w}: abi_major")
     r = e.get("runtime")
@@ -142,7 +148,7 @@ Commands (cmd = verify for `index verify`, match for `pack match`); offline, JSO
   pack match    -> the best entry one of whose model.structure variants (tensor table and the metadata keys the pack was compiled
                    with, read from headers; structure.py) a file set of --model-dir has, for --arch, ABI major 3, a runtime this
                    engine runs and min_engine <= --engine-version; then tier, then manifest_sha256. The output is the entry plus
-                   "variant". Entry fields: model, arch, abi_major, runtime, tier, file, manifest_sha256, size, min_engine, sig
+                   "variant" and echoes model.files. Entry fields: model, arch, abi_major, runtime, tier, file, manifest_sha256, size, min_engine, sig
                    (gc-sig-1 object: write it to FILE.gcpack.sig).
 Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last-serial, expired), reason on stderr;
       3 pack match only: valid index, no entry fits; 2 usage.
