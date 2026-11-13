@@ -408,22 +408,14 @@ def for_variant(m, target, drafter=None):
                 contracts=[c for c in m["contracts"] if any(b["contract"] == c for b in bs)])
 
 
-def place_weights(m, variant, files, allw=None):
-    """allw (a list with one slot per model.weights entry): the files of variant placed at its slots, in the order given."""
-    idx = m["variants"][variant]["weights"]
-    need(len(files) == len(idx), f"variant {variant} takes {len(idx)} weight file(s), {len(files)} given")
-    allw = [None] * len(m["model"]["weights"]) if allw is None else allw
-    for i, f in zip(idx, files):
-        allw[i] = f
-    return allw
-
-
-def check_weights(m, allw):
-    """Every variant of m (as restricted by for_variant) finds, at its slots in allw, files that are regular, owned by this user or root, not
-    world-writable, and have the variant's structure (tensor table and metadata keys; header reads only, no hashing)."""
-    for vid in sorted({b["variant"] for b in m["buckets"]}):
-        fs = [allw[i] if i < len(allw) else None for i in m["variants"][vid]["weights"]]
-        need(all(fs), f"variant {vid}: weight files {m['variants'][vid]['weights']} are needed")
+def check_weights(m, target_files, drafter_files=None):
+    """The files of each role (as m, restricted by for_variant, uses them) are regular, owned by this user or root, not world-writable, and
+    have the structure of the variant their buckets were compiled for (tensor table and metadata keys; header reads only, no hashing). The
+    number, order and sharding of a role's files do not matter: the runtime finds every tensor by name."""
+    role = {b["variant"]: b["role"] for b in m["buckets"]}
+    for vid in sorted(role):
+        fs = target_files if role[vid] == "target" else drafter_files
+        need(fs, f"variant {vid}: {role[vid]} weight files are needed")
         for p in fs:
             need(os.path.exists(p), f"weights {p} missing")
             st = os.stat(p)

@@ -36,7 +36,7 @@ GC_API int gc_open(const gc_open_params *p, gc_handle **out) {
   if (!f) return fail(NULL, GC_E_MANIFEST, "no manifest.json");
   fclose(f);
   if (p->n_weights < 1 || !p->weights) return fail(NULL, GC_E_WEIGHTS, "no weights");
-  for (uint32_t i = 0; i < p->n_weights; i++) if (!(f = fopen(p->weights[i], "rb"))) return fail(NULL, GC_E_WEIGHTS, "weights unreadable"); else fclose(f);
+  for (uint32_t i = 0; i < p->n_weights; i++) if (!p->weights[i]) continue; else if (!(f = fopen(p->weights[i], "rb"))) return fail(NULL, GC_E_WEIGHTS, "weights unreadable"); else fclose(f);   /* NULL: the group separator */
   int spec = (p->flags & GC_OPEN_SPEC) != 0;
   if (p->n_buckets < 1 || (spec && p->n_buckets != 2)) return fail(NULL, GC_E_ARG, "buckets");
   if (p->pool_blocks > NBLK) return fail(NULL, GC_E_ARG, "pool_blocks above the pack's maximum");

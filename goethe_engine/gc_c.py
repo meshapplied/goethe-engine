@@ -103,9 +103,6 @@ class GcBackend:
         dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
         dv = P.pick_variant(m0, dws, "drafter") if dws else None
         m = self.m = P.for_variant(m0, tv, dv)
-        allw = P.place_weights(m0, tv, ws)
-        if dws:
-            P.place_weights(m0, dv, dws, allw)
         if self.spec:
             b, db, pol = P.spec_pair(m, sku=sku, dev=dev, contract=contract, ctx=ctx)
             ids, pol_s = [b["id"], db["id"]], policy or self._policy(pol)
@@ -123,12 +120,12 @@ class GcBackend:
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None
             self.bucket = b
             self.stage.ensure(lad + ([pf] if pf else []))        # only the chosen branch's blobs are read from the pack
-        P.check_weights(m, allw)
+        P.check_weights(m, ws, dws)
         top = lad[-1]
         libpath = os.path.join(P.materialize(self.stage, top), top["lib"])
         self.L = bind(libpath)
-        paths = [w for w in allw if w is not None]
-        keep = [arr(C.c_char_p, [os.fsencode(w) for w in paths]), arr(C.c_char_p, [i.encode() for i in ids])]
+        paths = ws + ([None] + dws if dws else [])     # groups: the target's files, a NULL, a drafter's (the runtime finds tensors by name)
+        keep = [arr(C.c_char_p, [None if w is None else os.fsencode(w) for w in paths]), arr(C.c_char_p, [i.encode() for i in ids])]
         p = OpenParams(C.sizeof(OpenParams), OPEN_NO_CHECK | (OPEN_SPEC if self.spec else 0), os.fsencode(self.stage.dir),
                        keep[0], len(paths), device, keep[1], len(ids), pool_blocks or 0,
                        pol_s.encode() if pol_s else None, None, state_pages)

@@ -226,10 +226,10 @@ def test_cli_verify_prints_json(toy, key, monkeypatch, capsys):
 
 def test_weights_must_not_be_world_writable(toy, key):
     m = P.for_variant(P.verify(toy[0], trusted=(key.kid,)), "q4")
-    P.check_weights(m, P.place_weights(m, "q4", [toy[1]]))
+    P.check_weights(m, [toy[1]])
     os.chmod(toy[1], 0o666)
     with pytest.raises(P.PackError, match="world-writable"):
-        P.check_weights(m, P.place_weights(m, "q4", [toy[1]]))
+        P.check_weights(m, [toy[1]])
 
 
 def test_the_weights_choose_the_variant_by_structure(tmp_path, key, mocklib):
@@ -243,10 +243,8 @@ def test_the_weights_choose_the_variant_by_structure(tmp_path, key, mocklib):
         P.pick_variant(m, [str(tmp_path / "other.gguf")])
     mv = P.for_variant(m, "alt")
     assert {b["variant"] for b in mv["buckets"]} == {"alt"} and P.select(mv, sku="mock", B=2)["id"].endswith(".alt")
-    with pytest.raises(P.PackError, match="takes 1 weight"):
-        P.place_weights(m, "q4", [w, w])
-    with pytest.raises(P.PackError, match="not the structure"):                      # same slot, other model
-        P.check_weights(P.for_variant(m, "q4"), P.place_weights(m, "q4", [alt]))
+    with pytest.raises(P.PackError, match="not the structure"):                      # the other variant's model under this variant
+        P.check_weights(P.for_variant(m, "q4"), [alt])
 
 
 def test_a_pair_has_a_variant_per_role(tmp_path, key, mocklib):
@@ -255,7 +253,9 @@ def test_a_pair_has_a_variant_per_role(tmp_path, key, mocklib):
     assert P.pick_variant(m, [w]) == "q4" and P.pick_variant(m, [dw], "drafter") == "d"
     mv = P.for_variant(m, "q4", "d")
     assert len(mv["buckets"]) == 2 and len(mv["spec"]) == 1
-    P.check_weights(mv, P.place_weights(m, "d", [dw], P.place_weights(m, "q4", [w])))
+    P.check_weights(mv, [w], [dw])
+    with pytest.raises(P.PackError, match="drafter weight files are needed"):
+        P.check_weights(mv, [w])
 
 
 # --- partial files: only the chosen branch's blobs are read
@@ -427,3 +427,23 @@ def test_backend_runs_the_variant_the_weights_choose_and_refuses_other_weights(t
     gguf(str(tmp_path / "other.gguf"), [("a.weight", [64, 8], 12), ("b.weight", [64], 0)])
     with pytest.raises(P.PackError, match="not a model this pack was compiled for"):
         GcBackend(pack, str(tmp_path / "other.gguf"), B=2, sku="mock", trusted=(key.kid,))
+
+
+def test_weight_files_may_be_resharded_reordered_and_are_found_by_tensor_name(tmp_path, key, mocklib):
+    """The same tensors in two files, in the other order, give the structure the pack was compiled for; a missing, an extra and a duplicated
+    tensor are refused naming it."""
+    from toypack import TARGET, gguf
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib)
+    m = P.for_variant(P.verify(pack, trusted=(key.kid,)), "q4")
+    a, b = str(tmp_path / "s-b.gguf"), str(tmp_path / "s-a.gguf")
+    gguf(a, TARGET[1:])                                       # b.weight alone
+    gguf(b, TARGET[:1])                                       # a.weight alone
+    P.check_weights(m, [a, b])                                # shard count and order do not matter
+    P.check_weights(m, [b, a])
+    with pytest.raises(P.PackError, match="b.weight.*missing from this model"):
+        P.check_weights(m, [b])
+    gguf(str(tmp_path / "extra.gguf"), [("c.weight", [4], 0)])
+    with pytest.raises(P.PackError, match="c.weight.*missing from the model the pack was compiled for"):
+        P.check_weights(m, [a, b, str(tmp_path / "extra.gguf")])
+    with pytest.raises(P.PackError, match="occurs twice"):
+        P.check_weights(m, [a, b, w])

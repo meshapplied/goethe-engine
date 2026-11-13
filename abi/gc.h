@@ -62,7 +62,8 @@ typedef struct gc_open_params {
   uint32_t size;
   uint32_t flags;               /* GC_OPEN_* */
   const char *pack_dir;         /* extracted pack: a directory with manifest.json, manifest.sha256, blobs/ */
-  const char *const *weights;   /* weight file paths in the manifest's model.weights order; a drafter's is last */
+  const char *const *weights;   /* weight file paths: the target's files (any order, any sharding: tensors are found by name), then for a
+                                   speculative pair a NULL entry and the drafter's files; n_weights counts the NULL */
   uint32_t n_weights;
   int32_t device;               /* CUDA ordinal; -1 = the current device */
   const char *const *buckets;   /* manifest bucket ids: a batch ladder in ascending columns, or {target, drafter} */
