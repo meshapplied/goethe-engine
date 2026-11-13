@@ -39,11 +39,12 @@ class Key:
 
 
 def gcpack(path, manifest, blobs):
-    """Write a .gcpack: manifest bytes and {sha256: bytes}."""
+    """Write a .gcpack: manifest bytes and {sha256: bytes, or (stored bytes, codec)}."""
     hdr, off, parts = dict(blobs={}), len(manifest), [manifest]
     hdr["manifest"] = [0, len(manifest)]
     for h, b in blobs.items():
-        hdr["blobs"][h] = [off, len(b)]
+        b, *codec = b if isinstance(b, tuple) else (b,)
+        hdr["blobs"][h] = [off, len(b), *codec]
         off += len(b)
         parts.append(b)
     hb = json.dumps(hdr).encode()

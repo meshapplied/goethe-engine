@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
 
-  b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len]}})  payload
-  offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by its sha256
+  b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len] or [off, len, "xz"]}})  payload
+  offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by the sha256 of its raw bytes;
+  len = stored bytes, "xz" = the blob is one xz stream (the only codec; read with a 64 MiB decoder memory limit and a raw size cap)
 
 The signature (gc-sig-1, detached, PACK.sig, or the index entry's) is ECDSA over sha256(b"gc-pack-3\n" + manifest bytes): the manifest
 names every blob by its sha256, and a blob is hash-checked when it is extracted, so a file with holes is as safe as a whole one for
@@ -16,7 +17,7 @@ buckets[] each with variant, role, sku, contract, ncol, maxctx, files, lib, requ
   python -m goethe_engine.pack show FILE [--sig F]                   one line per bucket
   python -m goethe_engine.pack need PREFIX --model-dir D [--arch A --sku S --numerics ..]  the byte ranges a download must fetch
 """
-import atexit, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
+import atexit, hashlib, json, lzma, os, re, shutil, stat, subprocess, sys, tempfile
 
 from . import sign, structure
 
@@ -26,6 +27,8 @@ DOMAIN = b"gc-pack-3\n"             # signed digest = sha256(DOMAIN + manifest b
 MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
 RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
+MAX_RAW = 4 << 30                   # bytes: no blob inflates past this (xz bombs are refused as the output grows)
+XZ_MEM = 64 << 20                   # bytes: xz decoder memory limit
 MAX_JSON = 16 << 20                 # bytes: larger manifests are refused before parsing
 ROLES = ("target", "drafter")
 POLICIES = {"ar": ("K",), "walk": ("gate", "succ", "pred", "feats"),   # speculative round kinds and their fields
@@ -165,20 +168,51 @@ class Staged:
             if os.path.exists(dst):
                 continue
             need(bh in self.blobs, f"blob {bh} missing from the pack")
-            off, ln = self.blobs[bh]
+            off, ln, codec = blob_entry(self.blobs[bh], bh)
             _section(off, ln, self.total - self.base, f"blob {bh}")
             self.f.seek(self.base + off)
             hh, left = hashlib.sha256(), ln
-            with _create(dst) as o:
-                while left:
-                    chunk = self.f.read(min(left, 4 << 20))
-                    need(chunk, f"blob {bh}: pack truncated or a hole")
-                    hh.update(chunk)
-                    o.write(chunk)
-                    left -= len(chunk)
+            dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
+            out = 0
+
+            def put(o, b):
+                nonlocal out
+                out += len(b)
+                need(out <= MAX_RAW, f"blob {bh}: inflates past {MAX_RAW} bytes (refused)")
+                hh.update(b)
+                o.write(b)
+            try:
+                with _create(dst) as o:
+                    while left:
+                        chunk = self.f.read(min(left, 4 << 20))
+                        need(chunk, f"blob {bh}: pack truncated or a hole")
+                        left -= len(chunk)
+                        if not dec:
+                            put(o, chunk)
+                            continue
+                        try:
+                            b = dec.decompress(chunk, 1 << 20)
+                            while True:
+                                put(o, b)
+                                if dec.needs_input or dec.eof:
+                                    break
+                                b = dec.decompress(b"", 1 << 20)
+                        except (lzma.LZMAError, EOFError) as e:
+                            raise PackError(f"blob {bh}: xz: {e}")
+                    need(not dec or (dec.eof and not dec.unused_data and not left), f"blob {bh}: xz stream truncated or followed by data")
+            except PackError:
+                if os.path.exists(dst):
+                    os.unlink(dst)
+                raise
             if hh.hexdigest() != bh:
                 os.unlink(dst)
                 raise PackError(f"blob {bh} does not hash to its name")
+
+
+def blob_entry(e, what):
+    """(offset, stored length, codec) of a header blob entry [off, len] or [off, len, \"xz\"]; any other codec is refused."""
+    need(isinstance(e, list) and len(e) in (2, 3) and (len(e) == 2 or e[2] == "xz"), f"blob {what}: container entry {e!r} (codecs: stored, xz)")
+    return e[0], e[1], e[2] if len(e) == 3 else None
 
 
 def _create(path):
@@ -501,7 +535,8 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
             hs = blob_hashes(bs)
             need(all(h in blobs for h in hs), "a needed blob is missing from the container header")
             print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), prefix=dict(off=0, len=end),
-                                  ranges=[dict(off=base + blobs[h][0], len=blobs[h][1], sha256=h) for h in hs])))
+                                  ranges=[dict(off=base + blob_entry(blobs[h], h)[0], len=blob_entry(blobs[h], h)[1], sha256=h,
+                                               **({"codec": "xz"} if blob_entry(blobs[h], h)[2] else {})) for h in hs])))
             return
         st = stage(o.file, o.sig, arch=o.arch, defer=True)
     except PackError as e:

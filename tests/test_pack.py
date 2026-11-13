@@ -64,7 +64,7 @@ def _rewrite(pack, edit):
     hdr = json.loads(raw[16:16 + n])
     base = 16 + n
     man = raw[base + hdr["manifest"][0]:base + hdr["manifest"][0] + hdr["manifest"][1]]
-    blobs = {h: raw[base + o:base + o + l] for h, (o, l) in hdr["blobs"].items()}
+    blobs = {h: raw[base + o:base + o + l] for h, (o, l, *_) in hdr["blobs"].items()}
     man, blobs = edit(man, blobs)
     gcpack(pack, man, blobs)
 
@@ -447,3 +447,54 @@ def test_weight_files_may_be_resharded_reordered_and_are_found_by_tensor_name(tm
         P.check_weights(m, [a, b, str(tmp_path / "extra.gguf")])
     with pytest.raises(P.PackError, match="occurs twice"):
         P.check_weights(m, [a, b, w])
+
+
+# --- xz blobs: [off, len, "xz"], name = sha256 of the raw bytes
+
+def _xz(pack, key, how):
+    """Re-write the toy pack with its first blob stored by how(raw) -> (stored bytes, codec)."""
+    h0 = []
+
+    def edit(man, blobs):
+        h0.append(sorted(blobs)[0])
+        return man, dict(blobs, **{h0[0]: how(blobs[h0[0]])})
+    _rewrite(pack, edit)
+    return h0[0]
+
+
+def test_xz_blob_loads_and_stored_still_does(tmp_path, key, mocklib):
+    import lzma
+    pack = toy_pack(str(tmp_path), key, mocklib)[0]
+    _xz(pack, key, lambda b: (lzma.compress(b), "xz"))
+    st = P.stage(pack, trusted=(key.kid,))
+    st.ensure(None)
+    assert P.verify(pack, trusted=(key.kid,))
+    st.close()
+
+
+def test_xz_bomb_refused_with_bounded_memory(tmp_path, key, mocklib, monkeypatch):
+    import lzma, resource
+    pack = toy_pack(str(tmp_path), key, mocklib)[0]
+    z = lzma.LZMACompressor(lzma.FORMAT_XZ, preset=1)
+    zero, bomb = bytes(1 << 24), []
+    for _ in range(64):                                  # 1 GiB of zeros in a few KiB
+        bomb.append(z.compress(zero))
+    bomb.append(z.flush())
+    monkeypatch.setattr(P, "MAX_RAW", 256 << 20)
+    _xz(pack, key, lambda b: (b"".join(bomb), "xz"))
+    r0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    with pytest.raises(P.PackError, match="inflates past"):
+        P.verify(pack, trusted=(key.kid,))
+    assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - r0 < 200 * 1024     # KiB: far below the 1 GiB output
+
+
+def test_xz_memlimit_truncated_and_wrong_codec_refused(tmp_path, key, mocklib, monkeypatch):
+    import lzma
+    big = lzma.compress(b"x" * 100, filters=[{"id": lzma.FILTER_LZMA2, "dict_size": 1 << 24}])
+    for i, (how, err) in enumerate([(lambda b: (big, "xz"), "xz"), (lambda b: (lzma.compress(b)[:-9], "xz"), "xz"),
+                                    (lambda b: (b, "gzip"), "codecs")]):
+        pack = toy_pack(str(tmp_path / str(i)), key, mocklib)[0]
+        _xz(pack, key, how)
+        monkeypatch.setattr(P, "XZ_MEM", 1 << 16 if i == 0 else 64 << 20)    # i = 0: the dictionary needs more than the limit
+        with pytest.raises(P.PackError, match=err):
+            P.verify(pack, trusted=(key.kid,))
