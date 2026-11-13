@@ -301,3 +301,25 @@ def test_single_stream_bucket_is_the_cheapest_predicted_step_of_any_contract():
     m["buckets"].pop()
     assert P.single_stream(m, sku="s") is None
     assert P.select(m, sku="s", B=2)["id"] == "z2"
+
+
+def test_numerics_request_selects_by_capability_records():
+    """--numerics / --act / --kv pick buckets from their determinism, act and kv records (opaque contract names); no match names the
+    missing capability."""
+    def bk(i, c, n, det, act, batch=True, kv="f16"):
+        return dict(id=i, role="target", sku="s", contract=c, ncol=n, batch=batch, maxctx=8, determinism=det, act=act, kv=kv)
+    m = dict(contracts=["Hh", "Aa", "Ee"], runtime=dict(kind="gc-c", version=1),
+             buckets=[bk("h2", "Hh", 2, "batch_invariant", "a16"), bk("a2", "Aa", 2, "batch_invariant", "a8"),
+                      bk("e1", "Ee", 1, "exact", None, batch=False)])
+    pick = lambda B, **kw: P.select(m, sku="s", B=B, want=P.wanted(single=B == 1, **kw))["id"]
+    assert pick(4 - 2) == "h2"                      # default: deterministic, a16 where a bucket has it
+    assert pick(2, act="a8") == "a2"
+    assert P.single_stream(m, sku="s", want=P.wanted("exact", single=True))["id"] == "e1"
+    assert P.select(m, sku="s", B=2, want=P.wanted("fast"))["id"] == "h2"   # fast falls back to deterministic
+    with pytest.raises(P.PackError, match="kv=fp8.*the pack has"):
+        P.need_bucket(m, "s", P.wanted(kv="fp8"), "kv=fp8")
+    with pytest.raises(P.PackError, match="act"):
+        P.wanted(act="a4")
+    old = dict(id="o", role="target", sku="s", contract="K", ncol=2, batch=True, maxctx=8)   # a pack before ABI 2.2
+    assert P.feature(old, "determinism") == "batch_invariant" and P.wanted()(old)
+    assert not P.wanted("exact")(old)

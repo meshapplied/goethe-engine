@@ -264,7 +264,7 @@ def ver(s):
     return tuple(int(x) for x in s.split("."))
 
 
-def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False):
+def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False, want=None):
     """The bucket for (sku or device, contract, B columns, ctx positions, role): the smallest ncol >= B, then the
     smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch."""
     if dev is not None:
@@ -279,10 +279,13 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
         need(dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"]),
              f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}")
     need(sku is not None, "no SKU: pass a device or a SKU")
-    c = contract or next(iter(m["contracts"]), None)   # opaque labels: the pack lists its preference order
+    ok = want or (lambda b: True)
+    # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request
+    c = contract or next((x for x in m["contracts"] if any(b["contract"] == x and ok(b) for b in m["buckets"])), None) \
+        or next(iter(m["contracts"]), None)
     skip = {b["id"]: usable(m, b) for b in m["buckets"] if usable(m, b)}
     cand = [b for b in m["buckets"] if b["sku"] == sku and b["contract"] == c and b["role"] == role
-            and b["id"] not in skip
+            and b["id"] not in skip and ok(b)
             and not b.get("variant_of") and b["ncol"] >= B and (ctx is None or b["maxctx"] >= ctx)
             and (verify or role != "target" or b["batch"] or b["ncol"] == 1)]   # a spec verify serves no batch
     need(cand, f"no {role} bucket for sku {sku}, contract {c}, B {B}, ctx {ctx} (skipped, unknown to this loader: "
@@ -291,7 +294,7 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     return min(cand, key=lambda b: (b["ncol"], b["maxctx"], b["id"]))
 
 
-def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None):
+def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
     """The bucket a handle that serves one sequence runs: among the buckets `select` returns for B 1 (one per contract, or just
     `contract`), the one with the least predicted step (bucket field step_us, the compiler's S2 price); a bucket without a price is
     not ranked, and without any price the 1 column non-batch bucket if the pack has one, else None (the caller takes the batch
@@ -300,13 +303,45 @@ def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None):
     cs = []
     for c in ([contract] if contract else m["contracts"]):
         try:
-            cs.append(select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx))
+            cs.append(select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx, want=want))
         except PackError:
             continue
     priced = [b for b in cs if "step_us" in b]
     if priced:
         return min(priced, key=lambda b: b["step_us"])
     return next((b for b in cs if b["ncol"] == 1 and not b["batch"]), None)
+
+
+DETERMINISM = ("exact", "batch_invariant", "tolerance")   # buckets[].determinism (pack ABI 2.2)
+
+
+def feature(b, k):
+    """A bucket's numerics axis k ("determinism", "act", "kv"): its record, or for packs before ABI 2.2 what they imply
+    (batch_invariant true or absent: batch_invariant, else exact; act and kv unknown, kv f16)."""
+    if k in b:
+        return b[k]
+    return {"determinism": "batch_invariant" if b.get("batch_invariant", True) else "exact", "act": None, "kv": "f16"}[k]
+
+
+def wanted(numerics="deterministic", act="auto", kv="auto", single=False):
+    """The bucket predicate of a request: numerics exact | deterministic (batch_invariant; exact also serves a handle of one
+    sequence, which has no batch to depend on) | fast (tolerance, else deterministic: no tolerance bucket exists yet), act auto
+    (a16 where a bucket has it: the pack's contract order) | a8 | a16 (exact buckets carry no act), kv auto (f16) | f16 | fp8."""
+    det = {"exact": {"exact"}, "deterministic": {"batch_invariant"} | ({"exact"} if single else set()),
+           "fast": {"tolerance", "batch_invariant"} | ({"exact"} if single else set())}
+    if numerics not in det or act not in ("auto", "a8", "a16") or kv not in ("auto", "f16", "fp8"):
+        raise PackError(f"numerics {numerics!r} act {act!r} kv {kv!r}: numerics exact | deterministic | fast, act auto | a8 | "
+                        "a16, kv auto | f16 | fp8")
+    return lambda b: (feature(b, "determinism") in det[numerics] and (act == "auto" or feature(b, "act") in (None, act))
+                      and feature(b, "kv") == ("f16" if kv == "auto" else kv))
+
+
+def need_bucket(m, sku, want, what):
+    """PackError naming the missing capability unless some target bucket of the pack satisfies want."""
+    have = sorted({(feature(b, "determinism"), feature(b, "act"), feature(b, "kv")) for b in m["buckets"] if b["role"] == "target"
+                   and (sku is None or b["sku"] == sku)})
+    need(any(want(b) for b in m["buckets"] if b["role"] == "target"),
+         f"no bucket satisfies {what}; the pack has (determinism, act, kv): {have}")
 
 
 def usable(m, b):

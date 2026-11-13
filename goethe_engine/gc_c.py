@@ -78,17 +78,18 @@ def arr(ctype, xs):
 
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
-                 drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4):
+                 drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
+                 numerics="deterministic", act="auto", kv="auto"):
         """state_pages: snapshot pages a page pack (no paged KV) gets for its prefix cache; a paged pack takes none."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted)
         try:
-            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages)
+            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv))
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req):
         m = self.m = self.stage.manifest
         dev = None if sku else P.device()
         self.spec = drafter_weights is not None
@@ -102,8 +103,10 @@ class GcBackend:
         else:
             # one sequence: the pack's single stream bucket when it has one (a token a launch, its own numerics contract);
             # else, and for B > 1, the smallest batch bucket
-            b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=ctx)) or \
-                P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx)
+            want = P.wanted(*req, single=B == 1)
+            P.need_bucket(m, sku, want, f"numerics={req[0]} act={req[1]} kv={req[2]} for {B} sequence(s)")
+            b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=ctx, want=want)) or \
+                P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx, want=want)
             lad = P.ladder(m, b)
             pf = P.prefill(m, b)   # a prompt chunk of W tokens a launch (the runtime ignores it on a paged pack)
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None

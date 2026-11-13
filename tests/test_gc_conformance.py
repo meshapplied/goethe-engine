@@ -208,3 +208,11 @@ def test_abi_1_0_struct_sizes_still_load(make, tmp_path, key, mocklib):
     assert be.L.gc_layout_get(h, C.cast(C.byref(lo), C.POINTER(gc_c.Layout))) == 0 and lo.num_blocks > 0
     be.L.gc_close(h)
     stage.close()
+
+
+def test_unsatisfiable_numerics_request_names_the_missing_capability(tmp_path, key, mocklib):
+    pack, w, _ = toy_pack(str(tmp_path), key, mocklib)
+    with pytest.raises(Exception, match="kv=fp8.*the pack has"):
+        GcBackend(pack, w, sku="mock", trusted=(key.kid,), kv="fp8")
+    with pytest.raises(Exception, match="numerics=exact"):
+        GcBackend(pack, w, sku="mock", trusted=(key.kid,), numerics="exact", B=8)
