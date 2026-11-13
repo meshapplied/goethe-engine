@@ -155,3 +155,18 @@ def test_hf_chat_accepts_a_mapping_result():
     for r in ({"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}, [1, 2, 3]):
         t.t = type("T", (), dict(chat_template="x", apply_chat_template=lambda self, *a, r=r, **k: r))()
         assert t.chat([{"role": "user", "content": "hi"}]) == [1, 2, 3]
+
+
+def test_stop_ids_come_from_generation_config_then_config(tmp_path):
+    """A chat model ends a turn on its own token (gemma <turn|>, qwen <|im_end|>): every declared stop id ends a generation."""
+    import json
+    from goethe_engine.tokenizer import model_stop_ids
+    assert model_stop_ids(str(tmp_path)) == []
+    (tmp_path / "config.json").write_text(json.dumps({"eos_token_id": 7}))
+    assert model_stop_ids(str(tmp_path)) == [7]
+    (tmp_path / "generation_config.json").write_text(json.dumps({"eos_token_id": [1, 106, 50]}))
+    assert model_stop_ids(str(tmp_path)) == [1, 106, 50]
+    (tmp_path / "generation_config.json").write_text("not json")
+    assert model_stop_ids(str(tmp_path)) == [7]
+    (tmp_path / "config.json").write_text(json.dumps({"eos_token_id": None}))
+    assert model_stop_ids(str(tmp_path)) == []
