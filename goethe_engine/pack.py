@@ -464,7 +464,8 @@ def materialize(st, b, out=None):
 def main(a):
     import argparse
     ap = argparse.ArgumentParser(prog="goethe-engine pack", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
-verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}.
+verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}, and with
+--partial "weights": the names of the model files of --model-dir the branch matched (the --weights of serve).
 Without --partial every blob of every bucket is extracted and hash-checked; with --partial only the manifest signature and the blobs of the
 branch --model-dir chooses (a variant by structure, --sku, the numerics flags). --sig defaults to FILE.sig.
 need reads a PREFIX file (the first bytes of a pack: 16 bytes, the header, the manifest) and prints {"manifest_sha256", "prefix": {off, len},
@@ -491,10 +492,13 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
         need(sets, f"{d}: no model files (*.safetensors, *.gguf)")
         for fs in sets:
             try:
-                return branch(m, fs, sku=o.sku, numerics=o.numerics, act=o.act, kv=o.kv)[1]
+                bs = branch(m, fs, sku=o.sku, numerics=o.numerics, act=o.act, kv=o.kv)[1]
+                chosen[:] = [os.path.basename(f) for f in fs]
+                return bs
             except PackError as e:
                 last = e
         raise last
+    chosen = []
     try:
         if o.cmd == "need":
             with open(o.file, "rb") as f:
@@ -519,7 +523,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
             else:
                 st.ensure(None)
             print(json.dumps(dict(ok=True, manifest_sha256=st.manifest_sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
-                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]))))
+                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}))))
         else:
             for b in m["buckets"]:
                 print(f"{b['id']:40s} {b['variant']:10s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")

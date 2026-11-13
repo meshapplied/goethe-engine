@@ -315,7 +315,8 @@ def test_verify_partial_checks_the_manifest_signature_and_the_branch(tmp_path, k
     d.mkdir()
     os.link(w, d / "w.gguf")
     P.main(["verify", pack, "--partial", "--model-dir", str(d), "--sku", "mock"])
-    assert json.loads(capsys.readouterr().out)["ok"]
+    j = json.loads(capsys.readouterr().out)
+    assert j["ok"] and j["weights"] == ["w.gguf"]
     h = sorted(P.stage(pack, trusted=(key.kid,), defer=True).blobs)[0]
     _hole(pack, h)
     with pytest.raises(SystemExit, match="does not hash"):
