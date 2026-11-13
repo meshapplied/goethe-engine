@@ -4,20 +4,22 @@ index.json (signed by index.sig, sign.py scheme, detached over the exact bytes):
   {"schema": "gc-pack-index", "version": 2, "serial": int >= 1 (monotonic), "issued": "YYYY-MM-DDTHH:MM:SSZ",
    "expires": same format,
    "entries": [{"model": {"hf_repo": str, "revision": str, "format": "gguf" | "safetensors",
-                          "files": {file name: sha256 hex}},          # the model's whole per-file sha256 set
+                          "files": {file name: sha256 hex},           # optional: the model's whole per-file sha256 set (exact identity)
+                          "structure": {"sha256": hex, "keys": [str]}},   # optional: structural identity (structure.py)
                 "arch": "sm_120a", "abi_major": 2, "runtime": {"kind": str, "version": int}, "tier": str,
                 "file_sha256": hex,                                   # the .gcpack file, named by its sha256 in the store
                 "sig": {gc-sig-1 object},                             # detached signature over the exact file bytes
                 "size": int bytes of the file, "min_engine": "MAJOR.MINOR.PATCH"}]}
 Unknown extra keys are ignored; any other "version" is refused."""
 import argparse
+import glob
 import json
 import os
 import re
 import sys
 from datetime import datetime, timezone
 
-from . import __version__, pack, sign
+from . import __version__, pack, sign, structure
 
 SCHEMA, VERSION = "gc-pack-index", 2
 HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -53,9 +55,12 @@ def validate_entry(e, i):
     need(isinstance(m.get("hf_repo"), str) and m["hf_repo"] and isinstance(m.get("revision"), str) and m["revision"],
          f"{w}: model needs hf_repo and revision")
     need(m.get("format") in ("gguf", "safetensors"), f"{w}: model format")
-    f = m.get("files")
-    need(isinstance(f, dict) and f and all(isinstance(k, str) and k and HEX.match(str(v)) for k, v in f.items()),
+    f, st = m.get("files"), m.get("structure")
+    need(st is not None or (isinstance(f, dict) and f), f"{w}: model needs files (exact) or a structure")
+    need(f is None or (isinstance(f, dict) and all(isinstance(k, str) and k and HEX.match(str(v)) for k, v in f.items())),
          f"{w}: model files must map names to sha256")
+    need(st is None or (isinstance(st, dict) and HEX.match(str(st.get("sha256"))) and isinstance(st.get("keys"), list)
+                        and all(isinstance(k, str) for k in st["keys"])), f"{w}: model structure needs sha256 and keys")
     need(isinstance(e.get("arch"), str) and re.fullmatch(r"sm_\d+[a-z]?", e["arch"]), f"{w}: arch is not sm_XX")
     need(isinstance(e.get("abi_major"), int) and e["abi_major"] >= 0, f"{w}: abi_major")
     r = e.get("runtime")
@@ -103,15 +108,62 @@ def dir_files(entry_files, model_dir):
     return out
 
 
+def model_sets(model_dir):
+    """The file sets of model_dir that can be one model: a checkpoint's shards (all *.safetensors), else each GGUF (a sharded one
+    -0000k-of-0000n.gguf together). Header-only readers take these."""
+    st = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+    if st:
+        return [st]
+    sets = {}
+    for p in sorted(glob.glob(os.path.join(model_dir, "*.gguf"))):
+        sets.setdefault(re.sub(r"-\d+-of-\d+\.gguf$", ".gguf", p), []).append(p)
+    return list(sets.values())
+
+
+def identity(e, model_dir, sets=None, memo=None):
+    """"exact" (every file the entry names is in model_dir with its sha256), "structural" (a file set of model_dir has the
+    structure the entry names), else None. The structure is read from headers; the exact check only hashes if the entry has files."""
+    m = e["model"]
+    st, memo = m.get("structure"), {} if memo is None else memo
+    if st is not None:
+        key = tuple(st["keys"])
+        if key not in memo:
+            memo[key] = {}
+        ok = False
+        for fs in (model_sets(model_dir) if sets is None else sets):
+            k2 = (key, tuple(fs))
+            if k2 not in memo[key]:
+                try:
+                    memo[key][k2] = structure.structure(fs, st["keys"])["sha256"]
+                except (structure.StructureError, OSError, ValueError):
+                    memo[key][k2] = None
+            if memo[key][k2] == st["sha256"]:
+                ok = True
+                break
+        if not ok:
+            return None
+        if m.get("files") and dir_files(m["files"], model_dir) == m["files"]:
+            return "exact"
+        return "structural"
+    return "exact" if dir_files(m["files"], model_dir) == m["files"] else None
+
+
 def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):
-    """Like match, with the identity read from model_dir: an entry matches when every file it names is in model_dir
-    with that sha256. Candidates are the entries for this arch, ABI, runtime and engine version; best first (see RT_PREF)."""
+    """Like match, with the identity read from model_dir: an entry matches when a file set of model_dir has its structure
+    (header-only) or every file it names is there with that sha256. Candidates are the entries for this arch, ABI, runtime and
+    engine version; best first: exact identity, then see RT_PREF. Each returned entry carries "identity": "exact" | "structural"."""
     ev, la = vtuple(engine_version, "engine version"), pack.semver(pack.ABI)[0]
-    hit = [e for e in ix["entries"] if e["arch"] == arch and e["abi_major"] == la
-           and e["runtime"]["version"] in pack.RUNTIMES.get(e["runtime"]["kind"], ())
-           and vtuple(e["min_engine"], "min_engine") <= ev and (tier is None or e["tier"] == tier)
-           and dir_files(e["model"]["files"], model_dir) == e["model"]["files"]]
-    return sorted(hit, key=lambda e: (RT_PREF.get(e["runtime"]["kind"], 9), -len(e["model"]["files"]), e["tier"], e["file_sha256"]))
+    memo, sets = {}, model_sets(model_dir)
+    hit = []
+    for e in ix["entries"]:
+        if not (e["arch"] == arch and e["abi_major"] == la and e["runtime"]["version"] in pack.RUNTIMES.get(e["runtime"]["kind"], ())
+                and vtuple(e["min_engine"], "min_engine") <= ev and (tier is None or e["tier"] == tier)):
+            continue
+        idy = identity(e, model_dir, sets, memo)
+        if idy:
+            hit.append(dict(e, identity=idy))
+    return sorted(hit, key=lambda e: (e["identity"] != "exact", RT_PREF.get(e["runtime"]["kind"], 9), -len(e["model"].get("files") or {}),
+                                      e["tier"], e["file_sha256"]))
 
 
 def main(argv, trusted=None):
@@ -119,8 +171,10 @@ def main(argv, trusted=None):
     ap = argparse.ArgumentParser(prog="goethe-engine", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
 Commands (cmd = verify for `index verify`, match for `pack match`); offline, JSON on stdout.
   index verify  -> {"serial", "expires", "keyid", "entries"}
-  pack match    -> the best entry whose model.files all exist in --model-dir with those sha256 (other files in the dir are
-                   ignored), for --arch, ABI major 2, a runtime this engine runs and min_engine <= --engine-version; a pair
+  pack match    -> the best entry whose model.structure (tensor table and the metadata keys the pack was compiled with,
+                   read from headers; structure.py) a file set of --model-dir has, or whose model.files all exist in --model-dir
+                   with those sha256 (other files in the dir are ignored); an exact hit outranks a structural one and the
+                   output adds "identity": "exact" | "structural", for --arch, ABI major 2, a runtime this engine runs and min_engine <= --engine-version; a pair
                    (more files) outranks its target, then tier, then file_sha256. Entry fields: model, arch, abi_major,
                    runtime, tier, file_sha256, size, sig (gc-sig-1 object: write it to FILE.gcpack.sig), min_engine.
 Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last-serial, expired), reason on stderr;

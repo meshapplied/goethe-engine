@@ -16,7 +16,7 @@ afterwards comes from the extracted directory. Any failure raises PackError.
 """
 import atexit, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
-from . import sign
+from . import sign, structure
 
 ABI = "2.0.0"                       # pack ABI semver: additive within a major
 MAGIC = b"GCPACK2\n"
@@ -90,6 +90,10 @@ def validate(m, loader_abi=ABI):
          "model weights must be named by sha256")
     need(all(w.get("of") is None or (isinstance(w["of"], int) and 0 <= w["of"] < j) for j, w in enumerate(m["model"]["weights"])),
          'a weights entry "of" must name an earlier entry')
+    st = m.get("structure")
+    need(st is None or (isinstance(st, dict) and HEX.match(st.get("sha256", "")) and isinstance(st.get("keys"), list)
+                        and isinstance(st.get("kv"), dict) and isinstance(st.get("tensors"), list)),
+         "structure needs sha256, keys, kv and tensors")
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
     ids = set()
     for b in m["buckets"]:
@@ -397,14 +401,23 @@ def check_weights(m, weights, memo=None, used=None):
     ws = m["model"]["weights"]
     used = sorted({j for i in (range(len(ws)) if used is None else used) for j in weight_span(m, i)})
     need(len(weights) > max(used), f"weights {[ws[i]['file'] for i in used]} needed, {len(weights)} files given")
+    # a pack that names its model's structure (the first file set): those weights hashes are what the gates ran on; a drafter's stay exact
+    tset = set(weight_span(m, 0)) if m.get("structure") is not None else set()
     for i in used:
         w, p = ws[i], weights[i]
         need(os.path.exists(p), f"weights {p} missing")
         st = os.stat(p)
         need(stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.getuid()) and not st.st_mode & 0o002,
              f"weights {p}: must be a regular file of this user or root and not world-writable")
-        need(st.st_size == w["bytes"], f"weights {p}: {st.st_size} bytes, manifest {w['bytes']}")
-        need(sha256_file(p, memo) == w["sha256"], f"weights {p}: sha256 differs from the manifest's {w['file']}")
+        if i not in tset:
+            need(st.st_size == w["bytes"], f"weights {p}: {st.st_size} bytes, manifest {w['bytes']}")
+            need(sha256_file(p, memo) == w["sha256"], f"weights {p}: sha256 differs from the manifest's {w['file']}")
+    if tset:     # header reads only: tensor names, shapes and types and the metadata the pack was compiled with
+        fs = [weights[i] for i in used if i in tset]
+        try:
+            structure.check(m["structure"], fs)
+        except structure.StructureError as e:
+            raise PackError(f"weights {fs}: not the structure this pack was compiled for: {e}")
 
 
 def materialize(st, b, out=None):
