@@ -79,9 +79,9 @@ def validate(m, loader_abi=ABI):
         need(isinstance(v.get("weights"), list) and v["weights"] and all(isinstance(i, int) and 0 <= i < len(ws) for i in v["weights"]),
              f"variant {vid}: weights indices")
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
-    raw = m.get("blobs", {})
+    raw = m.get("blob_raw", {})
     need(isinstance(raw, dict) and all(HEX.match(h) and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_RAW
-                                       for h, n in raw.items()), "manifest blobs: {sha256: raw bytes <= 4 GiB}")
+                                       for h, n in raw.items()), "manifest blob_raw: {sha256: raw bytes <= 4 GiB}")
     ids = set()
     for b in m["buckets"]:
         for k in ("id", "role", "sku", "contract", "ncol", "maxctx", "files", "lib", "requires"):
@@ -176,7 +176,8 @@ class Staged:
             self.f.seek(self.base + off)
             hh, left = hashlib.sha256(), ln
             dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
-            pin = self.manifest.get("blobs", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
+            pin = self.manifest.get("blob_raw", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
+            need(pin is not None or not codec, f"blob {bh}: xz without a raw size pinned in the signed manifest (refused)")
             cap = MAX_RAW if pin is None else min(pin, MAX_RAW)
             out = 0
 

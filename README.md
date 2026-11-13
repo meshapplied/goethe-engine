@@ -8,7 +8,7 @@ Kernel packs (one signed `.gcpack` file per model and GPU architecture, pack ABI
 Loading is offline and fails closed: pinned signing key over the manifest, blob hashes, ABI, architecture, runtime. A pack names the
 structure of the models it was compiled for (tensor table and metadata keys, never weight values), so it serves any weights of that
 structure, finetunes included. Only the blobs of the branch the weights choose are read, each hash-checked, so a partly downloaded file
-is enough.
+is enough. A blob may be stored xz compressed; its raw size is pinned in the signed manifest (`blob_raw`: {sha256: bytes}) and the decode is bounded by it (an xz blob without a pin is refused).
 
 ## Install
 

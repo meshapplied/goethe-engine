@@ -451,18 +451,23 @@ def test_weight_files_may_be_resharded_reordered_and_are_found_by_tensor_name(tm
 
 # --- xz blobs: [off, len, "xz"], name = sha256 of the raw bytes
 
-def _xz(pack, key, how):
-    """Re-write the toy pack with its first blob stored by how(raw) -> (stored bytes, codec)."""
+def _xz(pack, key, how, pin=True):
+    """Re-write the toy pack with its first blob stored by how(raw) -> (stored bytes, codec), its raw size pinned and re-signed."""
     h0 = []
 
     def edit(man, blobs):
         h0.append(sorted(blobs)[0])
+        if pin:
+            m = json.loads(man)
+            m["blob_raw"] = {h0[0]: len(blobs[h0[0]])}
+            man = json.dumps(m, indent=1, sort_keys=True).encode() + b"\n"
         return man, dict(blobs, **{h0[0]: how(blobs[h0[0]])})
     _rewrite(pack, edit)
+    key.sign_pack(pack)
     return h0[0]
 
 
-def test_xz_blob_loads_and_stored_still_does(tmp_path, key, mocklib):
+def test_xz_blob_loads_with_a_pin_and_stored_still_does(tmp_path, key, mocklib):
     import lzma
     pack = toy_pack(str(tmp_path), key, mocklib)[0]
     _xz(pack, key, lambda b: (lzma.compress(b), "xz"))
@@ -513,7 +518,7 @@ def test_blob_raw_size_pin_is_signed_and_bounds_the_decode(tmp_path, key, mockli
     def build(pin, pack_):
         def edit(man, blobs):
             m = json.loads(man)
-            m["blobs"] = {h: pin}
+            m["blob_raw"] = {h: pin}
             return json.dumps(m, indent=1, sort_keys=True).encode() + b"\n", dict(blobs, **{h: (lzma.compress(b), "xz")})
         _rewrite(pack_, edit)
         sign_pack(pack_)
@@ -525,4 +530,13 @@ def test_blob_raw_size_pin_is_signed_and_bounds_the_decode(tmp_path, key, mockli
         P.verify(pack, trusted=(key.kid,))
     build(len(b) + 1, pack)
     with pytest.raises(P.PackError, match="pins"):
+        P.verify(pack, trusted=(key.kid,))
+
+
+def test_xz_blob_without_a_signed_raw_size_is_refused_but_stored_unpinned_loads(tmp_path, key, mocklib):
+    import lzma
+    pack = toy_pack(str(tmp_path), key, mocklib)[0]
+    P.verify(pack, trusted=(key.kid,))                      # stored blobs, no `blobs` field: loads
+    _xz(pack, key, lambda b: (lzma.compress(b), "xz"), pin=False)
+    with pytest.raises(P.PackError, match="without a raw size"):
         P.verify(pack, trusted=(key.kid,))
