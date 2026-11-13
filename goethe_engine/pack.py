@@ -4,7 +4,8 @@ NAME.gcpack.sig (gc-sig-1, over the exact file bytes). Layout (stdlib framing):
 
   b"GCPACK2\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len]}})  payload
   offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by its sha256
-Weights are not in the pack: the manifest names them by sha256 and the loader checks the file it is given.
+Weights are not in the pack: the manifest names them by sha256 and the loader checks the file it is given
+(a checkpoint's later shards name its first file in "of" and are checked with it).
 
 stage() copies the file into a private 0700 directory while hashing it, verifies the signature on that copy, extracts the
 manifest and blobs there (each blob re-hashed), checks ABI major, arch and runtime, and drops the copy; everything loaded
@@ -87,6 +88,8 @@ def validate(m, loader_abi=ABI):
         need(k in m, f"manifest lacks {k}")
     need(m["model"].get("weights") and all(HEX.match(w.get("sha256", "")) for w in m["model"]["weights"]),
          "model weights must be named by sha256")
+    need(all(w.get("of") is None or (isinstance(w["of"], int) and 0 <= w["of"] < j) for j, w in enumerate(m["model"]["weights"])),
+         'a weights entry "of" must name an earlier entry')
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
     ids = set()
     for b in m["buckets"]:
@@ -346,12 +349,18 @@ def prefill(m, b):
                 and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["prefill"], default=None)
 
 
+def weight_span(m, i):
+    """Manifest weights indices of the file set that starts at index i: the entry itself and the later shards that name it in "of"."""
+    ws = m["model"]["weights"]
+    return [i] + [j for j, w in enumerate(ws) if j != i and w.get("of") == i]
+
+
 def check_weights(m, weights, memo=None, used=None):
     """The weights files given (in model.weights order) hash to the manifest's sha256 values; used: the indices the
     loaded buckets read (default all), each of which must be given. A file must belong to this user or root and be
     not world-writable (the runtime reads it again after this check)."""
     ws = m["model"]["weights"]
-    used = sorted(set(range(len(ws)) if used is None else used))
+    used = sorted({j for i in (range(len(ws)) if used is None else used) for j in weight_span(m, i)})
     need(len(weights) > max(used), f"weights {[ws[i]['file'] for i in used]} needed, {len(weights)} files given")
     for i in used:
         w, p = ws[i], weights[i]

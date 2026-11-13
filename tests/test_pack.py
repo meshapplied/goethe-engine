@@ -206,6 +206,30 @@ def test_weights_must_not_be_world_writable(toy, key):
         P.check_weights(m, [toy[1], toy[2]])
 
 
+def test_every_shard_of_a_file_set_is_checked(tmp_path, key, mocklib):
+    """A weights entry that names file 0 in "of" is a later shard of that set: it is hashed with it."""
+    pack, s0, s1 = toy_pack(str(tmp_path), key, mocklib, mutate=lambda m: m["model"]["weights"][1].update(of=0))
+    m = P.verify(pack, trusted=(key.kid,))
+    assert P.weight_span(m, 0) == [0, 1]
+    P.check_weights(m, [s0, s1], used=[0])
+    open(s1, "wb").write(b"swapped!")
+    with pytest.raises(P.PackError, match="sha256 differs"):
+        P.check_weights(m, [s0, s1], used=[0])
+    with pytest.raises(P.PackError, match="1 files given|needed"):
+        P.check_weights(m, [s0], used=[0])
+
+
+def test_shard_of_must_name_an_earlier_entry(tmp_path, key, mocklib):
+    with pytest.raises(P.PackError, match='"of"'):
+        P.verify(toy_pack(str(tmp_path), key, mocklib, mutate=lambda m: m["model"]["weights"][0].update(of=1))[0], trusted=(key.kid,))
+
+
+def test_a_pair_keeps_target_and_drafter_files_apart(tmp_path, key, mocklib):
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True)
+    m = P.verify(pack, trusted=(key.kid,))
+    assert P.weight_span(m, 0) == [0] and P.weight_span(m, 1) == [1]
+
+
 def test_pinned_key_is_the_release_key():
     pem = ("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcvBeilUyHdQbvn9eHVjUZkn0Og4n\n"
            "QvHAoaZr1KzcHGsBptYLZktabraS2V1K6eC6lDlagNe/6mOmPCcYLkK4kg==\n-----END PUBLIC KEY-----\n")
