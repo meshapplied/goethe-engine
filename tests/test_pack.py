@@ -498,3 +498,31 @@ def test_xz_memlimit_truncated_and_wrong_codec_refused(tmp_path, key, mocklib, m
         monkeypatch.setattr(P, "XZ_MEM", 1 << 16 if i == 0 else 64 << 20)    # i = 0: the dictionary needs more than the limit
         with pytest.raises(P.PackError, match=err):
             P.verify(pack, trusted=(key.kid,))
+
+
+def test_blob_raw_size_pin_is_signed_and_bounds_the_decode(tmp_path, key, mocklib, monkeypatch):
+    import lzma
+    pack = toy_pack(str(tmp_path), key, mocklib)[0]
+    raw = open(pack, "rb").read()
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(raw[16:16 + n])
+    h = sorted(hdr["blobs"])[0]
+    o, l = hdr["blobs"][h][:2]
+    b = raw[16 + n + o:16 + n + o + l]
+
+    def build(pin, pack_):
+        def edit(man, blobs):
+            m = json.loads(man)
+            m["blobs"] = {h: pin}
+            return json.dumps(m, indent=1, sort_keys=True).encode() + b"\n", dict(blobs, **{h: (lzma.compress(b), "xz")})
+        _rewrite(pack_, edit)
+        sign_pack(pack_)
+    sign_pack = key.sign_pack
+    build(len(b), pack)
+    P.verify(pack, trusted=(key.kid,))                      # exact pin: loads
+    build(len(b) - 1, pack)
+    with pytest.raises(P.PackError, match="inflates past"):
+        P.verify(pack, trusted=(key.kid,))
+    build(len(b) + 1, pack)
+    with pytest.raises(P.PackError, match="pins"):
+        P.verify(pack, trusted=(key.kid,))

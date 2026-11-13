@@ -79,6 +79,9 @@ def validate(m, loader_abi=ABI):
         need(isinstance(v.get("weights"), list) and v["weights"] and all(isinstance(i, int) and 0 <= i < len(ws) for i in v["weights"]),
              f"variant {vid}: weights indices")
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
+    raw = m.get("blobs", {})
+    need(isinstance(raw, dict) and all(HEX.match(h) and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_RAW
+                                       for h, n in raw.items()), "manifest blobs: {sha256: raw bytes <= 4 GiB}")
     ids = set()
     for b in m["buckets"]:
         for k in ("id", "role", "sku", "contract", "ncol", "maxctx", "files", "lib", "requires"):
@@ -173,12 +176,14 @@ class Staged:
             self.f.seek(self.base + off)
             hh, left = hashlib.sha256(), ln
             dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
+            pin = self.manifest.get("blobs", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
+            cap = MAX_RAW if pin is None else min(pin, MAX_RAW)
             out = 0
 
             def put(o, b):
                 nonlocal out
                 out += len(b)
-                need(out <= MAX_RAW, f"blob {bh}: inflates past {MAX_RAW} bytes (refused)")
+                need(out <= cap, f"blob {bh}: inflates past {cap} bytes (refused)")
                 hh.update(b)
                 o.write(b)
             try:
@@ -191,15 +196,16 @@ class Staged:
                             put(o, chunk)
                             continue
                         try:
-                            b = dec.decompress(chunk, 1 << 20)
+                            b = dec.decompress(chunk, min(1 << 20, cap + 1 - out))
                             while True:
                                 put(o, b)
                                 if dec.needs_input or dec.eof:
                                     break
-                                b = dec.decompress(b"", 1 << 20)
+                                b = dec.decompress(b"", min(1 << 20, cap + 1 - out))
                         except (lzma.LZMAError, EOFError) as e:
                             raise PackError(f"blob {bh}: xz: {e}")
                     need(not dec or (dec.eof and not dec.unused_data and not left), f"blob {bh}: xz stream truncated or followed by data")
+                need(pin is None or out == pin, f"blob {bh}: {out} raw bytes, the manifest pins {pin}")
             except PackError:
                 if os.path.exists(dst):
                     os.unlink(dst)
