@@ -17,6 +17,7 @@ directory, verified there, extracted, and loaded from that copy.
 
     goethe-engine serve --pack FILE.gcpack --weights W [DRAFTER_W] [--tokenizer DIR] [--host H] [--port P]
                         [--context-length N] [--max-running-requests N] [--served-model-name S] [--api-key K]
+                        [--numerics exact|deterministic|fast] [--act auto|a8|a16] [--kv auto|f16|fp8]
     goethe-engine serve --ref                               # CPU reference model, to try the API
     goethe-engine index verify --index F --sig F            # signed pack index: serial, expiry, entries
     goethe-engine pack match --index F --sig F --model-dir DIR --arch sm_XX   # entry for the model files in DIR, exit 3 if none
