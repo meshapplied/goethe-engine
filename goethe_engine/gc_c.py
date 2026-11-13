@@ -121,6 +121,8 @@ class GcBackend:
             self.bucket = b
             self.stage.ensure(lad + ([pf] if pf else []))        # only the chosen branch's blobs are read from the pack
         P.check_weights(m, ws, dws)
+        if not self.spec:   # weights, slots and the smallest pool must fit the device; no pool_blocks: the largest that fits
+            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, P.device_free(device), pool_blocks, what=b["id"])
         top = lad[-1]
         libpath = os.path.join(P.materialize(self.stage, top), top["lib"])
         self.L = bind(libpath)

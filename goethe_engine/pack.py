@@ -421,6 +421,57 @@ def ladder(m, b):
                    and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["ncol"])
 
 
+MIB = 1 << 20
+
+
+def device_free(idx=None):
+    """Free bytes of CUDA device idx (default: the current one), through the driver API; None without a driver."""
+    import ctypes as C
+    try:
+        cu = C.CDLL("libcuda.so.1")
+        ctx, free, tot = C.c_void_p(), C.c_size_t(), C.c_size_t()
+        if cu.cuInit(0) or cu.cuDevicePrimaryCtxRetain(C.byref(ctx), max(idx or 0, 0)) or cu.cuCtxSetCurrent(ctx) or cu.cuMemGetInfo_v2(C.byref(free), C.byref(tot)):
+            return None
+        return free.value
+    except OSError:
+        return None
+
+
+def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"):
+    """(pool_blocks or None, resident bytes) for opening the ladder lad on a device with free bytes: resident = the ladder's distinct weight
+    sets + fixed regions + slot bytes * (slots + state_pages) + block bytes * pool_blocks, from each bucket's manifest `resident`.
+    pool_blocks None: the largest pool that fits (None when the pack's full pool does, or the pack has no paged KV). Refuses, with
+    the numbers, a pack whose weights and smallest pool (one full context) do not fit, or an explicit pool_blocks that does not.
+    free None or a bucket without `resident` (an older pack): no check."""
+    rs = [b.get("resident") for b in lad]
+    if free is None or not all(rs):
+        return pool_blocks, None
+    top = rs[-1]
+    weights = sum({r["wset"]: r["weights"] for r in rs}.values())
+    base = weights + sum(r["fixed"] for r in rs) + top["slot"] * (top["slots"] + state_pages)
+    blk, rows = top["block"], top["block_rows"]
+    per_seq = lad[-1]["maxctx"] // rows if rows else 0
+    full = top["slots"] * per_seq
+    budget = free - margin
+
+    def gb(x):
+        return f"{x / 1e9:.2f} GB"
+    if blk == 0:
+        need(base <= budget, f"{what}: needs {gb(base)} on the device (weights {gb(weights)}, {top['slots']} sequence slots), "
+                             f"{gb(max(free, 0))} free with a {gb(margin)} margin kept; fewer columns or a smaller context")
+        return pool_blocks, base
+    least = base + blk * per_seq
+    need(least <= budget, f"{what}: needs {gb(least)} on the device (weights {gb(weights)}, {top['slots']} sequence slots {gb(top['slot'] * (top['slots'] + state_pages))}, "
+                          f"one full context of KV {gb(blk * per_seq)}), {gb(max(free, 0))} free with a {gb(margin)} margin kept; "
+                          f"open a ladder with fewer columns or a smaller maxctx")
+    if pool_blocks:
+        need(base + blk * pool_blocks <= budget, f"{what}: pool_blocks {pool_blocks} needs {gb(base + blk * pool_blocks)}, {gb(max(free, 0))} free "
+                                                  f"with a {gb(margin)} margin kept (at most {(budget - base) // blk} blocks fit)")
+        return pool_blocks, base + blk * pool_blocks
+    fits = int((budget - base) // blk)
+    return (None, base + blk * full) if fits >= full else (fits, base + blk * fits)
+
+
 def prefill(m, b):
     """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
     sequence a launch beside b's ladder) with b's SKU, contract, role and maxctx, or None."""
