@@ -412,6 +412,9 @@ def place_weights(m, variant, files, allw=None):
     """allw (a list with one slot per model.weights entry): the files of variant placed at its slots, in the order given."""
     idx = m["variants"][variant]["weights"]
     need(len(files) == len(idx), f"variant {variant} takes {len(idx)} weight file(s), {len(files)} given")
+    # the runtime of this release binds a weight by its file's slot: one file per role is the one case that cannot misbind (a resharded
+    # checkpoint with as many files would bind tensors to the wrong file); several files need the by-name runtime of the next release
+    need(len(idx) == 1, f"variant {variant} lists {len(idx)} weight files: this release takes one weight file per role ({len(files)} given)")
     allw = [None] * len(m["model"]["weights"]) if allw is None else allw
     for i, f in zip(idx, files):
         allw[i] = f

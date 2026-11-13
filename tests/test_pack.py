@@ -427,3 +427,13 @@ def test_backend_runs_the_variant_the_weights_choose_and_refuses_other_weights(t
     gguf(str(tmp_path / "other.gguf"), [("a.weight", [64, 8], 12), ("b.weight", [64], 0)])
     with pytest.raises(P.PackError, match="not a model this pack was compiled for"):
         GcBackend(pack, str(tmp_path / "other.gguf"), B=2, sku="mock", trusted=(key.kid,))
+
+
+def test_a_variant_with_several_weight_files_is_refused_never_bound_by_position(tmp_path, key, mocklib):
+    """Weights bind by file slot in this release: a variant that lists two files is refused with the counts, so a resharded checkpoint cannot misbind."""
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, mutate=lambda m: m["variants"]["q4"].update(weights=[0, 1]))
+    m = P.verify(pack, trusted=(key.kid,))
+    with pytest.raises(P.PackError, match="lists 2 weight files.*1 given|takes 2 weight file.*1 given"):
+        P.place_weights(m, "q4", [w])
+    with pytest.raises(P.PackError, match="lists 2 weight files.*2 given"):
+        P.place_weights(m, "q4", [w, dw])
