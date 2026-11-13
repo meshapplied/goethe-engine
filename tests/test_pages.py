@@ -122,3 +122,72 @@ def test_paged_bounded_pack_runs_many_sequences_without_block_sharing():
     out = run(e)
     st = [o.stats for o in out if o.finished]
     assert len(st) == 3 and all(s["cached_tokens"] == 0 for s in st)
+
+
+def test_bounded_prefix_cache_restores_state_and_shares_blocks():
+    from conftest import FakeBounded
+
+    def gen(be, reqs, **cfg):
+        e = Engine(be, Config(max_model_len=60, **cfg))
+        outs = []
+        for i, (p, sp) in enumerate(reqs):
+            e.add_request(i, p, sp)
+            outs += run(e)
+        return e, toks(outs), {o.rid: o.stats for o in outs if o.finished}
+
+    base = prompt(21)
+    reqs = [(base, P(max_tokens=6)), (base + [9, 8], P(max_tokens=6)), (base, P(max_tokens=6))]
+    be = FakeBounded(blocks := 48, 4, seqs=3, spare=3)
+    e, got, st = gen(be, reqs)
+    cold = {}
+    for i, (p, sp) in enumerate(reqs):
+        _, g, _ = gen(FakeBounded(blocks, 4, seqs=3, spare=3), [(p, sp)], prefix_cache=False)
+        cold[i] = g[(0, 0)]
+    assert [got[(i, 0)] for i in range(3)] == [cold[i] for i in range(3)]
+    assert st[1]["cached_tokens"] == 20 and st[2]["cached_tokens"] == 20      # a hit at the snapshot's position only
+    assert any(l[0] == "restore" for l in be.log) and any(l[0] == "save" for l in be.log)
+    e.kv.check([])
+
+
+def test_bounded_cache_evicts_snapshots_and_never_leaks_blocks():
+    from conftest import FakeBounded
+
+    be = FakeBounded(40, 4, seqs=2, spare=1)
+    e = Engine(be, Config(max_model_len=60, max_num_seqs=2))
+    for b in range(1, 9):
+        e.add_request(b, prompt(14, b), P(max_tokens=4))
+        run(e)
+    assert len(e.kv.bsnaps.keys) == 1
+    e.kv.check([])
+    free = len(e.kv.pool.free)
+    while e.kv.bsnaps.keys:
+        e.kv.bsnaps.evict_one()
+    assert len(e.kv.pool.free) == 40 and free < 40
+
+
+def test_bounded_pool_pressure_preempts_by_recompute_and_equals_alone():
+    from conftest import FakeBounded
+
+    reqs = [(prompt(n, b), P(max_tokens=9)) for n, b in ((13, 1), (9, 2), (17, 3), (13, 1), (11, 4))]
+    be = FakeBounded(14, 4, seqs=4, spare=2)
+    e = Engine(be, Config(max_model_len=40, max_num_seqs=4))
+    for i, (p, sp) in enumerate(reqs):
+        e.add_request(i, p, sp)
+    got = toks(run(e))
+    assert e.sched.preemptions > 0
+    for i, (p, sp) in enumerate(reqs):
+        assert got[(i, 0)] == fake_greedy_b(p, 9), i
+    e.kv.check([])
+
+
+def fake_greedy_b(tokens, k):
+    from conftest import fold, row
+    h, out, toks_ = 7, [], list(tokens)
+    for p, t in enumerate(toks_):
+        h = fold(h, t, p)
+    for _ in range(k):
+        t = int(row(fold(h, toks_[0], 0)).argmax())
+        out.append(t)
+        h = fold(h, t, len(toks_))
+        toks_.append(t)
+    return out

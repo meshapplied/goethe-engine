@@ -29,10 +29,11 @@ class Engine:
         cfg = cfg or Config()
         g = backend.geometry
         linear = bool(getattr(backend, "spec_width", 0))   # a spec pair runs one stream; page packs run many (a block is a sequence page)
-        snaps = 0 if linear or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
+        bounded = bool(getattr(backend, "bounded", False))
+        snaps = 0 if linear or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
         if cfg.max_num_seqs is None or cfg.prefix_cache is None:   # unset knobs follow what the backend can do; explicit ones are checked below
             cfg = replace(cfg, max_num_seqs=(1 if linear else min(64, backend.max_seqs)) if cfg.max_num_seqs is None else cfg.max_num_seqs,
-                          prefix_cache=(snaps > 0 if not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"] and getattr(backend, "prefix_cache", True)) if cfg.prefix_cache is None else cfg.prefix_cache)
+                          prefix_cache=(snaps > 0 if bounded or not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"] and getattr(backend, "prefix_cache", True)) if cfg.prefix_cache is None else cfg.prefix_cache)
         if g.dtype != cfg.kv_dtype:
             raise ValueError(f"backend KV dtype {g.dtype} != config {cfg.kv_dtype} (fp8 is an explicit opt-in)")
         if cfg.max_num_seqs > backend.max_seqs:
@@ -41,11 +42,9 @@ class Engine:
             raise ValueError("token budget below one verify step")
         self.backend, self.cfg, self.grammar, self.eos = backend, cfg, grammar, set(eos_ids)
         self.width = getattr(backend, "spec_width", 0)
-        pages = 0 if self.width or getattr(backend, "paged", True) else getattr(backend, "state_pages", 0)
-        if cfg.prefix_cache and not pages and (self.width or not getattr(backend, "paged", True)):
+        pages = 0 if self.width or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
+        if cfg.prefix_cache and not pages and (self.width or bounded or not getattr(backend, "paged", True)):
             raise ValueError("backend has no prefix cache: no paged KV and no snapshot pages")
-        if cfg.prefix_cache and not pages and not getattr(backend, "prefix_cache", True):
-            raise ValueError("backend holds bounded state (window ring, recurrent) in its slots: a prefix cannot be shared by block")
         if cfg.max_model_len > getattr(backend, "max_len", cfg.max_model_len):
             raise ValueError(f"max_model_len exceeds the backend's {backend.max_len}")
         self.caps = caps_of(backend)
@@ -62,7 +61,7 @@ class Engine:
             for k, n in self.caps["taps"].items():
                 at[k], off = range(off, off + n), off + n
             self.cols = torch.tensor([c for k in need for c in at[k]])
-        self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages)
+        self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages, bounded)
         self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size)
         self.inbox, self.live, self.counter = deque(), {}, 0
         self.m = dict(steps=0, prompt_tokens=0, generation_tokens=0, prefix_hit_tokens=0, aborted=0, errors=0,
@@ -147,8 +146,12 @@ class Engine:
         self._emit(s, [], reason, error)
 
     def _copy(self, pairs):
+        ops = [p for p in pairs if p[0] == "save"]
+        pairs = [p for p in pairs if p[0] != "save"]
         if pairs:
             self.backend.copy_blocks(pairs)
+        for _, sid, snap in ops:
+            self.backend.save_state(sid, snap)
 
     def _flush(self):
         out, self._out = list(self._out.values()), {}
@@ -175,6 +178,10 @@ class Engine:
                 for it in items]
         try:
             self._copy(copies)
+            for it in items:
+                if it.seq.restore is not None and self.kv.bsnaps:
+                    self.backend.restore_state(it.seq.restore, it.seq.sid)
+                    it.seq.restore = None
             logits, feats = self.backend.step(work), None
             if self.feats:
                 logits, feats = logits

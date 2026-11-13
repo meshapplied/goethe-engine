@@ -187,6 +187,12 @@ GC_API int gc_commit(gc_handle *h, uint64_t sid, uint32_t base, const uint32_t *
  * ring, recurrent state) of a page pack. */
 GC_API int gc_copy_blocks(gc_handle *h, const uint32_t *src, const uint32_t *dst, uint32_t n);
 
+/* 1.1, GC_L_BOUNDED only: copy a sequence's bounded state (window rings, recurrent state; not its KV blocks) into snapshot page
+ * snap (0 .. gc_layout.state_pages - 1), or back into a sequence's slot (assigned on first contact; the next step then runs at the
+ * snapshot's position). Exact only at the position the snapshot was taken. GC_E_ARG on a library without GC_L_BOUNDED. */
+GC_API int gc_state_save(gc_handle *h, uint64_t sid, uint32_t snap);
+GC_API int gc_state_restore(gc_handle *h, uint32_t snap, uint64_t sid);
+
 /* Releases a sequence's slot, recurrent state and spec state. Unknown sid is not an error. */
 GC_API int gc_release(gc_handle *h, uint64_t sid);
 

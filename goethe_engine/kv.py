@@ -166,11 +166,59 @@ class StateCache:
         assert sorted(self.free + used) == list(range(self.first, self.first + self.n)), "snapshot page leaked or twice owned"
 
 
+class BoundedCache:
+    """Prefix cache of a paged pack whose sequences also hold bounded state (window ring, recurrent state). That state is exact
+    at one position, so an entry is the exact tokens it followed, the KV blocks that cover them (held by the entry) and a
+    snapshot slot holding the bounded state; a hit shares the blocks and restores the snapshot. Snapshot slots are 0 .. n - 1."""
+
+    def __init__(self, pool, n):
+        self.pool, self.n, self.free, self.keys, self.tick = pool, n, list(range(n - 1, -1, -1)), {}, 0
+
+    def match(self, tokens, touch=True):
+        """(entry, pos) of the longest entry that is a prefix of tokens[:-1], else (None, 0)."""
+        self.tick += touch
+        for pos in sorted({len(k) for k in self.keys}, reverse=True):
+            e = self.keys.get(tuple(tokens[:pos])) if pos < len(tokens) else None
+            if e:
+                if touch:
+                    e[2] = self.tick
+                return e, pos
+        return None, 0
+
+    def evict_one(self):
+        k = min(self.keys, key=lambda k: self.keys[k][2])
+        snap, blocks, _ = self.keys.pop(k)
+        for b in blocks:
+            self.pool.decref(b)
+        self.free.append(snap)
+
+    def put(self, tokens, blocks):
+        """The snapshot slot to save the state that followed tokens into, or None if cached already / no slot."""
+        key = tuple(tokens)
+        self.tick += 1
+        if key in self.keys:
+            self.keys[key][2] = self.tick
+            return None
+        if not self.free and self.keys:
+            self.evict_one()
+        if not self.free:
+            return None
+        for b in blocks:
+            self.pool.incref(b)
+        snap = self.free.pop()
+        self.keys[key] = [snap, list(blocks), self.tick]
+        return snap
+
+    def check(self):
+        assert sorted(self.free + [e[0] for e in self.keys.values()]) == list(range(self.n)), "snapshot slot leaked or twice owned"
+
+
 class KVManager:
-    def __init__(self, num_blocks, bs, prefix_cache=True, state_pages=0):
+    def __init__(self, num_blocks, bs, prefix_cache=True, state_pages=0, bounded=False):
         self.bs, self.pool = bs, BlockPool(num_blocks)
         self.cache = RadixCache(self.pool, bs) if prefix_cache and not state_pages else None
-        self.snaps = StateCache(num_blocks, state_pages) if prefix_cache and state_pages else None
+        self.snaps = StateCache(num_blocks, state_pages) if prefix_cache and state_pages and not bounded else None
+        self.bsnaps = BoundedCache(self.pool, state_pages) if prefix_cache and state_pages and bounded else None
 
     def match(self, tokens, touch=False):
         """Cached blocks for a prompt; the last token is never cached, its step gives the next token."""
@@ -178,9 +226,18 @@ class KVManager:
 
     def hit(self, tokens):
         """Prompt tokens the prefix cache would serve."""
+        if self.bsnaps:
+            return self.bsnaps.match(tokens, False)[1]
         return self.snaps.match(tokens, False)[1] if self.snaps else len(self.match(tokens)) * self.bs
 
     def attach(self, seq):
+        if self.bsnaps:
+            e, seq.computed = self.bsnaps.match(seq.tokens)
+            seq.blocks, seq.tpages = (list(e[1]) if e else []), 0
+            for b in seq.blocks:
+                self.pool.incref(b)
+            seq.restore = e[0] if e else None
+            return
         if self.snaps:
             seq.restore, seq.computed = self.snaps.match(seq.tokens)
             seq.blocks, seq.tpages = [], 0
@@ -201,6 +258,8 @@ class KVManager:
         short = len(cow) + fresh - len(pool.free)
         if short > 0 and self.cache:
             self.cache.evict(short)
+        while short > 0 and self.bsnaps and self.bsnaps.keys and len(cow) + fresh > len(pool.free):
+            self.bsnaps.evict_one()
         if len(cow) + fresh > len(pool.free):
             return None
         pairs = []
@@ -210,20 +269,25 @@ class KVManager:
             pool.decref(seq.blocks[i])
             seq.blocks[i] = dst
         seq.blocks += pool.take(fresh)
-        if seq.restore is not None:
+        if seq.restore is not None and self.snaps:
             pairs.append((seq.restore, seq.blocks[0]))
             seq.restore = None
         return pairs
 
     def snapshot(self, seq):
-        """Copies (page, spare) that save the sequence's page at its computed position, if that is worth a snapshot."""
+        """Copies (page, spare) that save the sequence's page at its computed position, if that is worth a snapshot; a bounded
+        pack's op is ("save", sid, slot): the state to a snapshot slot, the entry holding the blocks that cover the rows."""
+        if self.bsnaps:
+            n = seq.computed
+            snap = self.bsnaps.put(seq.tokens[:n], seq.blocks[:-(-n // self.bs)]) if seq.blocks and n else None
+            return [] if snap is None else [("save", seq.sid, snap)]
         spare = self.snaps.put(seq.tokens[:seq.computed]) if self.snaps and seq.blocks and seq.computed else None
         return [] if spare is None else [(seq.blocks[0], spare)]
 
     def commit(self, seq):
         """Index the full blocks of the computed rows; adopt the tree's block where another sequence indexed it first.
         A page pack snapshots at the last prompt token (every prompt step ends there) and returns the copies to run."""
-        if self.snaps:
+        if self.snaps or self.bsnaps:
             return self.snapshot(seq) if seq.computed == seq.nprompt - 1 else []
         nf = seq.computed // self.bs
         if not self.cache or nf <= seq.tpages:
@@ -259,7 +323,12 @@ class KVManager:
             assert len(nd.pages) == len(nd.blocks)
             for b in nd.blocks:
                 want[b] += 1
+        for e in self.bsnaps.keys.values() if self.bsnaps else []:
+            for b in e[1]:
+                want[b] += 1
         assert want == self.pool.ref, "ref counts do not match owners"
         assert sorted(self.pool.free) == [b for b, r in enumerate(want) if r == 0], "free list mismatch"
+        if self.bsnaps:
+            self.bsnaps.check()
         if self.snaps:
             self.snaps.check()

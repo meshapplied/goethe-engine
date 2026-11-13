@@ -225,4 +225,7 @@ def test_bounded_state_pack_shares_no_prefix_by_block(make, monkeypatch):
     assert not be.bounded and be.prefix_cache
     monkeypatch.setenv("GCK_MOCK_BOUNDED", "1")
     b = make()
-    assert b.paged and b.bounded and not b.prefix_cache
+    assert b.paged and b.bounded and b.state_pages == 0 and not b.prefix_cache   # the mock opens no snapshot slots
+    assert b.L.gc_state_save(b.h, 1, 0) == 0 and b.L.gc_state_restore(b.h, 0, 1) == 0
+    monkeypatch.delenv("GCK_MOCK_BOUNDED")
+    assert make().L.gc_state_save(b.h, 1, 0) != 0   # without the flag a library refuses

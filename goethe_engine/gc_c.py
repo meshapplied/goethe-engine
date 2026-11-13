@@ -61,9 +61,13 @@ def bind(path):
                gc_layout_get=(C.c_int, [C.c_void_p, P_(Layout)]), gc_step=(C.c_int, [C.c_void_p, P_(StepIn), P_(StepOut)]),
                gc_commit=(C.c_int, [C.c_void_p, C.c_uint64, C.c_uint32, P_(C.c_uint32), C.c_uint32]),
                gc_copy_blocks=(C.c_int, [C.c_void_p, P_(C.c_uint32), P_(C.c_uint32), C.c_uint32]),
+               gc_state_save=(C.c_int, [C.c_void_p, C.c_uint64, C.c_uint32]),
+               gc_state_restore=(C.c_int, [C.c_void_p, C.c_uint32, C.c_uint64]),
                gc_release=(C.c_int, [C.c_void_p, C.c_uint64]), gc_last_error=(C.c_char_p, [C.c_void_p]),
                gc_close=(None, [C.c_void_p]))
     for n, (res, args) in sig.items():
+        if n.startswith("gc_state_") and not hasattr(L, n):   # 1.1 and only with GC_L_BOUNDED: a 1.0 library has neither
+            continue
         f = getattr(L, n)
         f.restype, f.argtypes = res, args
     v = L.gc_abi_version()
@@ -80,7 +84,7 @@ class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
                  numerics="deterministic", act="auto", kv="auto"):
-        """state_pages: snapshot pages a page pack (no paged KV) gets for its prefix cache; a paged pack takes none."""
+        """state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted)
         try:
@@ -195,6 +199,12 @@ class GcBackend:
 
     def commit(self, sid, base, path):
         self._ck(self.L.gc_commit(self.h, sid, base, arr(C.c_uint32, path), len(path)))
+
+    def save_state(self, sid, snap):
+        self._ck(self.L.gc_state_save(self.h, sid, snap))
+
+    def restore_state(self, snap, sid):
+        self._ck(self.L.gc_state_restore(self.h, snap, sid))
 
     def copy_blocks(self, pairs):
         self._ck(self.L.gc_copy_blocks(self.h, arr(C.c_uint32, [s for s, _ in pairs]),

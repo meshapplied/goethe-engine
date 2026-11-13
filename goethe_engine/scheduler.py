@@ -134,7 +134,7 @@ class Scheduler:
         i, empty = 0, Tree([], [])
         while i < len(self.running) and budget > 0:
             s = self.running[i]
-            need = chunk(s, len(s.tokens) - s.computed, kv.snaps)
+            need = chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps)
             t = trees.get(s.sid, empty)
             if need + len(t) > budget:
                 if len(t) and strict(s):
@@ -174,7 +174,7 @@ class Scheduler:
                 if lead * kv.bs >= 32:
                     continue
             kv.attach(s)
-            n = min(chunk(s, len(s.tokens) - s.computed, kv.snaps), budget)
+            n = min(chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps), budget)
             if len(s.tokens) - s.computed == 1 and strict(s) and s.nout:
                 n = 0  # the anchor alone: next step's decode carries its drafts
             pairs = kv.reserve(s, s.computed + n)

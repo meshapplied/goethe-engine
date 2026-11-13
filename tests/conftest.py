@@ -204,6 +204,57 @@ class FakePages:
         pass
 
 
+class FakeBounded:
+    """A bounded paged pack: KV rows live in blocks, and a slot per sequence holds bounded state (here the running hash a real
+    pack keeps as ring and recurrent state), valid at one position. Logits depend on both, so a stale, shared or wrongly
+    restored state, or a wrong block table, changes the run."""
+
+    paged, bounded, prefix_cache, caps = True, True, True, {}
+
+    def __init__(self, num_blocks=64, bs=4, seqs=4, spare=2, vocab=V):
+        self.geometry = KVGeometry(bs, num_blocks, 1, 1, 1)
+        self.vocab_size, self.max_seqs, self.max_len, self.state_pages = vocab, seqs, bs * num_blocks, spare
+        self.kv, self.state, self.snap, self.steps, self.log = {}, {}, {}, 0, []
+
+    def step(self, work):
+        bs, rows = self.geometry.block_size, []
+        self.steps += 1
+        assert len(work) <= self.max_seqs
+        for w in work:
+            slot = lambda p: w.blocks[p // bs] * bs + p % bs
+            if w.pos == 0:
+                self.state[w.sid] = (7, 0)
+            h, n = self.state[w.sid]
+            assert n == w.pos, f"state of {w.sid} is at position {n}, step at {w.pos}"
+            for p in range(w.pos):
+                assert self.kv[slot(p)][1] == p, "stale or foreign KV row"
+            for j, t in enumerate(w.tokens):
+                self.kv[slot(w.pos + j)] = (t, w.pos + j)
+                h = fold(h, t, w.pos + j)
+                if j >= len(w.tokens) - w.want:
+                    rows.append(row(fold(h, self.kv[slot(0)][0], 0), self.vocab_size))
+            self.state[w.sid] = (h, w.pos + len(w.tokens))
+        return torch.stack(rows) if rows else torch.empty(0, self.vocab_size)
+
+    def copy_blocks(self, pairs):
+        bs = self.geometry.block_size
+        for s, d in pairs:
+            for i in range(bs):
+                if s * bs + i in self.kv:
+                    self.kv[d * bs + i] = self.kv[s * bs + i]
+
+    def save_state(self, sid, snap):
+        self.log.append(("save", sid, snap))
+        self.snap[snap] = self.state[sid]
+
+    def restore_state(self, snap, sid):
+        self.log.append(("restore", snap, sid))
+        self.state[sid] = self.snap[snap]
+
+    def release(self, sid):
+        self.state.pop(sid, None)
+
+
 # --- signed packs and the mock libgck (tests/toypack.py, tests/mock/gck_mock.c)
 import os
 import subprocess

@@ -164,6 +164,17 @@ GC_API int gc_copy_blocks(gc_handle *h, const uint32_t *src, const uint32_t *dst
   return GC_OK;
 }
 
+/* the mock has no bounded state: its closed-form oracle reads only the tokens, so a save and a restore are accepted and do nothing */
+GC_API int gc_state_save(gc_handle *h, uint64_t sid, uint32_t snap) {
+  (void)sid; (void)snap;
+  return h && getenv("GCK_MOCK_BOUNDED") ? GC_OK : GC_E_ARG;
+}
+
+GC_API int gc_state_restore(gc_handle *h, uint32_t snap, uint64_t sid) {
+  (void)sid; (void)snap;
+  return h && getenv("GCK_MOCK_BOUNDED") ? GC_OK : GC_E_ARG;
+}
+
 GC_API int gc_release(gc_handle *h, uint64_t sid) {
   if (!h) return GC_E_ARG;
   seqent *e = seq_of(h, sid, 0);
