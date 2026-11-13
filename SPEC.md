@@ -69,17 +69,8 @@ Policies build proposals and nothing else; no algorithm name appears in the engi
 - Drafter KV and features keyed by token prefix (reference) / positional rows (GPU): vLLM v0.11 `v1/spec_decode/eagle.py`
   propose uses the target's block table for the draft KV (`block_table_tensor.gather`), so drafter rows share the
   target's paging and prefix hits.
-- Capabilities from the pack: target bucket `spec_caps` (pack ABI 2.x) map to
+- Capabilities from the pack: target bucket `spec_caps` map to
   `spec.CAPS` (`pack_backend.caps_of_bucket`); `spec.check` refuses with the first failing requirement and
   `Engine.spec_algorithms()` lists every algorithm with None or its reason.
 - A speculative pair is loaded only if its target bucket advertises device acceptance: `io.accept`, or for gc-c buckets
-  (which carry no `io`) a non-empty `spec_caps.accept` (additive, pack ABI 1.1).
-
-## Proof
-
-CPU tests: every policy above, greedy, equals `RefModel.dense` (4 concurrent streams,
-preemption, chunked prefill, prefix cache); tree commits that move rows are exercised; a recurrent target with tree
-verify equals the oracle; multi-stream random traces (greedy, exact sampled, rejection sampled, n > 1, aborts, pool
-pressure) equal their references and free every block; rejection sampling (chain with q, SpecInfer tree with q,
-EAGLE top-k tree) matches the target's exact 3-token joint law by chi-square, and a residual-free sampler is caught;
-seeded rejection outputs equal across batch sizes, budgets and pool pressure.
+  (which carry no `io`) a non-empty `spec_caps.accept`.

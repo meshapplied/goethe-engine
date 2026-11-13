@@ -45,8 +45,9 @@ def key_id(pub_pem):
     return hashlib.sha256(r.stdout).hexdigest()
 
 
-def verify(data, sig, trusted=None):
-    """Checks sig (bytes of the signature file, None if absent) over data (bytes, or the path of a file); returns the signer's key id.
+def verify(data, sig, trusted=None, digest=None):
+    """Checks sig (bytes of the signature file, None if absent) over data (bytes, or the path of a file), or, with digest (hex sha256),
+    the ECDSA signature over that digest (data is then unused); returns the signer's key id.
     trusted: key ids to accept (default TRUSTED_KEY_IDS). With the dev override set: returns "UNSIGNED" unchecked."""
     if os.environ.get(ALLOW_UNSIGNED_ENV) == "1":
         print(f"*** {ALLOW_UNSIGNED_ENV}=1: signature check disabled, content is NOT authenticated (development only) ***",
@@ -68,6 +69,16 @@ def verify(data, sig, trusted=None):
         raise SignatureError(f"key id {kid} is not in the pinned allow-list (refused)")
     if key_id(pub) != kid:
         raise SignatureError("embedded public key does not match its key id (refused)")
+    if digest is not None:
+        with tempfile.TemporaryDirectory() as d:
+            for n, b in (("pub.pem", pub), ("sig.bin", raw), ("digest.bin", bytes.fromhex(digest))):
+                with open(os.path.join(d, n), "wb") as f:
+                    f.write(b)
+            r = _openssl("pkeyutl", "-verify", "-pubin", "-inkey", os.path.join(d, "pub.pem"), "-in", os.path.join(d, "digest.bin"),
+                         "-sigfile", os.path.join(d, "sig.bin"), "-pkeyopt", "digest:sha256")
+        if r.returncode or b"Successfully" not in r.stdout:
+            raise SignatureError("signature does not verify (refused)")
+        return kid
     with tempfile.TemporaryDirectory() as d:
         for n, b in (("pub.pem", pub), ("sig.bin", raw)) + (() if isinstance(data, (str, os.PathLike)) else (("data", data),)):
             with open(os.path.join(d, n), "wb") as f:

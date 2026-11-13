@@ -86,7 +86,7 @@ class GcBackend:
                  numerics="deterministic", act="auto", kv="auto"):
         """state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
-        self.stage = P.stage(pack, trusted=trusted)
+        self.stage = P.stage(pack, trusted=trusted, defer=True)
         try:
             self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv))
         except BaseException:
@@ -94,16 +94,23 @@ class GcBackend:
             raise
 
     def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req):
-        m = self.m = self.stage.manifest
+        m0 = self.stage.manifest
         dev = None if sku else P.device()
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
+        # the branch the weight files choose: the target variant (and the drafter's) by structure, header-only
+        tv = P.pick_variant(m0, ws)
+        dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
+        dv = P.pick_variant(m0, dws, "drafter") if dws else None
+        m = self.m = P.for_variant(m0, tv, dv)
+        allw = P.place_weights(m0, tv, ws)
+        if dws:
+            P.place_weights(m0, dv, dws, allw)
         if self.spec:
             b, db, pol = P.spec_pair(m, sku=sku, dev=dev, contract=contract, ctx=ctx)
-            ids, used, pol_s = [b["id"], db["id"]], [b.get("weights", 0), db.get("weights", 1)], policy or self._policy(pol)
-            allw = [None] * len(m["model"]["weights"])
-            allw[used[0]], allw[used[1]] = ws[0], drafter_weights
+            ids, pol_s = [b["id"], db["id"]], policy or self._policy(pol)
             self.bucket, lad = b, [b]
+            self.stage.ensure([b, db])
         else:
             # one sequence: the pack's single stream bucket when it has one (a token a launch, its own numerics contract);
             # else, and for B > 1, the smallest batch bucket
@@ -114,9 +121,9 @@ class GcBackend:
             lad = P.ladder(m, b)
             pf = P.prefill(m, b)   # a prompt chunk of W tokens a launch (the runtime ignores it on a paged pack)
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None
-            used, allw = [x.get("weights", 0) for x in lad + ([pf] if pf else [])] + [b.get("weights", 0)], ws
             self.bucket = b
-        P.check_weights(m, allw, P.memo_dir(), used)
+            self.stage.ensure(lad + ([pf] if pf else []))        # only the chosen branch's blobs are read from the pack
+        P.check_weights(m, allw)
         top = lad[-1]
         libpath = os.path.join(P.materialize(self.stage, top), top["lib"])
         self.L = bind(libpath)

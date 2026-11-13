@@ -317,8 +317,10 @@ def build(args):
             raise SystemExit("serve needs --pack FILE and --weights PATH... (or --ref for the CPU reference model)")
         from .gc_c import GcBackend
         if len(args.weights) > 2:
-            raise SystemExit("--weights takes the target file and optionally a drafter file (speculative pair)")
-        be = GcBackend(args.pack, args.weights[0], B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
+            raise SystemExit("--weights takes the target model (a GGUF file, or a checkpoint directory) and optionally a drafter file (speculative pair)")
+        import glob
+        tw = sorted(glob.glob(os.path.join(args.weights[0], "*.safetensors"))) if os.path.isdir(args.weights[0]) else args.weights[0]
+        be = GcBackend(args.pack, tw, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")

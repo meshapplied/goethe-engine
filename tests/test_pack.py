@@ -1,4 +1,4 @@
-"""Fail-closed load of a signed pack: signature, pinned key, hashes, ABI, arch, runtime."""
+"""Fail-closed load of a signed v3 pack: manifest signature, pinned key, blob hashes, variants, ABI, arch, runtime, partial files."""
 import json
 import os
 
@@ -11,7 +11,7 @@ from toypack import toy_pack
 
 
 def test_loader_is_the_pinned_abi():
-    assert P.ABI == "2.0.0" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c"]
+    assert P.ABI == "3.0.0" and P.MAGIC == b"GCPACK3\n" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c"]
 
 
 def test_caps_and_numerics_of_a_bucket(toy, key):
@@ -23,11 +23,11 @@ def test_caps_and_numerics_of_a_bucket(toy, key):
 
 def test_other_majors_refused_newer_minor_read():
     with pytest.raises(P.PackError, match="major"):
-        P.validate(dict(schema=P.SCHEMA, abi="1.1.0"))
+        P.validate(dict(schema=P.SCHEMA, abi="2.1.0"))
     with pytest.raises(P.PackError):
-        P.validate(dict(schema="other", abi="2.0.0"))
+        P.validate(dict(schema="other", abi="3.0.0"))
     with pytest.raises(P.PackError, match="lacks"):
-        P.validate(dict(schema=P.SCHEMA, abi="2.7.0"))  # a newer minor parses; this one lacks its fields
+        P.validate(dict(schema=P.SCHEMA, abi="3.7.0"))  # a newer minor parses; this one lacks its fields
 
 
 # --- fail-closed load: signature, key, hashes, ABI, arch, runtime
@@ -56,17 +56,50 @@ def test_missing_and_bad_signature_refused(toy, key):
         P.verify(toy[0], trusted=(key.kid,))
 
 
-def test_any_tampered_byte_refused(toy, key):
-    raw = bytearray(open(toy[0], "rb").read())
-    for i in (0, len(raw) // 2, len(raw) - 1):
-        t = bytearray(raw)
-        t[i] ^= 1
-        open(toy[0], "wb").write(t)
-        with pytest.raises(P.PackError, match="does not verify"):
-            P.verify(toy[0], trusted=(key.kid,))
-    open(toy[0], "ab").write(b" ")
+def _rewrite(pack, edit):
+    """Re-write the pack file with (header, manifest bytes, blobs) edited by edit(hdr, manifest, blobs) -> (hdr or None, manifest, blobs)."""
+    from toypack import gcpack
+    raw = open(pack, "rb").read()
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(raw[16:16 + n])
+    base = 16 + n
+    man = raw[base + hdr["manifest"][0]:base + hdr["manifest"][0] + hdr["manifest"][1]]
+    blobs = {h: raw[base + o:base + o + l] for h, (o, l) in hdr["blobs"].items()}
+    man, blobs = edit(man, blobs)
+    gcpack(pack, man, blobs)
+
+
+def test_altered_manifest_refused(toy, key):
+    _rewrite(toy[0], lambda man, blobs: (man.replace(b'"ncol": 8', b'"ncol": 9'), blobs))
     with pytest.raises(P.PackError, match="does not verify"):
         P.verify(toy[0], trusted=(key.kid,))
+
+
+def test_swapped_manifest_signature_refused(tmp_path, key, mocklib):
+    a = toy_pack(str(tmp_path / "a"), key, mocklib)[0]
+    b = toy_pack(str(tmp_path / "b"), key, mocklib, mutate=lambda m: m["compiler"].update(commit="1" * 40))[0]
+    os.replace(b + ".sig", a + ".sig")                 # a valid signature of another manifest
+    with pytest.raises(P.PackError, match="does not verify"):
+        P.verify(a, trusted=(key.kid,))
+
+
+def test_altered_container_header_refused(toy, key):
+    raw = bytearray(open(toy[0], "rb").read())
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(bytes(raw[16:16 + n]))
+    h = sorted(hdr["blobs"])[0]
+    hdr["blobs"][h][0] += 1                            # an altered offset: the bytes read no longer hash to the blob's name
+    hb = json.dumps(hdr).encode()
+    open(toy[0], "wb").write(raw[:8] + len(hb).to_bytes(8, "little") + hb + raw[16 + n:])
+    with pytest.raises(P.PackError, match="does not hash|out of range|truncated"):
+        P.verify(toy[0], trusted=(key.kid,))
+
+
+def test_a_v2_container_is_not_a_pack(tmp_path, key):
+    f = str(tmp_path / "x.gcpack")
+    open(f, "wb").write(b"GCPACK2\n" + (2).to_bytes(8, "little") + b"{}")
+    with pytest.raises(P.PackError, match="magic"):
+        P.verify(f, trusted=(key.kid,))
 
 
 def test_unpinned_key_refused(toy, key):
@@ -75,23 +108,18 @@ def test_unpinned_key_refused(toy, key):
 
 
 def test_blob_not_hashing_to_its_name_refused_even_if_signed(tmp_path, key, mocklib):
-    from toypack import gcpack
-    d = str(tmp_path)
-    pack = toy_pack(d, key, mocklib)[0]
-    raw = open(pack, "rb").read()
-    n = int.from_bytes(raw[8:16], "little")
-    hdr = json.loads(raw[16:16 + n])
-    base = 16 + n
-    m = raw[base:base + hdr["manifest"][1]]
-    blobs = {h: raw[base + o:base + o + l] for h, (o, l) in hdr["blobs"].items()}
-    h = sorted(blobs)[0]
-    blobs[h] = blobs[h] + b"x"
-    gcpack(pack, m, blobs)
-    key.sign_file(pack)
+    pack = toy_pack(str(tmp_path), key, mocklib)[0]
+
+    def flip(man, blobs):
+        h = sorted(blobs)[0]
+        return man, dict(blobs, **{h: blobs[h] + b"x"})
+    _rewrite(pack, flip)
     with pytest.raises(P.PackError, match="does not hash"):
         P.verify(pack, trusted=(key.kid,))
-    gcpack(pack, m, {k: v for k, v in blobs.items() if k != h})
-    key.sign_file(pack)
+
+    def drop(man, blobs):
+        return man, {k: v for k, v in blobs.items() if k != sorted(blobs)[0]}
+    _rewrite(pack, drop)
     with pytest.raises(P.PackError, match="missing"):
         P.verify(pack, trusted=(key.kid,))
 
@@ -99,7 +127,6 @@ def test_blob_not_hashing_to_its_name_refused_even_if_signed(tmp_path, key, mock
 def test_not_a_gcpack_refused(tmp_path, key):
     f = str(tmp_path / "x.gcpack")
     open(f, "wb").write(b"not a pack at all")
-    key.sign_file(f)
     with pytest.raises(P.PackError, match="magic"):
         P.verify(f, trusted=(key.kid,))
 
@@ -111,7 +138,7 @@ def test_arch_abi_runtime_refused(tmp_path, key, mocklib):
     pack = toy_pack(d, key, mocklib)[0]
     with pytest.raises(P.PackError, match="arch"):
         P.verify(pack, trusted=t, arch="sm_90a")
-    for kw, pat in ((dict(abi="1.1.0"), "major"), (dict(runtime="mystery-rt"), "runtime")):
+    for kw, pat in ((dict(abi="2.0.0"), "major"), (dict(runtime="mystery-rt"), "runtime")):
         d = str(tmp_path / pat)
         os.makedirs(d)
         with pytest.raises(P.PackError, match=pat):
@@ -137,8 +164,7 @@ def test_stage_is_private_and_independent_of_the_source(toy, key):
     import stat, hashlib
     st = P.stage(toy[0], trusted=(key.kid,))
     assert stat.S_IMODE(os.stat(st.dir).st_mode) == 0o700
-    assert st.sha256 == hashlib.sha256(open(toy[0], "rb").read()).hexdigest() and st.keyid == key.kid
-    assert not os.path.exists(os.path.join(st.dir, "pack.gcpack"))
+    assert st.keyid == key.kid and len(st.manifest_sha256) == 64
     open(toy[0], "ab").write(b"tamper")   # the source changes after staging
     h = sorted(os.listdir(os.path.join(st.dir, "blobs")))[0]
     assert hashlib.sha256(open(os.path.join(st.dir, "blobs", h), "rb").read()).hexdigest() == h
@@ -193,41 +219,107 @@ def test_cli_verify_prints_json(toy, key, monkeypatch, capsys):
     monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
     P.main(["verify", toy[0], "--arch", "sm_120a"])
     j = json.loads(capsys.readouterr().out)
-    assert j["ok"] and j["keyid"] == key.kid and j["buckets"] == 2 and len(j["sha256"]) == 64 and j["weights"] == ["w.gguf", "d.gguf"]
+    assert j["ok"] and j["keyid"] == key.kid and j["buckets"] == 2 and len(j["manifest_sha256"]) == 64 and j["variants"] == ["alt", "d", "q4"]
     with pytest.raises(SystemExit, match="REFUSED"):
         P.main(["verify", toy[0], "--arch", "sm_90a"])
 
 
 def test_weights_must_not_be_world_writable(toy, key):
-    m = P.verify(toy[0], trusted=(key.kid,))
-    P.check_weights(m, [toy[1], toy[2]])
+    m = P.for_variant(P.verify(toy[0], trusted=(key.kid,)), "q4")
+    P.check_weights(m, P.place_weights(m, "q4", [toy[1]]))
     os.chmod(toy[1], 0o666)
     with pytest.raises(P.PackError, match="world-writable"):
-        P.check_weights(m, [toy[1], toy[2]])
+        P.check_weights(m, P.place_weights(m, "q4", [toy[1]]))
 
 
-def test_every_shard_of_a_file_set_is_checked(tmp_path, key, mocklib):
-    """A weights entry that names file 0 in "of" is a later shard of that set: it is hashed with it."""
-    pack, s0, s1 = toy_pack(str(tmp_path), key, mocklib, mutate=lambda m: m["model"]["weights"][1].update(of=0))
+def test_the_weights_choose_the_variant_by_structure(tmp_path, key, mocklib):
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, alt=True)
     m = P.verify(pack, trusted=(key.kid,))
-    assert P.weight_span(m, 0) == [0, 1]
-    P.check_weights(m, [s0, s1], used=[0])
-    open(s1, "wb").write(b"swapped!")
-    with pytest.raises(P.PackError, match="sha256 differs"):
-        P.check_weights(m, [s0, s1], used=[0])
-    with pytest.raises(P.PackError, match="1 files given|needed"):
-        P.check_weights(m, [s0], used=[0])
+    alt = str(tmp_path / "alt.gguf")
+    assert P.pick_variant(m, [w]) == "q4" and P.pick_variant(m, [alt]) == "alt"
+    from toypack import gguf
+    gguf(str(tmp_path / "other.gguf"), [("a.weight", [64, 9], 12), ("b.weight", [64], 0)])      # another tensor type: no variant
+    with pytest.raises(P.PackError, match="a.weight"):
+        P.pick_variant(m, [str(tmp_path / "other.gguf")])
+    mv = P.for_variant(m, "alt")
+    assert {b["variant"] for b in mv["buckets"]} == {"alt"} and P.select(mv, sku="mock", B=2)["id"].endswith(".alt")
+    with pytest.raises(P.PackError, match="takes 1 weight"):
+        P.place_weights(m, "q4", [w, w])
+    with pytest.raises(P.PackError, match="not the structure"):                      # same slot, other model
+        P.check_weights(P.for_variant(m, "q4"), P.place_weights(m, "q4", [alt]))
 
 
-def test_shard_of_must_name_an_earlier_entry(tmp_path, key, mocklib):
-    with pytest.raises(P.PackError, match='"of"'):
-        P.verify(toy_pack(str(tmp_path), key, mocklib, mutate=lambda m: m["model"]["weights"][0].update(of=1))[0], trusted=(key.kid,))
-
-
-def test_a_pair_keeps_target_and_drafter_files_apart(tmp_path, key, mocklib):
+def test_a_pair_has_a_variant_per_role(tmp_path, key, mocklib):
     pack, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True)
     m = P.verify(pack, trusted=(key.kid,))
-    assert P.weight_span(m, 0) == [0] and P.weight_span(m, 1) == [1]
+    assert P.pick_variant(m, [w]) == "q4" and P.pick_variant(m, [dw], "drafter") == "d"
+    mv = P.for_variant(m, "q4", "d")
+    assert len(mv["buckets"]) == 2 and len(mv["spec"]) == 1
+    P.check_weights(mv, P.place_weights(m, "d", [dw], P.place_weights(m, "q4", [w])))
+
+
+# --- partial files: only the chosen branch's blobs are read
+
+def _hole(pack, blob_hash):
+    """Zero the bytes of one blob in place (a download hole)."""
+    raw = bytearray(open(pack, "rb").read())
+    n = int.from_bytes(raw[8:16], "little")
+    o, l = json.loads(bytes(raw[16:16 + n]))["blobs"][blob_hash]
+    raw[16 + n + o:16 + n + o + l] = b"\0" * l
+    open(pack, "wb").write(raw)
+
+
+def test_partial_file_serves_the_branch_whose_blobs_are_present(tmp_path, key, mocklib):
+    import hashlib
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, alt=True)
+    _hole(pack, hashlib.sha256(b"alt-plan").hexdigest())                 # the alt branch's own blob is a hole
+    with pytest.raises(P.PackError, match="does not hash"):              # the full check refuses the file
+        P.verify(pack, trusted=(key.kid,))
+    st = P.stage(pack, trusted=(key.kid,), defer=True)                   # the q4 branch does not touch it
+    m = P.for_variant(st.manifest, "q4")
+    st.ensure(P.ladder(m, P.select(m, sku="mock", B=8)))
+    with pytest.raises(P.PackError, match="does not hash"):
+        st.ensure([b for b in st.manifest["buckets"] if b["variant"] == "alt"])
+    st.close()
+
+
+def test_pack_need_lists_exactly_the_branch_ranges(tmp_path, key, mocklib, capsys):
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, alt=True)
+    raw = open(pack, "rb").read()
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(raw[16:16 + n])
+    end = 16 + n + hdr["manifest"][0] + hdr["manifest"][1]
+    prefix = tmp_path / "prefix"
+    prefix.write_bytes(raw[:end])                                       # only the header and the manifest were downloaded
+    d = tmp_path / "model"
+    d.mkdir()
+    os.link(w, d / "w.gguf")
+    P.main(["need", str(prefix), "--model-dir", str(d), "--sku", "mock"])
+    j = json.loads(capsys.readouterr().out)
+    import hashlib
+    assert j["prefix"] == dict(off=0, len=end) and len(j["manifest_sha256"]) == 64
+    assert all(hashlib.sha256(raw[r["off"]:r["off"] + r["len"]]).hexdigest() == r["sha256"] for r in j["ranges"]) and j["ranges"]
+    # a model whose structure no variant has is refused
+    from toypack import gguf
+    gguf(str(tmp_path / "x.gguf"), [("zzz", [1], 0)])
+    (tmp_path / "bad").mkdir()
+    os.link(tmp_path / "x.gguf", tmp_path / "bad" / "x.gguf")
+    with pytest.raises(SystemExit, match="not a model this pack was compiled for"):
+        P.main(["need", str(prefix), "--model-dir", str(tmp_path / "bad"), "--sku", "mock"])
+
+
+def test_verify_partial_checks_the_manifest_signature_and_the_branch(tmp_path, key, mocklib, monkeypatch, capsys):
+    monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib)
+    d = tmp_path / "m"
+    d.mkdir()
+    os.link(w, d / "w.gguf")
+    P.main(["verify", pack, "--partial", "--model-dir", str(d), "--sku", "mock"])
+    assert json.loads(capsys.readouterr().out)["ok"]
+    h = sorted(P.stage(pack, trusted=(key.kid,), defer=True).blobs)[0]
+    _hole(pack, h)
+    with pytest.raises(SystemExit, match="does not hash"):
+        P.main(["verify", pack, "--partial", "--model-dir", str(d), "--sku", "mock"])
 
 
 def test_pinned_key_is_the_release_key():
@@ -320,6 +412,17 @@ def test_numerics_request_selects_by_capability_records():
         P.need_bucket(m, "s", P.wanted(kv="fp8"), "kv=fp8")
     with pytest.raises(P.PackError, match="act"):
         P.wanted(act="a4")
-    old = dict(id="o", role="target", sku="s", contract="K", ncol=2, batch=True, maxctx=8)   # a pack before ABI 2.2
-    assert P.feature(old, "determinism") == "batch_invariant" and P.wanted()(old)
-    assert not P.wanted("exact")(old)
+
+
+
+def test_backend_runs_the_variant_the_weights_choose_and_refuses_other_weights(tmp_path, key, mocklib):
+    from goethe_engine.gc_c import GcBackend
+    from toypack import gguf
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, alt=True)
+    for weights, want in ((w, "q4"), (str(tmp_path / "alt.gguf"), "alt")):
+        be = GcBackend(pack, weights, B=2, sku="mock", trusted=(key.kid,))
+        assert be.bucket["variant"] == want and be.m["variants"][want]["weights"]
+        be.close()
+    gguf(str(tmp_path / "other.gguf"), [("a.weight", [64, 8], 12), ("b.weight", [64], 0)])
+    with pytest.raises(P.PackError, match="not a model this pack was compiled for"):
+        GcBackend(pack, str(tmp_path / "other.gguf"), B=2, sku="mock", trusted=(key.kid,))

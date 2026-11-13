@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
-"""Kernel pack reader. A pack is ONE file, NAME.gcpack, for one model and GPU architecture, with a detached signature
-NAME.gcpack.sig (gc-sig-1, over the exact file bytes). Layout (stdlib framing):
+"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
 
-  b"GCPACK2\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len]}})  payload
+  b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len]}})  payload
   offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by its sha256
-Weights are not in the pack: the manifest names them by sha256 and the loader checks the file it is given
-(a checkpoint's later shards name its first file in "of" and are checked with it).
 
-stage() copies the file into a private 0700 directory while hashing it, verifies the signature on that copy, extracts the
-manifest and blobs there (each blob re-hashed), checks ABI major, arch and runtime, and drops the copy; everything loaded
-afterwards comes from the extracted directory. Any failure raises PackError.
+The signature (gc-sig-1, detached, PACK.sig, or the index entry's) is ECDSA over sha256(b"gc-pack-3\n" + manifest bytes): the manifest
+names every blob by its sha256, and a blob is hash-checked when it is extracted, so a file with holes is as safe as a whole one for
+the blobs actually used. Weights are not in the pack: a manifest "variant" names the structure of the model files its buckets were
+compiled for (structure.py: tensor table and metadata keys, no weight bytes); the loader checks the files it is given against it.
 
-  python -m goethe_engine.pack verify FILE [--sig F] [--arch sm_XX]  stage and verify everything, then discard
+Manifest: model.weights (informational: the files the gates ran on), variants {id: {structure, weights: [model.weights indices]}},
+buckets[] each with variant, role, sku, contract, ncol, maxctx, files, lib, requires, numerics axes, step_us.
+
+  python -m goethe_engine.pack verify FILE [--sig F] [--arch sm_XX] [--partial [--model-dir D] [--sku S]]   check, discard
   python -m goethe_engine.pack show FILE [--sig F]                   one line per bucket
+  python -m goethe_engine.pack need PREFIX --model-dir D [--arch A --sku S --numerics ..]  the byte ranges a download must fetch
 """
 import atexit, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile
 
 from . import sign, structure
 
-ABI = "2.0.0"                       # pack ABI semver: additive within a major
-MAGIC = b"GCPACK2\n"
+ABI = "3.0.0"                       # pack ABI semver: additive within a major
+MAGIC = b"GCPACK3\n"
+DOMAIN = b"gc-pack-3\n"             # signed digest = sha256(DOMAIN + manifest bytes)
 MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
 RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
@@ -32,31 +35,6 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 
 class PackError(Exception):
     """Any mismatch between a pack, its blobs, the weights and the device: the pack is not loaded."""
-
-
-def memo_dir():
-    """Per-user cache of weight file hashes, keyed by path, inode, size, mtime and ctime."""
-    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "goethe-engine")
-
-
-def sha256_file(p, memo=None):
-    p = os.path.realpath(p)
-    st = os.stat(p)
-    sid = f"{p}\t{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}"
-    mf = memo and os.path.join(memo, "sha256.tsv")
-    if mf and os.path.exists(mf):
-        for ln in open(mf):
-            if ln.startswith(sid + "\t"):
-                return ln.rstrip("\n").rsplit("\t", 1)[1]
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(16 << 20), b""):
-            h.update(b)
-    if mf:
-        os.makedirs(memo, mode=0o700, exist_ok=True)
-        with open(mf, "a") as f:
-            f.write(f"{sid}\t{h.hexdigest()}\n")
-    return h.hexdigest()
 
 
 def semver(s):
@@ -86,14 +64,17 @@ def validate(m, loader_abi=ABI):
     need(pv[0] == la[0], f"pack abi {m['abi']} is major {pv[0]}; this loader ({loader_abi}) reads major {la[0]} (refused)")
     for k in ("compiler", "model", "arch", "cuda", "hw", "runtime", "contracts", "buckets"):
         need(k in m, f"manifest lacks {k}")
-    need(m["model"].get("weights") and all(HEX.match(w.get("sha256", "")) for w in m["model"]["weights"]),
-         "model weights must be named by sha256")
-    need(all(w.get("of") is None or (isinstance(w["of"], int) and 0 <= w["of"] < j) for j, w in enumerate(m["model"]["weights"])),
-         'a weights entry "of" must name an earlier entry')
-    st = m.get("structure")
-    need(st is None or (isinstance(st, dict) and HEX.match(st.get("sha256", "")) and isinstance(st.get("keys"), list)
-                        and isinstance(st.get("kv"), dict) and isinstance(st.get("tensors"), list)),
-         "structure needs sha256, keys, kv and tensors")
+    ws = m["model"].get("weights")
+    need(isinstance(ws, list) and ws and all(isinstance(w, dict) and isinstance(w.get("file"), str) for w in ws),
+         "model.weights: the list of weight files the gates ran on")
+    vs = m.get("variants")
+    need(isinstance(vs, dict) and vs, "manifest lacks variants")
+    for vid, v in vs.items():
+        st = v.get("structure") if isinstance(v, dict) else None
+        need(isinstance(st, dict) and HEX.match(st.get("sha256", "")) and isinstance(st.get("keys"), list)
+             and isinstance(st.get("kv"), dict) and isinstance(st.get("tensors"), list), f"variant {vid}: structure needs sha256, keys, kv and tensors")
+        need(isinstance(v.get("weights"), list) and v["weights"] and all(isinstance(i, int) and 0 <= i < len(ws) for i in v["weights"]),
+             f"variant {vid}: weights indices")
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
     ids = set()
     for b in m["buckets"]:
@@ -110,6 +91,7 @@ def validate(m, loader_abi=ABI):
     for b in m["buckets"]:
         need(all(v in ids for v in b.get("variants", [])), f"bucket {b['id']}: unknown variant")
         need(0 <= b.get("weights", 0) < len(m["model"]["weights"]), f"bucket {b['id']}: weights index")
+        need(b.get("variant") in m["variants"], f"bucket {b['id']}: variant {b.get('variant')!r} is not in the manifest")
     by = {b["id"]: b for b in m["buckets"]}
     for s in m.get("spec", []):
         t, d, pol = by.get(s.get("target")), by.get(s.get("drafter")), s.get("policy") or {}
@@ -154,32 +136,84 @@ def check_manifest(raw, loader_abi=ABI, arch=None):
     return m
 
 
+def blob_hashes(buckets):
+    return sorted({x for b in buckets for x in b["files"].values()})
+
+
 class Staged:
-    """A verified private extraction of a pack: dir (mode 0700, ours alone; manifest.json, manifest.sha256, blobs/),
-    manifest, sha256 of the pack file and the signer's key id. close() removes it."""
+    """A verified pack file: manifest (verified by the signature), the signer's key id and a private directory dir (mode 0700, ours
+    alone; manifest.json, manifest.sha256, blobs/). Blobs are extracted on demand by ensure(), each hash-checked against the manifest
+    as it is read, so a pack with holes serves every branch whose blobs are present. close() removes dir."""
 
     def __init__(self):
-        self.dir, self.manifest, self.sha256, self.keyid = tempfile.mkdtemp(prefix="goethe-engine-"), None, None, None
+        self.dir, self.manifest, self.keyid, self.manifest_sha256 = tempfile.mkdtemp(prefix="goethe-engine-"), None, None, None
+        self.f = self.blobs = self.base = self.total = None
         atexit.register(self.close)
 
     def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
+
+    def ensure(self, buckets):
+        """Extract the blobs of buckets (default: all) into dir/blobs; refuses a missing, truncated or altered blob."""
+        for bh in blob_hashes(self.manifest["buckets"] if buckets is None else buckets):
+            dst = os.path.join(self.dir, "blobs", bh)
+            if os.path.exists(dst):
+                continue
+            need(bh in self.blobs, f"blob {bh} missing from the pack")
+            off, ln = self.blobs[bh]
+            _section(off, ln, self.total - self.base, f"blob {bh}")
+            self.f.seek(self.base + off)
+            hh, left = hashlib.sha256(), ln
+            with _create(dst) as o:
+                while left:
+                    chunk = self.f.read(min(left, 4 << 20))
+                    need(chunk, f"blob {bh}: pack truncated or a hole")
+                    hh.update(chunk)
+                    o.write(chunk)
+                    left -= len(chunk)
+            if hh.hexdigest() != bh:
+                os.unlink(dst)
+                raise PackError(f"blob {bh} does not hash to its name")
 
 
 def _create(path):
     return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb")
 
 
-def _section(f, off, ln, total, what):
+def _section(off, ln, total, what):
     need(isinstance(off, int) and isinstance(ln, int) and 0 <= off and 0 <= ln and off + ln <= total, f"{what}: section out of range")
 
 
-def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
-    """Verify a .gcpack and extract it into a private dir. sig: path of the detached signature (default PACK.sig).
-    The file is copied once (hashed on the way), the signature is checked on the copy, and what is loaded later comes
-    from Staged.dir, so nothing verified can change underneath."""
+def read_container(f, total):
+    """(header blobs, base offset, manifest bytes, offset just past the manifest) of an open pack file (or of a prefix holding its header and
+    manifest)."""
+    need(f.read(len(MAGIC)) == MAGIC, "not a gcpack3 file (bad magic)")
+    n = int.from_bytes(f.read(8), "little")
+    need(0 < n <= MAX_HEADER, "container header size")
+    try:
+        hdr = json.loads(f.read(n))
+        base = len(MAGIC) + 8 + n
+        mo, ml = hdr["manifest"]
+        blobs = hdr["blobs"]
+        need(isinstance(blobs, dict), "container header blobs")
+    except (ValueError, KeyError, TypeError) as e:
+        raise PackError(f"container header: {e}")
+    _section(mo, ml, total - base, "manifest")
+    need(ml <= MAX_JSON, "manifest.json larger than the cap (refused)")
+    f.seek(base + mo)
+    raw = f.read(ml)
+    need(len(raw) == ml, "manifest truncated")
+    return blobs, base, raw, base + mo + ml
+
+
+def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False):
+    """Verify a .gcpack: the signature (sig: path of the detached signature, default PACK.sig) over sha256(DOMAIN + manifest bytes), then
+    the manifest. Blobs are extracted (hash-checked) all at once, or with defer=True only when Staged.ensure asks."""
     st = Staged()
     try:
         sp = sig or pack + ".sig"
@@ -188,57 +222,25 @@ def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
             fd = os.open(pack, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError as e:
             raise PackError(f"{pack}: {e.strerror} (symlinks are refused)")
-        cp, h = os.path.join(st.dir, "pack.gcpack"), hashlib.sha256()
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
             raise PackError(f"{pack}: not a regular file")
-        with os.fdopen(fd, "rb") as f, _create(cp) as o:
-            for chunk in iter(lambda: f.read(4 << 20), b""):
-                h.update(chunk)
-                o.write(chunk)
-        st.sha256 = h.hexdigest()
+        st.f = os.fdopen(fd, "rb")
+        st.total = os.fstat(fd).st_size
+        st.blobs, st.base, raw, _ = read_container(st.f, st.total)
+        st.manifest_sha256 = hashlib.sha256(raw).hexdigest()
         try:
-            st.keyid = sign.verify(cp, sigb, trusted)
+            st.keyid = sign.verify(None, sigb, trusted, digest=hashlib.sha256(DOMAIN + raw).hexdigest())
         except sign.SignatureError as e:
             raise PackError(str(e))
-        total = os.path.getsize(cp)
-        with open(cp, "rb") as f:
-            need(f.read(len(MAGIC)) == MAGIC, "not a gcpack file (bad magic)")
-            n = int.from_bytes(f.read(8), "little")
-            need(0 < n <= MAX_HEADER, "container header size")
-            try:
-                hdr = json.loads(f.read(n))
-                base = len(MAGIC) + 8 + n
-                mo, ml = hdr["manifest"]
-                blobs = hdr["blobs"]
-                need(isinstance(blobs, dict), "container header blobs")
-            except (ValueError, KeyError, TypeError) as e:
-                raise PackError(f"container header: {e}")
-            _section(f, mo, ml, total - base, "manifest")
-            need(ml <= MAX_JSON, "manifest.json larger than the cap (refused)")
-            f.seek(base + mo)
-            raw = f.read(ml)
-            m = st.manifest = check_manifest(raw, loader_abi, arch)
-            with _create(os.path.join(st.dir, "manifest.json")) as o:
-                o.write(raw)
-            with _create(os.path.join(st.dir, "manifest.sha256")) as o:
-                o.write((hashlib.sha256(raw).hexdigest() + "\n").encode())
-            os.mkdir(os.path.join(st.dir, "blobs"), 0o700)
-            for bh in sorted({x for b in m["buckets"] for x in b["files"].values()}):
-                need(bh in blobs, f"blob {bh} missing from the pack")
-                off, ln = blobs[bh]
-                _section(f, off, ln, total - base, f"blob {bh}")
-                f.seek(base + off)
-                hh, left = hashlib.sha256(), ln
-                with _create(os.path.join(st.dir, "blobs", bh)) as o:
-                    while left:
-                        chunk = f.read(min(left, 4 << 20))
-                        need(chunk, f"blob {bh}: pack truncated")
-                        hh.update(chunk)
-                        o.write(chunk)
-                        left -= len(chunk)
-                need(hh.hexdigest() == bh, f"blob {bh} does not hash to its name")
-        os.unlink(cp)
+        st.manifest = check_manifest(raw, loader_abi, arch)
+        with _create(os.path.join(st.dir, "manifest.json")) as o:
+            o.write(raw)
+        with _create(os.path.join(st.dir, "manifest.sha256")) as o:
+            o.write((st.manifest_sha256 + "\n").encode())
+        os.mkdir(os.path.join(st.dir, "blobs"), 0o700)
+        if not defer:
+            st.ensure(None)
         return st
     except BaseException as e:
         st.close()
@@ -246,7 +248,7 @@ def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
 
 
 def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
-    """Stage everything, check it, discard the copy; returns the Staged record's manifest, file sha256 and key id."""
+    """Stage everything, check it, discard the copy; returns the manifest."""
     st = stage(pack, sig, loader_abi, trusted, arch)
     st.close()
     return st.manifest
@@ -316,15 +318,12 @@ def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
     return next((b for b in cs if b["ncol"] == 1 and not b["batch"]), None)
 
 
-DETERMINISM = ("exact", "batch_invariant", "tolerance")   # buckets[].determinism (pack ABI 2.2)
+DETERMINISM = ("exact", "batch_invariant", "tolerance")   # buckets[].determinism
 
 
 def feature(b, k):
-    """A bucket's numerics axis k ("determinism", "act", "kv"): its record, or for packs before ABI 2.2 what they imply
-    (batch_invariant true or absent: batch_invariant, else exact; act and kv unknown, kv f16)."""
-    if k in b:
-        return b[k]
-    return {"determinism": "batch_invariant" if b.get("batch_invariant", True) else "exact", "act": None, "kv": "f16"}[k]
+    """A bucket's numerics axis k ("determinism", "act", "kv"): its record."""
+    return b[k]
 
 
 def wanted(numerics="deterministic", act="auto", kv="auto", single=False):
@@ -388,36 +387,67 @@ def prefill(m, b):
                 and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["prefill"], default=None)
 
 
-def weight_span(m, i):
-    """Manifest weights indices of the file set that starts at index i: the entry itself and the later shards that name it in "of"."""
-    ws = m["model"]["weights"]
-    return [i] + [j for j, w in enumerate(ws) if j != i and w.get("of") == i]
-
-
-def check_weights(m, weights, memo=None, used=None):
-    """The weights files given (in model.weights order) hash to the manifest's sha256 values; used: the indices the
-    loaded buckets read (default all), each of which must be given. A file must belong to this user or root and be
-    not world-writable (the runtime reads it again after this check)."""
-    ws = m["model"]["weights"]
-    used = sorted({j for i in (range(len(ws)) if used is None else used) for j in weight_span(m, i)})
-    need(len(weights) > max(used), f"weights {[ws[i]['file'] for i in used]} needed, {len(weights)} files given")
-    # a pack that names its model's structure (the first file set): those weights hashes are what the gates ran on; a drafter's stay exact
-    tset = set(weight_span(m, 0)) if m.get("structure") is not None else set()
-    for i in used:
-        w, p = ws[i], weights[i]
-        need(os.path.exists(p), f"weights {p} missing")
-        st = os.stat(p)
-        need(stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.getuid()) and not st.st_mode & 0o002,
-             f"weights {p}: must be a regular file of this user or root and not world-writable")
-        if i not in tset:
-            need(st.st_size == w["bytes"], f"weights {p}: {st.st_size} bytes, manifest {w['bytes']}")
-            need(sha256_file(p, memo) == w["sha256"], f"weights {p}: sha256 differs from the manifest's {w['file']}")
-    if tset:     # header reads only: tensor names, shapes and types and the metadata the pack was compiled with
-        fs = [weights[i] for i in used if i in tset]
+def pick_variant(m, files, role="target"):
+    """The id of the variant of role whose structure the model files have (header-only reads); refuses naming why each variant differs."""
+    ids = sorted({b["variant"] for b in m["buckets"] if b["role"] == role})
+    why = []
+    for v in ids:
         try:
-            structure.check(m["structure"], fs)
+            structure.check(m["variants"][v]["structure"], files)
+            return v
         except structure.StructureError as e:
-            raise PackError(f"weights {fs}: not the structure this pack was compiled for: {e}")
+            why.append(f"variant {v}: {e}")
+    raise PackError(f"{files}: not a model this pack was compiled for ({'; '.join(why) or 'no ' + role + ' buckets'})")
+
+
+def for_variant(m, target, drafter=None):
+    """The manifest restricted to the buckets of the target variant (and, for a speculative pair, the drafter variant)."""
+    bs = [b for b in m["buckets"] if b["variant"] == (target if b["role"] == "target" else drafter)]
+    ids = {b["id"] for b in bs}
+    return dict(m, buckets=bs, spec=[s for s in m.get("spec", []) if s.get("target") in ids and s.get("drafter") in ids],
+                contracts=[c for c in m["contracts"] if any(b["contract"] == c for b in bs)])
+
+
+def place_weights(m, variant, files, allw=None):
+    """allw (a list with one slot per model.weights entry): the files of variant placed at its slots, in the order given."""
+    idx = m["variants"][variant]["weights"]
+    need(len(files) == len(idx), f"variant {variant} takes {len(idx)} weight file(s), {len(files)} given")
+    allw = [None] * len(m["model"]["weights"]) if allw is None else allw
+    for i, f in zip(idx, files):
+        allw[i] = f
+    return allw
+
+
+def check_weights(m, allw):
+    """Every variant of m (as restricted by for_variant) finds, at its slots in allw, files that are regular, owned by this user or root, not
+    world-writable, and have the variant's structure (tensor table and metadata keys; header reads only, no hashing)."""
+    for vid in sorted({b["variant"] for b in m["buckets"]}):
+        fs = [allw[i] if i < len(allw) else None for i in m["variants"][vid]["weights"]]
+        need(all(fs), f"variant {vid}: weight files {m['variants'][vid]['weights']} are needed")
+        for p in fs:
+            need(os.path.exists(p), f"weights {p} missing")
+            st = os.stat(p)
+            need(stat.S_ISREG(st.st_mode) and st.st_uid in (0, os.getuid()) and not st.st_mode & 0o002,
+                 f"weights {p}: must be a regular file of this user or root and not world-writable")
+        try:
+            structure.check(m["variants"][vid]["structure"], fs)
+        except structure.StructureError as e:
+            raise PackError(f"weights {fs}: not the structure variant {vid} was compiled for: {e}")
+
+
+def branch(m, model_files, *, sku=None, numerics="deterministic", act="auto", kv="auto"):
+    """The buckets of the branch a model's files choose: its target variant, for sku (the pack's only SKU if none), satisfying the
+    numerics request. Returns (variant id, [buckets])."""
+    v = pick_variant(m, model_files)
+    mv = for_variant(m, v)
+    skus = sorted({b["sku"] for b in mv["buckets"]})
+    need(sku is None or sku in skus, f"sku {sku} is not in this pack ({skus})")
+    sku = sku or (skus[0] if len(skus) == 1 else None)
+    need(sku is not None, f"several SKUs in this pack {skus}: name one")
+    want = wanted(numerics, act, kv)
+    bs = [b for b in mv["buckets"] if b["sku"] == sku and want(b)]
+    need(bs, f"no bucket of variant {v} for sku {sku} with numerics={numerics} act={act} kv={kv}")
+    return v, bs
 
 
 def materialize(st, b, out=None):
@@ -434,28 +464,67 @@ def materialize(st, b, out=None):
 def main(a):
     import argparse
     ap = argparse.ArgumentParser(prog="goethe-engine pack", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
-verify prints {"ok": true, "sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "weights": [file names in
-manifest order: the --weights argument of serve]}. --sig defaults to FILE.sig. Exit 0 ok; 1 refused (signature missing or bad,
-key id not pinned, container malformed, a blob not hashing to its name, ABI major not 2, runtime not run here, --arch differs),
-reason on stderr.
+verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}.
+Without --partial every blob of every bucket is extracted and hash-checked; with --partial only the manifest signature and the blobs of the
+branch --model-dir chooses (a variant by structure, --sku, the numerics flags). --sig defaults to FILE.sig.
+need reads a PREFIX file (the first bytes of a pack: 16 bytes, the header, the manifest) and prints {"manifest_sha256", "prefix": {off, len},
+"ranges": [{off, len, sha256}]}: the byte ranges of exactly the blobs the branch needs; the manifest's signature is checked by `verify`
+once the ranges are fetched, and the caller compares manifest_sha256 with the index entry's.
+Exit 0 ok; 1 refused (signature missing or bad, key id not pinned, container malformed, a needed blob missing or not hashing to its name,
+ABI major not 3, runtime not run here, --arch differs, no variant has the model's structure), reason on stderr.
 """)
-    ap.add_argument("cmd", choices=("verify", "show"))
+    ap.add_argument("cmd", choices=("verify", "show", "need"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--arch")
+    ap.add_argument("--partial", action="store_true")
+    ap.add_argument("--model-dir")
+    ap.add_argument("--sku")
+    ap.add_argument("--numerics", default="deterministic")
+    ap.add_argument("--act", default="auto")
+    ap.add_argument("--kv", default="auto")
     o = ap.parse_args(a)
+
+    def files_of(d):
+        from .index import model_sets
+        sets = model_sets(d)
+        need(sets, f"{d}: no model files (*.safetensors, *.gguf)")
+        for fs in sets:
+            try:
+                return branch(m, fs, sku=o.sku, numerics=o.numerics, act=o.act, kv=o.kv)[1]
+            except PackError as e:
+                last = e
+        raise last
     try:
-        st = stage(o.file, o.sig, arch=o.arch)
+        if o.cmd == "need":
+            with open(o.file, "rb") as f:
+                blobs, base, raw, end = read_container(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
+            m = check_manifest(raw, ABI, o.arch)
+            need(o.model_dir, "need takes --model-dir")
+            bs = files_of(o.model_dir)
+            hs = blob_hashes(bs)
+            need(all(h in blobs for h in hs), "a needed blob is missing from the container header")
+            print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), prefix=dict(off=0, len=end),
+                                  ranges=[dict(off=base + blobs[h][0], len=blobs[h][1], sha256=h) for h in hs])))
+            return
+        st = stage(o.file, o.sig, arch=o.arch, defer=True)
     except PackError as e:
         sys.exit(f"pack: REFUSED: {e}")
     try:
         m = st.manifest
         if o.cmd == "verify":
-            print(json.dumps(dict(ok=True, sha256=st.sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
-                                  buckets=len(m["buckets"]), weights=[w["file"] for w in m["model"]["weights"]])))
+            if o.partial:
+                need(o.model_dir, "--partial takes --model-dir")
+                st.ensure(files_of(o.model_dir))
+            else:
+                st.ensure(None)
+            print(json.dumps(dict(ok=True, manifest_sha256=st.manifest_sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
+                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]))))
         else:
             for b in m["buckets"]:
-                print(f"{b['id']:40s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
+                print(f"{b['id']:40s} {b['variant']:10s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
+    except PackError as e:
+        sys.exit(f"pack: REFUSED: {e}")
     finally:
         st.close()
 

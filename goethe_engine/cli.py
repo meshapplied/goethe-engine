@@ -5,7 +5,8 @@ USAGE = """usage: goethe-engine serve [--host H --port P --context-length N --ma
                             --api-key K --pack FILE.gcpack --weights PATH... [--tokenizer DIR]]
        goethe-engine index verify --index F --sig F [--last-serial N]
        goethe-engine pack match --index F --sig F --model-dir DIR --arch sm_XX [--last-serial N] [--tier T]
-       goethe-engine pack verify FILE [--sig F] [--arch sm_XX] | pack show FILE [--sig F]
+       goethe-engine pack need PREFIX --model-dir DIR [--arch sm_XX --sku S --numerics ..]
+       goethe-engine pack verify FILE [--sig F] [--arch sm_XX] [--partial --model-dir DIR] | pack show FILE [--sig F]
        goethe-engine --version"""
 
 
@@ -21,7 +22,7 @@ def main(argv=None):
     if a[:2] == ["index", "verify"] or a[:2] == ["pack", "match"]:
         from . import index
         return index.main(a[1:])
-    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"]):
+    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["need"]):
         from . import pack
         pack.main(a[1:])
         return 0
