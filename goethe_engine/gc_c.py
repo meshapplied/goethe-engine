@@ -95,14 +95,14 @@ class GcBackend:
 
     def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req):
         m0 = self.stage.manifest
-        dev = None if sku else P.device()
+        dev = None if sku else P.device(None if device < 0 else device)   # the device the handle opens on, not always GPU 0
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
         # the branch the weight files choose: the target variant (and the drafter's) by structure, header-only
         tv = P.pick_variant(m0, ws)
         dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
         dv = P.pick_variant(m0, dws, "drafter") if dws else None
-        m = self.m = P.for_variant(m0, tv, dv)
+        m = self.m = P.restrict(P.for_variant(m0, tv, dv))     # this plugin runs platform cuda on one device
         if self.spec:
             b, db, pol = P.spec_pair(m, sku=sku, dev=dev, contract=contract, ctx=ctx)
             ids, pol_s = [b["id"], db["id"]], policy or self._policy(pol)
@@ -113,18 +113,21 @@ class GcBackend:
             # else, and for B > 1, the smallest batch bucket
             want = P.wanted(*req, single=B == 1)
             P.need_bucket(m, sku, want, f"numerics={req[0]} act={req[1]} kv={req[2]} for {B} sequence(s)")
-            b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=ctx, want=want)) or \
-                P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=ctx, want=want)
-            if B == 1:
-                b = P.with_prefill(m, b, sku=sku, dev=dev, contract=contract, ctx=ctx, want=want)
-            lad = P.ladder(m, b)
-            pf = P.prefill(m, b)   # a prompt chunk of W tokens a launch (the runtime ignores it on a paged pack)
+
+            def pick(cx):
+                b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)) or \
+                    P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=cx, want=want)
+                if B == 1:
+                    b = P.with_prefill(m, b, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)
+                return b, P.ladder(m, b), P.prefill(m, b)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
+            free = P.device_free(device)
+            b, lad, pf = P.open_ctx(pick, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, what=bl[0]["id"]))
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None
             self.bucket = b
             self.stage.ensure(lad + ([pf] if pf else []))        # only the chosen branch's blobs are read from the pack
         P.check_weights(m, ws, dws)
         if not self.spec:   # weights, slots and the smallest pool must fit the device; no pool_blocks: the largest that fits
-            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, P.device_free(device), pool_blocks, what=b["id"])
+            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, what=b["id"])
         top = lad[-1]
         libpath = os.path.join(P.materialize(self.stage, top), top["lib"])
         self.L = bind(libpath)

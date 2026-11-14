@@ -13,6 +13,13 @@ compiled for (structure.py: tensor table and metadata keys, no weight bytes); th
 Manifest: model.weights (informational: the files the gates ran on), variants {id: {structure, weights: [model.weights indices]}},
 buckets[] each with variant, role, sku, contract, ncol, maxctx, files, lib, requires, numerics axes, step_us.
 
+Axes (3.1, additive; derived when absent, so a 3.0 manifest reads unchanged): bucket "platform" (cuda), "kind" (decode: a batch
+ladder bucket | stream: one sequence a token a launch | prefill: a prompt chunk a launch | verify: a speculative verify), "mesh"
+({axis: size} over dp tp pp ep sp; absent or {} = one device); manifest "arches" {arch: {...}}, model "type" (decoder).
+Overlay: a container of the same framing whose manifest has schema "gc-pack-overlay" and "base" = sha256 of the base manifest bytes;
+signed on its own (sha256(b"gc-overlay-3\n" + overlay manifest bytes)), it adds buckets, variants, weights, hw, blob_raw, spec and
+arches (a new GPU arch or quant format) without touching or re-signing the base. merge() joins them fail-closed.
+
   python -m goethe_engine.pack verify FILE [--sig F] [--arch sm_XX] [--partial [--model-dir D] [--sku S]]   check, discard
   python -m goethe_engine.pack show FILE [--sig F]                   one line per bucket
   python -m goethe_engine.pack need PREFIX --model-dir D [--arch A --sku S --numerics ..]  the byte ranges a download must fetch
@@ -34,6 +41,12 @@ ROLES = ("target", "drafter")
 POLICIES = {"ar": ("K",), "walk": ("gate", "succ", "pred", "feats"),   # speculative round kinds and their fields
             "mtp": ("K", "feats", "tap", "own", "w_in", "w_own")}
 HEX = re.compile(r"^[0-9a-f]{64}$")
+OVERLAY_SCHEMA = "gc-pack-overlay"
+OVERLAY_DOMAIN = b"gc-overlay-3\n"     # signed digest of an overlay = sha256(OVERLAY_DOMAIN + overlay manifest bytes)
+PLATFORM = "cuda"                       # the platform of a bucket without the field (every 3.0 pack)
+KINDS = ("decode", "stream", "prefill", "verify")
+MESH_AXES = ("dp", "tp", "pp", "ep", "sp")  # data, tensor, pipeline, expert, sequence / context parallel
+MODEL_TYPE = "decoder"                  # model.type of a manifest without the field
 
 
 class PackError(Exception):
@@ -90,8 +103,10 @@ def validate(m, loader_abi=ABI):
         ids.add(b["id"])
         need(b["sku"] in m["hw"], f"bucket {b['id']}: sku {b['sku']} has no hw record hash")
         need(b["lib"] in b["files"] and b.get("plan", b["lib"]) in b["files"], f"bucket {b['id']}: lib / plan not in its files")
-        need(b["requires"]["arch"] == m["arch"], f"bucket {b['id']}: arch {b['requires']['arch']} != {m['arch']}")
+        need(b["requires"]["arch"] in arches(m), f"bucket {b['id']}: arch {b['requires']['arch']} not in {sorted(arches(m))}")
         need(isinstance(b.get("bodies", {}), dict), f"bucket {b['id']}: bodies is not a map")
+        need(isinstance(b.get("platform", PLATFORM), str) and isinstance(b.get("kind", ""), str), f"bucket {b['id']}: platform / kind")
+        mesh_key(b.get("mesh"), b["id"])
         for rel, h in b["files"].items():
             need(HEX.match(h) and safe_rel(rel), f"bucket {b['id']}: bad file entry {rel!r}")
     for b in m["buckets"]:
@@ -112,6 +127,83 @@ def validate(m, loader_abi=ABI):
         need(pol["kind"] not in ("ar", "mtp") or 1 <= int(pol.get("K", 0)) < t["ncol"],
              f"spec {s}: {pol['kind']} K outside 1 .. ncol - 1")
     return m
+
+
+def arches(m):
+    """The GPU arches a manifest's buckets may name: its "arch" and the keys of "arches" (3.1)."""
+    a = m.get("arches") or {}
+    need(isinstance(a, dict), "manifest arches must be a map")
+    return {m["arch"], *a}
+
+
+def mesh_key(mesh, what="mesh"):
+    """The canonical form of a mesh {axis: size}: the sorted (axis, size) pairs with size > 1; () is one device."""
+    mesh = mesh or {}
+    need(isinstance(mesh, dict) and all(k in MESH_AXES and isinstance(v, int) and not isinstance(v, bool) and v >= 1
+                                        for k, v in mesh.items()), f"{what}: mesh {mesh!r} must map {MESH_AXES} to sizes >= 1")
+    return tuple(sorted((k, v) for k, v in mesh.items() if v > 1))
+
+
+def axes(b):
+    """(platform, kind, mesh key) of a bucket: its fields, else derived (a 3.0 bucket: cuda, one device, kind from batch / ncol /
+    prefill)."""
+    kind = b.get("kind") or ("prefill" if b.get("prefill") else "decode" if b.get("batch") else "stream" if b["ncol"] == 1
+                             else "verify")
+    return b.get("platform", PLATFORM), kind, mesh_key(b.get("mesh"), b["id"])
+
+
+def restrict(m, *, platform=PLATFORM, mesh=None):
+    """The manifest restricted to the buckets of one platform and device mesh (default one device): what a backend plugin opens."""
+    mk = mesh_key(mesh)
+    bs = [b for b in m["buckets"] if axes(b)[0] == platform and axes(b)[2] == mk]
+    ids = {b["id"] for b in bs}
+    need(bs, f"no bucket for platform {platform}, mesh {dict(mk) or 'one device'}; the pack has "
+         f"{sorted({(axes(b)[0], str(dict(axes(b)[2]) or 'one device')) for b in m['buckets']})}")
+    return dict(m, buckets=bs, spec=[s for s in m.get("spec", []) if s.get("target") in ids and s.get("drafter") in ids],
+                contracts=[c for c in m["contracts"] if any(b["contract"] == c for b in bs)])
+
+
+def merge(m, raw, overlays):
+    """The manifest of base m (its bytes raw) joined with overlay manifests (dicts; schema gc-pack-overlay, base = sha256(raw)), applied
+    in the order of their own manifest digests. Additive only: a bucket id, sku hash, blob size, arch or a different variant under an
+    existing id that collides is refused; an overlay's weights indices >= len(its base's model.weights) name its own weights list."""
+    if not overlays:
+        return m
+    out, h = json.loads(raw), hashlib.sha256(raw).hexdigest()
+    nb, ws = len(out["model"]["weights"]), out["model"]["weights"]
+    ids = {b["id"] for b in out["buckets"]}
+    for o in sorted(overlays, key=lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()):
+        need(isinstance(o, dict) and o.get("schema") == OVERLAY_SCHEMA, "not a pack overlay manifest")
+        need(o.get("base") == h, f"overlay is for base manifest {o.get('base')}, this pack's is {h} (refused)")
+        need(semver(o.get("abi"))[0] == semver(out["abi"])[0], f"overlay abi {o.get('abi')} vs pack abi {out['abi']}")
+        own = o.get("weights", [])
+        need(isinstance(own, list) and all(isinstance(w, dict) and isinstance(w.get("file"), str) for w in own), "overlay weights")
+        at = {i: i for i in range(nb)}
+        for i, w in enumerate(own):            # a file the merged list already names is shared, else appended
+            same = [j for j, x in enumerate(ws) if x.get("sha256") and x.get("sha256") == w.get("sha256")]
+            at[nb + i] = same[0] if same else len(ws)
+            if not same:
+                ws.append(w)
+        remap = lambda i: (need(i in at, f"overlay weights index {i}"), at[i])[1]
+        for k in ("hw", "blob_raw", "arches"):
+            for x, v in (o.get(k) or {}).items():
+                need(out.setdefault(k, {}).get(x, v) == v, f"overlay {k} {x} differs from the pack's (refused)")
+                out[k][x] = v
+        for vid, v in (o.get("variants") or {}).items():
+            v = dict(v, weights=[remap(i) for i in v.get("weights", [])])
+            need(vid not in out["variants"] or out["variants"][vid] == v, f"overlay variant {vid} differs from the pack's (refused)")
+            out["variants"][vid] = v
+        for b in o.get("buckets", []):
+            need(isinstance(b, dict) and b.get("id") not in ids, f"overlay bucket {b.get('id') if isinstance(b, dict) else b} "
+                 "is already in the pack (refused)")
+            ids.add(b["id"])
+            b = dict(b, weights=remap(b.get("weights", 0)))
+            if o.get("runtime", out["runtime"]) != out["runtime"]:
+                b.setdefault("runtime", o["runtime"])
+            out["buckets"].append(b)
+        out["contracts"] += [c for c in o.get("contracts", []) if c not in out["contracts"]]
+        out["spec"] = out.get("spec", []) + list(o.get("spec", []))
+    return validate(out)
 
 
 def read_capped(path, cap=None):
@@ -138,7 +230,7 @@ def check_manifest(raw, loader_abi=ABI, arch=None):
     rt = m["runtime"]
     need(rt.get("kind") in RUNTIMES and rt.get("version") in RUNTIMES[rt["kind"]],
          f"runtime {rt.get('kind')} {rt.get('version')} is not one this engine runs {RUNTIMES}")
-    need(arch is None or m["arch"] == arch, f"pack arch {m['arch']} != {arch}")
+    need(arch is None or arch in arches(m), f"pack arches {sorted(arches(m))} lack {arch}")
     return m
 
 
@@ -154,12 +246,19 @@ class Staged:
     def __init__(self):
         self.dir, self.manifest, self.keyid, self.manifest_sha256 = tempfile.mkdtemp(prefix="goethe-engine-"), None, None, None
         self.f = self.blobs = self.base = self.total = None
+        self.src, self.files, self.overlays = {}, [], []    # blob hash -> (file, base, total, entry); open containers; overlay digests
         atexit.register(self.close)
 
+    def add(self, f, blobs, base, total):
+        """A container whose blobs this stage reads (the base pack first, then each overlay); a hash already present keeps its source."""
+        self.files.append(f)
+        for bh, e in blobs.items():
+            self.src.setdefault(bh, (f, base, total, e))
+
     def close(self):
-        if self.f:
-            self.f.close()
-            self.f = None
+        for f in self.files:
+            f.close()
+        self.files, self.f = [], None
         if self.dir:
             shutil.rmtree(self.dir, ignore_errors=True)
             self.dir = None
@@ -170,10 +269,11 @@ class Staged:
             dst = os.path.join(self.dir, "blobs", bh)
             if os.path.exists(dst):
                 continue
-            need(bh in self.blobs, f"blob {bh} missing from the pack")
-            off, ln, codec = blob_entry(self.blobs[bh], bh)
-            _section(off, ln, self.total - self.base, f"blob {bh}")
-            self.f.seek(self.base + off)
+            need(bh in self.src, f"blob {bh} missing from the pack")
+            f, base, total, e = self.src[bh]
+            off, ln, codec = blob_entry(e, bh)
+            _section(off, ln, total - base, f"blob {bh}")
+            f.seek(base + off)
             hh, left = hashlib.sha256(), ln
             dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
             pin = self.manifest.get("blob_raw", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
@@ -190,7 +290,7 @@ class Staged:
             try:
                 with _create(dst) as o:
                     while left:
-                        chunk = self.f.read(min(left, 4 << 20))
+                        chunk = f.read(min(left, 4 << 20))
                         need(chunk, f"blob {bh}: pack truncated or a hole")
                         left -= len(chunk)
                         if not dec:
@@ -252,33 +352,62 @@ def read_container(f, total):
     return blobs, base, raw, base + mo + ml
 
 
-def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False):
-    """Verify a .gcpack: the signature (sig: path of the detached signature, default PACK.sig) over sha256(DOMAIN + manifest bytes), then
-    the manifest. Blobs are extracted (hash-checked) all at once, or with defer=True only when Staged.ensure asks."""
-    st = Staged()
+def _open_signed(path, sig, domain, trusted):
+    """(open file, header blobs, base offset, total size, manifest bytes, signer key id) of a container whose manifest is signed over
+    sha256(domain + manifest bytes) by the detached signature sig (default PATH.sig)."""
+    sp = sig or path + ".sig"
+    sigb = read_capped(sp, sign.MAX_SIG) if os.path.lexists(sp) else None
     try:
-        sp = sig or pack + ".sig"
-        sigb = read_capped(sp, sign.MAX_SIG) if os.path.lexists(sp) else None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise PackError(f"{path}: {e.strerror} (symlinks are refused)")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise PackError(f"{path}: not a regular file")
+    f = os.fdopen(fd, "rb")
+    try:
+        total = os.fstat(fd).st_size
+        blobs, base, raw, _ = read_container(f, total)
         try:
-            fd = os.open(pack, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as e:
-            raise PackError(f"{pack}: {e.strerror} (symlinks are refused)")
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            os.close(fd)
-            raise PackError(f"{pack}: not a regular file")
-        st.f = os.fdopen(fd, "rb")
-        st.total = os.fstat(fd).st_size
-        st.blobs, st.base, raw, _ = read_container(st.f, st.total)
-        st.manifest_sha256 = hashlib.sha256(raw).hexdigest()
-        try:
-            st.keyid = sign.verify(None, sigb, trusted, digest=hashlib.sha256(DOMAIN + raw).hexdigest())
+            kid = sign.verify(None, sigb, trusted, digest=hashlib.sha256(domain + raw).hexdigest())
         except sign.SignatureError as e:
             raise PackError(str(e))
-        st.manifest = check_manifest(raw, loader_abi, arch)
+        return f, blobs, base, total, raw, kid
+    except BaseException:
+        f.close()
+        raise
+
+
+def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, overlays=()):
+    """Verify a .gcpack: the signature (sig: path of the detached signature, default PACK.sig) over sha256(DOMAIN + manifest bytes), then
+    the manifest. Blobs are extracted (hash-checked) all at once, or with defer=True only when Staged.ensure asks. overlays: overlay files
+    (each signed, OVERLAY_DOMAIN, signature at FILE.sig), merged into the manifest (merge); pack may also be [base, overlay, ...]. The
+    staged manifest.json is the base's bytes, or with overlays the merged manifest (manifest_sha256 stays the base's: the index entry's)."""
+    if isinstance(pack, (list, tuple)):
+        pack, overlays = pack[0], list(pack[1:]) + list(overlays)
+    st = Staged()
+    try:
+        st.f, st.blobs, st.base, st.total, raw, st.keyid = _open_signed(pack, sig, DOMAIN, trusted)
+        st.add(st.f, st.blobs, st.base, st.total)
+        st.manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        st.manifest = check_manifest(raw, loader_abi, None)
+        ovs = []
+        for op in overlays:
+            f, blobs, base, total, oraw, _ = _open_signed(op, None, OVERLAY_DOMAIN, trusted)
+            st.add(f, blobs, base, total)
+            st.overlays.append(hashlib.sha256(oraw).hexdigest())
+            try:
+                ovs.append(json.loads(oraw))
+            except ValueError as e:
+                raise PackError(f"{op}: overlay manifest: {e}")
+        if ovs:
+            st.manifest = merge(st.manifest, raw, ovs)
+            raw = (json.dumps(st.manifest, indent=1, sort_keys=True) + "\n").encode()
+        need(arch is None or arch in arches(st.manifest), f"pack arches {sorted(arches(st.manifest))} lack {arch}")
         with _create(os.path.join(st.dir, "manifest.json")) as o:
             o.write(raw)
         with _create(os.path.join(st.dir, "manifest.sha256")) as o:
-            o.write((st.manifest_sha256 + "\n").encode())
+            o.write((hashlib.sha256(raw).hexdigest() + "\n").encode())
         os.mkdir(os.path.join(st.dir, "blobs"), 0o700)
         if not defer:
             st.ensure(None)
@@ -322,7 +451,8 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
         need(sku is None or sku in s, f"--sku {sku} is not the device's SKU {sorted(s)}")
         sku = sku or s.pop()
         need(dev["cc"] == hit[0]["requires"]["cc"], f"device cc {dev['cc']} != pack cc {hit[0]['requires']['cc']}")
-        need(m["arch"].startswith("sm_" + dev["cc"].replace(".", "")), f"device cc {dev['cc']} vs pack arch {m['arch']}")
+        need(hit[0]["requires"]["arch"].startswith("sm_" + dev["cc"].replace(".", "")),
+             f"device cc {dev['cc']} vs bucket arch {hit[0]['requires']['arch']}")
         need(dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"]),
              f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}")
     need(sku is not None, "no SKU: pass a device or a SKU")
@@ -472,6 +602,22 @@ def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"
     return (None, base + blk * full) if fits >= full else (fits, base + blk * fits)
 
 
+def open_ctx(pick, m, ctx, fits):
+    """(bucket, ladder, prefill bucket) of pick(ctx). ctx None: the context is sized at load, the largest maxctx of the pack whose
+    pick fits the device (fits(buckets) raises PackError when not); a pack without resident records fits at its largest maxctx."""
+    if ctx is not None:
+        return pick(ctx)
+    err = None
+    for cx in sorted({b["maxctx"] for b in m["buckets"] if b["role"] == "target"}, reverse=True):
+        try:
+            b, lad, pf = pick(cx)
+            fits(lad + ([pf] if pf else []))
+            return b, lad, pf
+        except PackError as e:
+            err = e                 # the smallest context's reason is the one to report
+    raise err or PackError("no target bucket")
+
+
 def prefill(m, b):
     """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
     sequence a launch beside b's ladder) with b's SKU, contract, role and maxctx, or None."""
@@ -577,6 +723,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
     ap.add_argument("cmd", choices=("verify", "show", "need"))
     ap.add_argument("file")
     ap.add_argument("--sig")
+    ap.add_argument("--overlay", action="append", default=[], help="a signed overlay merged into the pack (repeatable)")
     ap.add_argument("--arch")
     ap.add_argument("--partial", action="store_true")
     ap.add_argument("--model-dir")
@@ -612,7 +759,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
                                   ranges=[dict(off=base + blob_entry(blobs[h], h)[0], len=blob_entry(blobs[h], h)[1], sha256=h,
                                                **({"codec": "xz"} if blob_entry(blobs[h], h)[2] else {})) for h in hs])))
             return
-        st = stage(o.file, o.sig, arch=o.arch, defer=True)
+        st = stage(o.file, o.sig, arch=o.arch, defer=True, overlays=o.overlay)
     except PackError as e:
         sys.exit(f"pack: REFUSED: {e}")
     try:
@@ -624,6 +771,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
             else:
                 st.ensure(None)
             print(json.dumps(dict(ok=True, manifest_sha256=st.manifest_sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
+                                  **({"overlays": st.overlays, "arches": sorted(arches(m))} if st.overlays else {}),
                                   buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}))))
         else:
             for b in m["buckets"]:

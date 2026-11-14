@@ -2,11 +2,11 @@
 import sys
 
 USAGE = """usage: goethe-engine serve [--host H --port P --context-length N --max-running-requests N --served-model-name S
-                            --api-key K --pack FILE.gcpack --weights PATH... [--tokenizer DIR]]
+                            --api-key K --pack FILE.gcpack [--overlay O]... --weights PATH... [--tokenizer DIR] [--device N]]
        goethe-engine index verify --index F --sig F [--last-serial N]
        goethe-engine pack match --index F --sig F --model-dir DIR --arch sm_XX [--last-serial N] [--tier T]
        goethe-engine pack need PREFIX --model-dir DIR [--arch sm_XX --sku S --numerics ..]
-       goethe-engine pack verify FILE [--sig F] [--arch sm_XX] [--partial --model-dir DIR] | pack show FILE [--sig F]
+       goethe-engine pack verify FILE [--sig F] [--overlay O]... [--arch sm_XX] [--partial --model-dir DIR] | pack show FILE [--sig F]
        goethe-engine --version"""
 
 

@@ -303,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def build(args):
     """(engine, tokenizer, ctx) from the CLI args: a pack backend, or the CPU reference model with --ref."""
-    from .engine import Engine
+    from . import registry
     from .scheduler import Config
     if args.ref:
         from .ref import RefModel, TorchBackend
@@ -315,19 +315,18 @@ def build(args):
     else:
         if not (args.pack and args.weights):
             raise SystemExit("serve needs --pack FILE and --weights PATH... (or --ref for the CPU reference model)")
-        from .gc_c import GcBackend
         if len(args.weights) > 2:
             raise SystemExit("--weights takes the target model (a GGUF file, or a checkpoint directory) and optionally a drafter file (speculative pair)")
         import glob
         tw = sorted(glob.glob(os.path.join(args.weights[0], "*.safetensors"))) if os.path.isdir(args.weights[0]) else args.weights[0]
-        be = GcBackend(args.pack, tw, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
+        be = registry.open_backend([args.pack] + list(args.overlay or []), tw, mesh=registry.Mesh.single(args.device), B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")
         tok = HFTokenizer(tdir)
         ctx = args.context_length or be.max_len
     seqs = min(args.max_running_requests or be.max_seqs, be.max_seqs)
-    eng = Engine(be, Config(max_num_seqs=seqs, max_model_len=ctx, kv_dtype="f16" if args.kv == "auto" else args.kv, prefix_cache=getattr(be, "prefix_cache", True)),
+    eng = registry.runner(be, Config(max_num_seqs=seqs, max_model_len=ctx, kv_dtype="f16" if args.kv == "auto" else args.kv, prefix_cache=getattr(be, "prefix_cache", True)),
                  eos_ids=tok.eos_ids)
     return eng, tok, ctx
 
@@ -349,6 +348,8 @@ def parser():
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
     ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
+    ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")
+    ap.add_argument("--device", type=int, default=-1, help="device ordinal (default: the current device)")
     return ap
 
 
