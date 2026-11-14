@@ -105,12 +105,45 @@ def test_overlay_adds_a_format_with_its_weights(tmp_path, key, mocklib):
         st.close()
 
 
-@pytest.mark.parametrize("bad", ["base", "collide", "unsigned"])
+REFUSALS = {"base": "base manifest", "collide": "already in the pack", "unsigned": "no signature", "untrusted": "not in the pinned",
+            "hw": "hw mock differs", "variant": "variant q4 differs", "flipped": "signature|verif", "symlink": "symlinks are refused",
+            "notfile": "not a regular file|symlinks"}
+
+
+@pytest.mark.parametrize("bad", sorted(REFUSALS))
 def test_overlay_refusals(tmp_path, key, mocklib, bad):
+    """Every way an overlay could change or forge the base is refused."""
     pack, _, _ = toy_pack(str(tmp_path), key, mocklib)
-    kw = dict(base="0" * 64) if bad == "base" else dict(ids=("target.mock.K1.2.256", "x")) if bad == "collide" else dict(sign=False)
+    kw = dict(base="0" * 64) if bad == "base" else dict(ids=("target.mock.K1.2.256", "x")) if bad == "collide" else \
+        dict(sign=False) if bad == "unsigned" else {}
     ovl = overlay(str(tmp_path), key, pack, mocklib, **kw)
-    with pytest.raises(P.PackError, match="base manifest|already in the pack|no signature"):
+    o = json.loads(base_raw(ovl))
+    if bad in ("hw", "variant"):        # a base field under the same key with another value, signed by the trusted key
+        if bad == "hw":
+            o["hw"]["mock"] = "2" * 64
+        else:
+            o["variants"]["q4"] = dict(json.loads(base_raw(pack))["variants"]["q4"], weights=[1])
+        raw = (json.dumps(o, indent=1, sort_keys=True) + "\n").encode()
+        gcpack(ovl, raw, {})            # refused at the merge, before any blob is read
+        open(ovl + ".sig", "wb").write(key.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + raw).hexdigest()))
+    elif bad == "untrusted":
+        from toypack import Key
+        os.makedirs(tmp_path / "other")
+        other = Key(str(tmp_path / "other"))           # a valid signature by a key that is not pinned
+        open(ovl + ".sig", "wb").write(other.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + base_raw(ovl)).hexdigest()))
+    elif bad == "flipped":
+        b = bytearray(open(ovl, "rb").read())
+        i = b.index(b'"base"') + 2
+        b[i] ^= 1                        # one byte of the signed manifest
+        open(ovl, "wb").write(bytes(b))
+    elif bad == "symlink":
+        os.symlink(ovl, ovl + ".ln")
+        os.symlink(ovl + ".sig", ovl + ".ln.sig")
+        ovl += ".ln"
+    elif bad == "notfile":
+        os.rename(ovl, ovl + ".f")
+        os.mkdir(ovl)
+    with pytest.raises(P.PackError, match=REFUSALS[bad]):
         P.stage([pack, ovl], trusted=(key.kid,), defer=True)
 
 
