@@ -540,3 +540,16 @@ def test_xz_blob_without_a_signed_raw_size_is_refused_but_stored_unpinned_loads(
     _xz(pack, key, lambda b: (lzma.compress(b), "xz"), pin=False)
     with pytest.raises(P.PackError, match="without a raw size"):
         P.verify(pack, trusted=(key.kid,))
+
+
+def test_b1_takes_the_batch_ladder_when_only_it_has_a_prefill_bucket():
+    """a 1 column stream bucket without a prompt chain yields to a batch bucket of the pack that has one (B 1 prompts run W tokens a launch)."""
+    def bk(i, c, n, batch, **kw):
+        return dict(id=i, role="target", sku="s", contract=c, ncol=n, batch=batch, maxctx=8, **kw)
+    m = dict(contracts=["BI", "E0"], runtime=dict(kind="gc-c", version=1),
+             buckets=[bk("bi2", "BI", 2, True), bk("e1", "E0", 1, False, step_us=700.0), bk("bi16", "BI", 16, False, prefill=16)])
+    s = P.single_stream(m, sku="s")
+    assert s["id"] == "e1" and P.prefill(m, s) is None
+    assert P.with_prefill(m, s, sku="s")["id"] == "bi2"
+    m["buckets"].pop()                                          # no prefill bucket anywhere: the stream bucket stays
+    assert P.with_prefill(m, s, sku="s")["id"] == "e1"

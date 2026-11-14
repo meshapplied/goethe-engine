@@ -479,6 +479,22 @@ def prefill(m, b):
                 and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["prefill"], default=None)
 
 
+def with_prefill(m, b, *, sku=None, dev=None, contract=None, ctx=None, want=None):
+    """B 1 prompts: a 1 column non-batch stream bucket b has no prompt chain, so when the pack has a batch ladder bucket (same request) with a
+    prefill bucket, that bucket (its contract's numerics, token-per-launch decode through its 2 column ladder step); else b."""
+    if b is None or P_has(m, b) or b["ncol"] != 1 or b["batch"]:
+        return b
+    try:
+        b2 = select(m, sku=sku, dev=dev, contract=contract, B=2, ctx=ctx, want=want)
+    except PackError:
+        return b
+    return b2 if prefill(m, b2) else b
+
+
+def P_has(m, b):
+    return prefill(m, b) is not None
+
+
 def pick_variant(m, files, role="target"):
     """The id of the variant of role whose structure the model files have (header-only reads); refuses naming why each variant differs."""
     ids = sorted({b["variant"] for b in m["buckets"] if b["role"] == role})
