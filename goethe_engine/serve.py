@@ -320,7 +320,7 @@ def build(args):
             raise SystemExit("--weights takes the target model (a GGUF file, or a checkpoint directory) and optionally a drafter file (speculative pair)")
         import glob
         tw = sorted(glob.glob(os.path.join(args.weights[0], "*.safetensors"))) if os.path.isdir(args.weights[0]) else args.weights[0]
-        be = registry.open_backend([args.pack] + list(args.overlay or []), tw, mesh=registry.Mesh.single(args.device), B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
+        be = registry.open_backend([args.pack] + list(args.overlay or []), tw, mesh=registry.Mesh.single(args.device), store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")
@@ -350,6 +350,7 @@ def parser():
     ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
     ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")
+    ap.add_argument("--store", metavar="DIR", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
     ap.add_argument("--device", type=int, default=-1, help="device ordinal (default: the current device)")
     return ap
 

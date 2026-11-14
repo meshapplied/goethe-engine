@@ -83,10 +83,10 @@ def arr(ctype, xs):
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="invariant", act="auto", kv="auto"):
-        """state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
+                 numerics="invariant", act="auto", kv="auto", store=None):
+        """store: the pack 4 blob store (P.open_store). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
-        self.stage = P.stage(pack, trusted=trusted, defer=True)
+        self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
             self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv))
         except BaseException:

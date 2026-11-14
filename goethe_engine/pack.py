@@ -20,6 +20,12 @@ Overlay: a container of the same framing whose manifest has schema "gc-pack-over
 signed on its own (sha256(b"gc-overlay-3\n" + overlay manifest bytes)), it adds buckets, variants, weights, hw, blob_raw, spec and
 arches (a new GPU arch or quant format) without touching or re-signing the base. merge() joins them fail-closed.
 
+Pack 4 (b"GCPACK4\n", manifest abi 4.x, signed over sha256(b"gc-pack-4\n" + manifest bytes)): the same container with the blobs outside
+it, in a content-addressed store (Store: open(sha256) -> the stored bytes as a file and their entry; DirStore: a directory of <sha256>.xz
+or <sha256>, the private gated store's download cache; a network transport is another Store). Every blob a v4 bucket names has its raw
+size pinned in the signed manifest; a store blob is checked exactly as an embedded one (pin, xz limits, hash). The magic fixes the major:
+a v4 file with an abi 3 manifest, or the reverse, is refused, so a signature never carries across.
+
   python -m goethe_engine.pack verify FILE [--sig F] [--arch sm_XX] [--partial [--model-dir D] [--sku S]]   check, discard
   python -m goethe_engine.pack show FILE [--sig F]                   one line per bucket
   python -m goethe_engine.pack need PREFIX --model-dir D [--arch A --sku S --numerics ..]  the byte ranges a download must fetch
@@ -31,6 +37,7 @@ from . import numerics_kw as NK, sign, structure
 ABI = "3.0.0"                       # pack ABI semver: additive within a major
 MAGIC = b"GCPACK3\n"
 DOMAIN = b"gc-pack-3\n"             # signed digest = sha256(DOMAIN + manifest bytes)
+ABI4, MAGIC4, DOMAIN4 = "4.0.0", b"GCPACK4\n", b"gc-pack-4\n"   # pack 4: the same framing, blobs by hash from a store
 MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
 RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
@@ -203,7 +210,7 @@ def merge(m, raw, overlays):
             out["buckets"].append(b)
         out["contracts"] += [c for c in o.get("contracts", []) if c not in out["contracts"]]
         out["spec"] = out.get("spec", []) + list(o.get("spec", []))
-    return validate(out)
+    return validate(out, out["abi"])
 
 
 def read_capped(path, cap=None):
@@ -249,6 +256,8 @@ class Staged:
         self.src, self.files, self.overlays = {}, [], []    # blob hash -> (file, base, total, entry); open containers; overlay digests
         atexit.register(self.close)
 
+    store = None                     # a Store blobs missing from the containers are read from (pack 4)
+
     def add(self, f, blobs, base, total):
         """A container whose blobs this stage reads (the base pack first, then each overlay); a hash already present keeps its source."""
         self.files.append(f)
@@ -269,7 +278,12 @@ class Staged:
             dst = os.path.join(self.dir, "blobs", bh)
             if os.path.exists(dst):
                 continue
-            need(bh in self.src, f"blob {bh} missing from the pack")
+            if bh not in self.src and self.store is not None:
+                got = self.store.open(bh)
+                if got:
+                    self.files.append(got[0])
+                    self.src[bh] = (got[0], 0, got[1][1], got[1])
+            need(bh in self.src, f"blob {bh} missing from the pack" + (" and the store" if self.store is not None else ""))
             f, base, total, e = self.src[bh]
             off, ln, codec = blob_entry(e, bh)
             _section(off, ln, total - base, f"blob {bh}")
@@ -330,10 +344,45 @@ def _section(off, ln, total, what):
     need(isinstance(off, int) and isinstance(ln, int) and 0 <= off and 0 <= ln and off + ln <= total, f"{what}: section out of range")
 
 
+class DirStore:
+    """A content-addressed blob store in a directory: <sha256>.xz (xz stream) or <sha256> (raw bytes), regular files, no symlinks."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def open(self, h):
+        """(open file, container entry [0, stored length] or [0, stored length, "xz"]) of blob h, or None when the store lacks it."""
+        need(HEX.match(h), f"blob name {h!r}")
+        for name, codec in ((h + ".xz", ["xz"]), (h, [])):
+            try:
+                fd = os.open(os.path.join(self.path, name), os.O_RDONLY | os.O_NOFOLLOW)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                raise PackError(f"store blob {name}: {e.strerror} (symlinks are refused)")
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise PackError(f"store blob {name}: not a regular file")
+            return os.fdopen(fd, "rb"), [0, os.fstat(fd).st_size, *codec]
+        return None
+
+
+def open_store(store):
+    """A Store from an object with open(), a directory path, or None ($GOETHE_BLOB_STORE, else no store)."""
+    store = store if store is not None else os.environ.get("GOETHE_BLOB_STORE")
+    return store if store is None or hasattr(store, "open") else DirStore(store)
+
+
 def read_container(f, total):
     """(header blobs, base offset, manifest bytes, offset just past the manifest) of an open pack file (or of a prefix holding its header and
-    manifest)."""
-    need(f.read(len(MAGIC)) == MAGIC, "not a gcpack3 file (bad magic)")
+    manifest); pack 3 or 4 framing (read_container_v also returns the major its magic fixes)."""
+    return read_container_v(f, total)[1:]
+
+
+def read_container_v(f, total):
+    """(3 or 4, header blobs, base offset, manifest bytes, end of manifest) of an open pack file or prefix."""
+    mg = f.read(len(MAGIC))
+    need(mg in (MAGIC, MAGIC4), "not a gcpack file (bad magic)")
     n = int.from_bytes(f.read(8), "little")
     need(0 < n <= MAX_HEADER, "container header size")
     try:
@@ -349,12 +398,12 @@ def read_container(f, total):
     f.seek(base + mo)
     raw = f.read(ml)
     need(len(raw) == ml, "manifest truncated")
-    return blobs, base, raw, base + mo + ml
+    return (4 if mg == MAGIC4 else 3), blobs, base, raw, base + mo + ml
 
 
 def _open_signed(path, sig, domain, trusted):
-    """(open file, header blobs, base offset, total size, manifest bytes, signer key id) of a container whose manifest is signed over
-    sha256(domain + manifest bytes) by the detached signature sig (default PATH.sig)."""
+    """(open file, header blobs, base offset, total size, manifest bytes, signer key id, major) of a container whose manifest is signed over
+    sha256(domain + manifest bytes) by the detached signature sig (default PATH.sig); domain None: the pack domain its magic fixes."""
     sp = sig or path + ".sig"
     sigb = read_capped(sp, sign.MAX_SIG) if os.path.lexists(sp) else None
     try:
@@ -367,33 +416,36 @@ def _open_signed(path, sig, domain, trusted):
     f = os.fdopen(fd, "rb")
     try:
         total = os.fstat(fd).st_size
-        blobs, base, raw, _ = read_container(f, total)
+        v, blobs, base, raw, _ = read_container_v(f, total)
         try:
-            kid = sign.verify(None, sigb, trusted, digest=hashlib.sha256(domain + raw).hexdigest())
+            kid = sign.verify(None, sigb, trusted, digest=hashlib.sha256((domain or (DOMAIN4 if v == 4 else DOMAIN)) + raw).hexdigest())
         except sign.SignatureError as e:
             raise PackError(str(e))
-        return f, blobs, base, total, raw, kid
+        return f, blobs, base, total, raw, kid, v
     except BaseException:
         f.close()
         raise
 
 
-def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, overlays=()):
+def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, overlays=(), store=None):
     """Verify a .gcpack: the signature (sig: path of the detached signature, default PACK.sig) over sha256(DOMAIN + manifest bytes), then
     the manifest. Blobs are extracted (hash-checked) all at once, or with defer=True only when Staged.ensure asks. overlays: overlay files
     (each signed, OVERLAY_DOMAIN, signature at FILE.sig), merged into the manifest (merge); pack may also be [base, overlay, ...]. The
-    staged manifest.json is the base's bytes, or with overlays the merged manifest (manifest_sha256 stays the base's: the index entry's)."""
+    staged manifest.json is the base's bytes, or with overlays the merged manifest (manifest_sha256 stays the base's: the index entry's).
+    store: the Store (or directory) of pack 4 blobs (open_store; default $GOETHE_BLOB_STORE); a blob embedded in a container is used first."""
     if isinstance(pack, (list, tuple)):
         pack, overlays = pack[0], list(pack[1:]) + list(overlays)
     st = Staged()
     try:
-        st.f, st.blobs, st.base, st.total, raw, st.keyid = _open_signed(pack, sig, DOMAIN, trusted)
+        st.f, st.blobs, st.base, st.total, raw, st.keyid, v = _open_signed(pack, sig, None, trusted)
         st.add(st.f, st.blobs, st.base, st.total)
+        st.store = open_store(store)
         st.manifest_sha256 = hashlib.sha256(raw).hexdigest()
-        st.manifest = check_manifest(raw, loader_abi, None)
+        st.manifest = check_manifest(raw, ABI4 if v == 4 else loader_abi, None)     # the magic fixes the major
         ovs = []
         for op in overlays:
-            f, blobs, base, total, oraw, _ = _open_signed(op, None, OVERLAY_DOMAIN, trusted)
+            f, blobs, base, total, oraw, _, ov = _open_signed(op, None, OVERLAY_DOMAIN, trusted)
+            need(ov == v, f"{op}: a pack {ov} overlay of a pack {v} file (refused)")
             st.add(f, blobs, base, total)
             st.overlays.append(hashlib.sha256(oraw).hexdigest())
             try:
@@ -403,6 +455,9 @@ def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, 
         if ovs:
             st.manifest = merge(st.manifest, raw, ovs)
             raw = (json.dumps(st.manifest, indent=1, sort_keys=True) + "\n").encode()
+        if v == 4:
+            pins = st.manifest.get("blob_raw", {})
+            need(all(h in pins for h in blob_hashes(st.manifest["buckets"])), "pack 4: a blob's raw size is not pinned in the signed manifest")
         need(arch is None or arch in arches(st.manifest), f"pack arches {sorted(arches(st.manifest))} lack {arch}")
         with _create(os.path.join(st.dir, "manifest.json")) as o:
             o.write(raw)
@@ -417,9 +472,9 @@ def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, 
         raise PackError(f"{pack}: {e}") if isinstance(e, PackError) else e
 
 
-def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None):
+def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, store=None):
     """Stage everything, check it, discard the copy; returns the manifest."""
-    st = stage(pack, sig, loader_abi, trusted, arch)
+    st = stage(pack, sig, loader_abi, trusted, arch, store=store)
     st.close()
     return st.manifest
 
@@ -724,6 +779,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
     ap.add_argument("cmd", choices=("verify", "show", "need"))
     ap.add_argument("file")
     ap.add_argument("--sig")
+    ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
     ap.add_argument("--overlay", action="append", default=[], help="a signed overlay merged into the pack (repeatable)")
     ap.add_argument("--arch")
     ap.add_argument("--partial", action="store_true")
@@ -750,17 +806,18 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
     try:
         if o.cmd == "need":
             with open(o.file, "rb") as f:
-                blobs, base, raw, end = read_container(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
-            m = check_manifest(raw, ABI, o.arch)
+                v, blobs, base, raw, end = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
+            m = check_manifest(raw, ABI4 if v == 4 else ABI, o.arch)
             need(o.model_dir, "need takes --model-dir")
             bs = files_of(o.model_dir)
             hs = blob_hashes(bs)
-            need(all(h in blobs for h in hs), "a needed blob is missing from the container header")
+            need(v == 4 or all(h in blobs for h in hs), "a needed blob is missing from the container header")
             print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), prefix=dict(off=0, len=end),
                                   ranges=[dict(off=base + blob_entry(blobs[h], h)[0], len=blob_entry(blobs[h], h)[1], sha256=h,
-                                               **({"codec": "xz"} if blob_entry(blobs[h], h)[2] else {})) for h in hs])))
+                                               **({"codec": "xz"} if blob_entry(blobs[h], h)[2] else {})) for h in hs if h in blobs],
+                                  **({"store": [h for h in hs if h not in blobs]} if v == 4 else {}))))   # pack 4: fetch these by hash
             return
-        st = stage(o.file, o.sig, arch=o.arch, defer=True, overlays=o.overlay)
+        st = stage(o.file, o.sig, arch=o.arch, defer=True, overlays=o.overlay, store=o.store)
     except PackError as e:
         sys.exit(f"pack: REFUSED: {e}")
     try:
