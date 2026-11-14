@@ -26,7 +26,7 @@ arches (a new GPU arch or quant format) without touching or re-signing the base.
 """
 import atexit, hashlib, json, lzma, os, re, shutil, stat, subprocess, sys, tempfile
 
-from . import sign, structure
+from . import numerics_kw as NK, sign, structure
 
 ABI = "3.0.0"                       # pack ABI semver: additive within a major
 MAGIC = b"GCPACK3\n"
@@ -497,14 +497,15 @@ def feature(b, k):
     return b[k]
 
 
-def wanted(numerics="deterministic", act="auto", kv="auto", single=False):
+def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     """The bucket predicate of a request: numerics exact | deterministic (batch_invariant; exact also serves a handle of one
     sequence, which has no batch to depend on) | fast (tolerance, else deterministic: no tolerance bucket exists yet), act auto
     (a16 where a bucket has it: the pack's contract order) | a8 | a16 (exact buckets carry no act), kv auto (f16) | f16 | fp8."""
+    numerics, act = NK.resolve(numerics, act)
     det = {"exact": {"exact"}, "deterministic": {"batch_invariant"} | ({"exact"} if single else set()),
            "fast": {"tolerance", "batch_invariant"} | ({"exact"} if single else set())}
     if numerics not in det or act not in ("auto", "a8", "a16") or kv not in ("auto", "f16", "fp8"):
-        raise PackError(f"numerics {numerics!r} act {act!r} kv {kv!r}: numerics exact | deterministic | fast, act auto | a8 | "
+        raise PackError(f"numerics {numerics!r} act {act!r} kv {kv!r}: numerics reference | invariant | invariant-hp | tolerance, act auto | a8 | "
                         "a16, kv auto | f16 | fp8")
     return lambda b: (feature(b, "determinism") in det[numerics] and (act == "auto" or feature(b, "act") in (None, act))
                       and feature(b, "kv") == ("f16" if kv == "auto" else kv))
@@ -681,7 +682,7 @@ def check_weights(m, target_files, drafter_files=None):
             raise PackError(f"weights {fs}: not the structure variant {vid} was compiled for: {e}")
 
 
-def branch(m, model_files, *, sku=None, numerics="deterministic", act="auto", kv="auto"):
+def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="auto"):
     """The buckets of the branch a model's files choose: its target variant, for sku (the pack's only SKU if none), satisfying the
     numerics request. Returns (variant id, [buckets])."""
     v = pick_variant(m, model_files)
@@ -728,7 +729,7 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
     ap.add_argument("--partial", action="store_true")
     ap.add_argument("--model-dir")
     ap.add_argument("--sku")
-    ap.add_argument("--numerics", default="deterministic")
+    ap.add_argument("--numerics", default="invariant", choices=NK.CHOICES)
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
     o = ap.parse_args(a)

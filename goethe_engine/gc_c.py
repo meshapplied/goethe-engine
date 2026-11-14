@@ -83,7 +83,7 @@ def arr(ctype, xs):
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="deterministic", act="auto", kv="auto"):
+                 numerics="invariant", act="auto", kv="auto"):
         """state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True)

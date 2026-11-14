@@ -553,3 +553,17 @@ def test_b1_takes_the_batch_ladder_when_only_it_has_a_prefill_bucket():
     assert P.with_prefill(m, s, sku="s")["id"] == "bi2"
     m["buckets"].pop()                                          # no prefill bucket anywhere: the stream bucket stays
     assert P.with_prefill(m, s, sku="s")["id"] == "e1"
+
+
+def test_numerics_keywords_resolve_and_old_names_warn(capsys):
+    """keywords map to the existing numerics axis; old names alias with a warning; the default is not the reference tier."""
+    from goethe_engine import numerics_kw as NK
+    for kw, want in (("invariant", "deterministic"), ("invariant-hp", "deterministic"), ("reference", "exact"), ("tolerance", "fast")):
+        assert NK.resolve(kw, warn=False)[0] == want
+    assert NK.resolve("invariant-hp") == ("deterministic", "a16") and NK.resolve("invariant-hp", "a8") == ("deterministic", "a8")
+    assert NK.resolve("exact")[0] == "exact" and "deprecated" in capsys.readouterr().err
+    assert NK.resolve(NK.DEFAULT, warn=False)[0] == "deterministic"            # the default is never the reference (E0) tier
+    assert [k for k, v in NK.KEYWORDS.items() if v == "exact"] == ["reference"]
+    with pytest.raises(ValueError):
+        NK.resolve("bogus")
+    assert callable(P.wanted("reference")) and callable(P.wanted("invariant-hp")) and callable(P.wanted("exact"))

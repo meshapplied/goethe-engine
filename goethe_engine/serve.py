@@ -14,6 +14,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import numerics_kw as NK
 from .tokenizer import ByteTokenizer, HFTokenizer, TextStream
 
 MAX_BODY = 8 << 20
@@ -342,9 +343,9 @@ def parser():
     ap.add_argument("--pack", metavar="FILE", help="signed kernel pack (.gcpack, signature in FILE.sig)")
     ap.add_argument("--weights", nargs="+", metavar="PATH", help="target weights, then a drafter's for a speculative pair")
     ap.add_argument("--tokenizer", metavar="DIR", help="Hugging Face tokenizer dir (default: the weights' dir)")
-    ap.add_argument("--numerics", choices=("exact", "deterministic", "fast"), default="deterministic",
-                    help="exact: bitwise llama.cpp, one stream; deterministic: independent of the batch; fast: tolerance "
-                         "(deterministic until a tolerance bucket exists)")
+    ap.add_argument("--numerics", choices=NK.CHOICES, default="invariant",
+                    help="reference: bitwise llama.cpp, one stream; invariant: independent of the batch (invariant-hp: 16-bit "
+                         "activations); tolerance: deterministic until a tolerance bucket exists; old names exact | deterministic warn")
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
     ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
