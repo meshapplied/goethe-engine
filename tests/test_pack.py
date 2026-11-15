@@ -563,6 +563,22 @@ def test_b1_takes_the_batch_ladder_when_only_it_has_a_prefill_bucket():
     assert P.with_prefill(m, s, sku="s")["id"] == "e1"
 
 
+def test_b1_non_batch_stream_of_the_prefill_contract_takes_the_batch_ladder():
+    """a 1 column non-batch stream bucket of the same contract as the prefill chain has no chain of its own (the runtime refuses a
+    chain beside a non-batch bucket): B 1 opens the 2 column batch bucket and its chain; without a batch bucket, no chain."""
+    def bk(i, n, batch, **kw):
+        return dict(id=i, role="target", sku="s", contract="BIH", ncol=n, batch=batch, maxctx=8, **kw)
+    m = dict(contracts=["BIH"], runtime=dict(kind="gc-c", version=1),
+             buckets=[bk("h1", 1, False), bk("h2", 2, True), bk("h128v", 128, False, prefill=128)])
+    s = P.single_stream(m, sku="s")
+    assert s["id"] == "h1" and P.prefill(m, s) is None
+    b = P.with_prefill(m, s, sku="s")
+    assert b["id"] == "h2" and P.prefill(m, b)["id"] == "h128v"
+    assert [x["id"] for x in P.ladder(m, b)] == ["h2"]
+    m["buckets"].pop(1)                                         # no batch bucket: the stream bucket opens alone, no chain
+    assert P.with_prefill(m, s, sku="s")["id"] == "h1" and P.prefill(m, s) is None
+
+
 def test_numerics_keywords_resolve_and_old_names_warn(capsys):
     """keywords map to the existing numerics axis; old names alias with a warning; the default is not the reference tier."""
     from goethe_engine import numerics_kw as NK
