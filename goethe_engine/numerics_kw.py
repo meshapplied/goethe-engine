@@ -3,7 +3,7 @@
 invariant     batch-invariant (BI), the shipped default                    -> exact | deterministic | fast axis: deterministic
 invariant-hp  batch-invariant with 16-bit activations (BIH)                -> deterministic, act a16 unless one is asked
 reference     bitwise llama.cpp validation tier (E0), only on request      -> exact
-tolerance     the later tolerance contract (fast: deterministic until a tolerance bucket exists)
+tolerance     KL-bounded (TOL buckets, compiler/numerics/tolerance.py) -> fast: tolerance buckets first, else deterministic
 Old spellings exact | deterministic print a deprecation warning."""
 import sys
 
