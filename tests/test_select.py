@@ -31,7 +31,7 @@ def test_same_arch_unknown_sku_takes_the_fitting_variant():
 
 
 def test_price_ranks_the_fitting_variants():
-    price = lambda s, r: {"a170": 9.0, "a84": 5.0}[s]
+    price = lambda s, d: {"a170": 9.0, "a84": 5.0}[s]
     assert P.pick_sku(man(), dev("12.0", 188, price=price)) == "a84"
 
 

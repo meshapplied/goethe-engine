@@ -520,7 +520,7 @@ def fits(dev, req, m):
 
 def pick_sku(m, dev, sku=None):
     """The SKU (variant) of the pack to run on dev: among the SKUs whose requires fit dev (fits), the exact (name, SMs) one, else the
-    least dev["price"](sku, requires) (probe-lite lintile price, when the device record carries one), then the most SMs and smem
+    least dev["price"](sku, dev) (probe-lite lintile price, when the device record carries one), then the most SMs and smem
     (fewest idle). No fit: refused with every SKU's reason and what to do instead."""
     req = {}
     for b in m["buckets"]:
@@ -540,7 +540,7 @@ def pick_sku(m, dev, sku=None):
     if exact:
         return exact[0]
     price = dev.get("price")
-    return min(ok, key=lambda s: (price(s, req[s]) if price else 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
+    return min(ok, key=lambda s: (price(s, dev) if price else 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
 
 
 def device(idx=None):
