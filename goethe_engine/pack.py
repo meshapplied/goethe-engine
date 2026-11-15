@@ -479,29 +479,84 @@ def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, store=None):
     return st.manifest
 
 
+def arch_runs(arch, cc):
+    """Why code of target arch cannot run on compute capability cc ("" if it can), by the CUDA compatibility rules (CUDA C
+    Programming Guide, Compute Capabilities: binary compatibility, architecture- and family-specific features): sm_XYa SASS only
+    on cc X.Y; sm_XYf and sm_XY SASS on cc X.Z, Z >= Y; compute_XY PTX (driver JIT) on any cc >= X.Y."""
+    g = re.fullmatch(r"(sm|compute)_(\d+)(\d)([af]?)", arch or "")
+    if not g:
+        return f"bucket arch {arch!r} is not sm_XY[a|f] or compute_XY"
+    want, have = (int(g[2]), int(g[3])), tuple(int(x) for x in cc.split("."))
+    if g[1] == "compute":
+        return "" if have >= want else f"PTX {arch} needs cc >= {want[0]}.{want[1]}"
+    if g[4] == "a":
+        return "" if have == want else f"{arch} SASS runs only on cc {want[0]}.{want[1]} (arch-specific targets are not forward compatible)"
+    return "" if have[0] == want[0] and have[1] >= want[1] else f"{arch} SASS runs only on cc {want[0]}.Z with Z >= {want[1]}"
+
+
 def cuda_arch_ok(dev, req, m):
-    """Why a cuda device cannot run a bucket that requires req in manifest m ("" if it can): its compute capability, the bucket's sm_XX
-    arch of that capability, the driver's CUDA version against the one the libraries were built with."""
-    if dev["cc"] != req["cc"]:
-        return f"device cc {dev['cc']} != pack cc {req['cc']}"
-    if not req["arch"].startswith("sm_" + dev["cc"].replace(".", "")):
-        return f"device cc {dev['cc']} vs bucket arch {req['arch']}"
+    """Why a cuda device cannot run a bucket that requires req in manifest m ("" if it can): the bucket's arch on the device's compute
+    capability (arch_runs), the driver's CUDA version against the one the libraries were built with."""
+    why = arch_runs(req["arch"], dev["cc"])
+    if why:
+        return f"device cc {dev['cc']}: {why}"
     if not (dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"])):
         return f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}"
     return ""
 
 
+def fits(dev, req, m):
+    """Why device dev cannot run a bucket that requires req ("" if it can): the platform's arch rule, then the plan's structure: its
+    persistent grid of req.sms CTAs must be co-resident (device SMs >= req.sms) and its shared memory per block must fit."""
+    why = dev["arch_ok"](dev, req, m)
+    if why:
+        return why
+    if req["sms"] > dev["sms"]:
+        return f"the plan's grid needs {req['sms']} SMs co-resident, the device has {dev['sms']}"
+    if dev.get("smem_block") is not None and req.get("smem_block", 0) > dev["smem_block"]:
+        return f"the plan needs {req['smem_block']} B shared memory per block, the device allows {dev['smem_block']}"
+    return ""
+
+
+def pick_sku(m, dev, sku=None):
+    """The SKU (variant) of the pack to run on dev: among the SKUs whose requires fit dev (fits), the exact (name, SMs) one, else the
+    least dev["price"](sku, requires) (probe-lite lintile price, when the device record carries one), then the most SMs and smem
+    (fewest idle). No fit: refused with every SKU's reason and what to do instead."""
+    req = {}
+    for b in m["buckets"]:
+        req.setdefault(b["sku"], b["requires"])
+    why = {s: fits(dev, r, m) for s, r in req.items()}
+    if sku is not None:
+        need(sku in req, f"--sku {sku} is not in this pack ({sorted(req)})")
+        need(not why[sku], f"--sku {sku} does not run on device {dev['name']}: {why[sku]}")
+        return sku
+    ok = [s for s in req if not why[s]]
+    arch = "sm_" + dev.get("cc", "?").replace(".", "")
+    need(ok, f"device {dev['name']} cc {dev.get('cc')} ({dev['sms']} SMs, smem per block {dev.get('smem_block')}) runs no variant "
+         f"of this pack: " + "; ".join(f"{s} ({req[s]['arch']}, {req[s]['sms']} SMs): {why[s]}" for s in sorted(req)) +
+         f". Fallback: serve this model with llama.cpp; or have a variant built for {arch}: on a machine with nvcc for {arch}, "
+         f"`gc pack KEY --hw RECORD --runtime gc-c --overlay PACK` (RECORD: calib/hwcal.sh on this device) and pass --overlay")
+    exact = sorted(s for s in ok if req[s]["name"] == dev["name"] and req[s]["sms"] == dev["sms"])
+    if exact:
+        return exact[0]
+    price = dev.get("price")
+    return min(ok, key=lambda s: (price(s, req[s]) if price else 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
+
+
 def device(idx=None):
-    """The visible cuda GPU: {platform, name, cc, sms, uuid, cuda (driver's CUDA version), arch_ok} from nvidia-smi and the CUDA runtime
-    (the cuda platform plugin's device query, registry.PLATFORMS)."""
+    """The visible cuda GPU: {platform, name, cc, sms, smem_block (opt-in shared memory per block), uuid, cuda (driver's CUDA version),
+    arch_ok} from nvidia-smi and the driver API (the cuda platform plugin's device query, registry.PLATFORMS)."""
+    import ctypes as C
     i = idx if idx is not None else os.environ.get("GC_GPU", "0")
     q = subprocess.run(["nvidia-smi", f"--id={i}", "--query-gpu=name,compute_cap,uuid", "--format=csv,noheader"],
                        capture_output=True, text=True, check=True).stdout.strip().split(", ")
     hdr = subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout
     cv = re.search(r"CUDA Version:\s*([\d.]+)", hdr)
-    import torch                                    # the SM count: no nvidia-smi field has it
-    p = torch.cuda.get_device_properties(0 if os.environ.get("CUDA_VISIBLE_DEVICES") else int(i))
-    return dict(platform="cuda", name=q[0], cc=q[1], uuid=q[2], sms=p.multi_processor_count, cuda=cv[1] if cv else None,
+    cu, d, v = C.CDLL("libcuda.so.1"), C.c_int(), C.c_int()
+    need(cu.cuInit(0) == 0 and cu.cuDeviceGet(C.byref(d), 0 if os.environ.get("CUDA_VISIBLE_DEVICES") else int(i)) == 0,
+         f"driver API: no CUDA device {i}")
+    attr = lambda a: v.value if cu.cuDeviceGetAttribute(C.byref(v), a, d) == 0 else None   # CUdevice_attribute values (cuda.h)
+    return dict(platform="cuda", name=q[0], cc=q[1], uuid=q[2], sms=attr(16), smem_block=attr(97), cuda=cv[1] if cv else None,
                 arch_ok=cuda_arch_ok)
 
 
@@ -512,18 +567,11 @@ def ver(s):
 def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False, want=None, kind=None):
     """The bucket for (sku or device, contract, B columns, ctx positions, role): the smallest ncol >= B, then the
     smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch: dev is a platform plugin's
-    device record (name, sms, arch_ok(dev, requires, m) -> reason). kind "encode": only encode buckets; otherwise never one (an
+    device record (name, sms, smem_block, arch_ok(dev, requires, m) -> reason, optional price); its SKU is pick_sku's. kind "encode": only encode buckets; otherwise never one (an
     encode graph serves no decode, prefill or verify)."""
     if dev is not None:
         need(callable(dev.get("arch_ok")), f"device record {dev.get('name')!r} has no arch_ok: not a platform plugin's device (refused)")
-        hit = [b for b in m["buckets"] if b["requires"]["name"] == dev["name"] and b["requires"]["sms"] == dev["sms"]]
-        need(hit, f"device {dev['name']} ({dev['sms']} SMs) matches no bucket's SKU in this pack "
-             f"({sorted({b['sku'] for b in m['buckets']})})")
-        s = {b["sku"] for b in hit}
-        need(sku is None or sku in s, f"--sku {sku} is not the device's SKU {sorted(s)}")
-        sku = sku or s.pop()
-        why = dev["arch_ok"](dev, hit[0]["requires"], m)
-        need(not why, why)
+        sku = pick_sku(m, dev, sku)
     need(sku is not None, "no SKU: pass a device or a SKU")
     ok = want or (lambda b: contract is not None or b.get("determinism") != "tolerance")   # tolerance buckets only when asked for
     # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request (a tolerance
