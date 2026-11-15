@@ -523,7 +523,13 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     need(cand, f"no {role} bucket for sku {sku}, contract {c}, B {B}, ctx {ctx} (skipped, unknown to this loader: "
          f"{skip or 'none'}; have "
          f"{sorted((b['sku'], b['contract'], b['ncol'], b['maxctx']) for b in m['buckets'] if b['role'] == role)})")
-    return min(cand, key=lambda b: (b["ncol"], b["maxctx"], b["id"]))
+    top = max(rev(b) for b in cand)       # the newest revision of the contract present
+    return min((b for b in cand if rev(b) == top), key=lambda b: (b["ncol"], b["maxctx"], b["id"]))
+
+
+def rev(b):
+    """A bucket's contract revision (manifest contract_rev; absent = 1, packs before revisions): rows of two revisions differ."""
+    return b.get("contract_rev", 1)
 
 
 def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
@@ -590,6 +596,9 @@ def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):
     if dev is not None:
         sku = select(m, dev=dev, contract=contract, verify=True)["sku"]
     by = {b["id"]: b for b in m["buckets"]}
+    for s in m.get("spec", []):
+        need(rev(by[s["target"]]) == rev(by[s["drafter"]]) or by[s["target"]]["contract"] != by[s["drafter"]]["contract"],
+             f"speculative pair {s['target']} / {s['drafter']}: contract revisions {rev(by[s['target']])} / {rev(by[s['drafter']])}")
     ps = [(by[s["target"]], by[s["drafter"]], s["policy"]) for s in m.get("spec", [])
           if s["policy"].get("kind") in POLICIES and not usable(m, by[s["target"]]) and not usable(m, by[s["drafter"]])
           and (sku is None or by[s["target"]]["sku"] == sku) and (contract is None or by[s["target"]]["contract"]
@@ -601,11 +610,12 @@ def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):
 
 def ladder(m, b):
     """The nominal buckets a process serving up to b's columns loads beside b (same SKU, contract, role, maxctx; ncol
-    <= b's), smallest first (a shrinking batch steps down through them). Only batch buckets join a ladder: a one-sequence stream bucket
-    (kind stream, a linear program the runtime opens alone) is b's ladder only when it is b."""
+    <= b's, same contract revision), smallest first (a shrinking batch steps down through them). Only batch buckets join a ladder: a
+    one-sequence stream bucket (kind stream, a linear program the runtime opens alone) is b's ladder only when it is b."""
     return sorted((x for x in m["buckets"] if not x.get("variant_of") and x["ncol"] <= b["ncol"]
                    and (x["batch"] or x["id"] == b["id"])
-                   and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["ncol"])
+                   and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)),
+                  key=lambda x: x["ncol"])
 
 
 MIB = 1 << 20
@@ -677,9 +687,10 @@ def open_ctx(pick, m, ctx, fits):
 
 def prefill(m, b):
     """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
-    sequence a launch beside b's ladder) with b's SKU, contract, role and maxctx, or None."""
+    sequence a launch beside b's ladder) with b's SKU, contract, revision, role and maxctx, or None."""
     return max((x for x in m["buckets"] if x.get("prefill") and not x["batch"]
-                and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["prefill"], default=None)
+                and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)),
+               key=lambda x: x["prefill"], default=None)
 
 
 def with_prefill(m, b, *, sku=None, dev=None, contract=None, ctx=None, want=None):
