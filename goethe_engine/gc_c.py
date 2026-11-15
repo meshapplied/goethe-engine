@@ -83,17 +83,17 @@ def arr(ctype, xs):
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="invariant", act="auto", kv="auto", store=None):
-        """store: the pack 4 blob store (P.open_store). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
+                 numerics="invariant", act="auto", kv="auto", store=None, plen=None):
+        """store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv))
+            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None):
         m0 = self.stage.manifest
         dev = None if sku else P.device(None if device < 0 else device)   # the device the handle opens on, not always GPU 0
         self.spec = drafter_weights is not None
@@ -119,7 +119,7 @@ class GcBackend:
                     P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=cx, want=want)
                 if B == 1:
                     b = P.with_prefill(m, b, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)
-                return b, P.ladder(m, b), P.prefill(m, b)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
+                return b, P.ladder(m, b), P.prefill(m, b, plen)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
             free = P.device_free(device)
             b, lad, pf = P.open_ctx(pick, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, what=bl[0]["id"]))
             ids, pol_s, pol = [x["id"] for x in lad] + ([pf["id"]] if pf else []), None, None

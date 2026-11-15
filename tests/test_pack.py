@@ -374,6 +374,23 @@ def test_prefill_bucket_is_beside_the_ladder_never_in_it(tmp_path, key, mocklib)
     assert P.prefill(m, dict(b, maxctx=512)) is None
 
 
+def test_prefill_bucket_is_the_cheapest_total_for_the_prompt_length():
+    """Several priced prefill buckets: the least sum of chunk prices (step_us_kv by KV extent over
+    step_us) for the prompt length the handle opens for; one unpriced candidate or no plen: the widest (the one-bucket behavior)."""
+    base = dict(sku="s", contract="c", role="target", maxctx=8192, batch=False, ncol=1)
+    w64 = dict(base, id="w64", prefill=64, step_us=2500.0)                                 # 25.6k tok/s
+    w512 = dict(base, id="w512", prefill=512, step_us=32600.0, step_us_kv=[[1024, 8150.0]])  # 15.7k at L128, 63k at L1k
+    b = dict(base, id="bi8", batch=True, ncol=8)
+    m = dict(buckets=[b, w64, w512])
+    assert P.prefill(m, b, 128)["id"] == "w64"
+    assert P.prefill(m, b, 1000)["id"] == "w512"
+    assert P.prefill(m, b)["id"] == "w512"
+    assert P.prefill_us(w512, 1024) == 2 * 8150.0 and P.prefill_us(w512, 1536) == 2 * 8150.0 + 32600.0
+    m["buckets"][1] = {k: v for k, v in w64.items() if k != "step_us"}
+    assert P.prefill(m, b, 128)["id"] == "w512"
+    assert P.prefill(m, dict(b, batch=False), 128) is None
+
+
 def test_single_stream_bucket_is_the_cheapest_predicted_step_of_any_contract():
     """B 1 takes the bucket of least step_us among the contracts' B 1 buckets (names opaque); without prices a 1 column non-batch
     bucket; a batch bucket is never one by shape alone."""

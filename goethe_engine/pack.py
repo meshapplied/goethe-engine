@@ -758,15 +758,35 @@ def open_ctx(pick, m, ctx, fits):
     raise err or PackError("no target bucket")
 
 
-def prefill(m, b):
-    """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
-    sequence a launch beside b's ladder) with b's SKU, contract, revision, role and maxctx, or None; None for a non-batch b (a stream
-    bucket opens alone: the runtime takes a chain only beside batch buckets)."""
+def prefill_us(x, L, pos=0):
+    """S2 price in us of prefilling L tokens from pos with prefill bucket x: per chunk of W columns the step_us_kv entry of the
+    smallest extent >= the chunk's KV extent (pos + rows through it), else step_us; None when unpriced."""
+    W, kv = x["prefill"], sorted(x.get("step_us_kv") or [])
+    tot = 0.0
+    for c in range(-(-L // W)):
+        e = pos + min((c + 1) * W, L)
+        us = next((u for r, u in kv if e <= r), x.get("step_us"))
+        if us is None:
+            return None
+        tot += us
+    return tot
+
+
+def prefill(m, b, plen=None):
+    """The prefill bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one sequence a launch
+    beside b's ladder; form chain or seq) with b's SKU, contract, revision, role and maxctx, or None; None for a non-batch b (a stream
+    bucket opens alone: the runtime takes a prefill bucket only beside batch buckets). Among several: the least total price over the
+    chunks of a plen-token prompt (the length the handle is opened for: gc_open takes one prefill bucket); the widest when plen is None
+    or any candidate is unpriced."""
     if not b["batch"]:
         return None
-    return max((x for x in m["buckets"] if x.get("prefill") and not x["batch"]
-                and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)),
-               key=lambda x: x["prefill"], default=None)
+    cs = [x for x in m["buckets"] if x.get("prefill") and not x["batch"]
+          and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)]
+    if plen is not None and cs:
+        us = {x["id"]: prefill_us(x, min(plen, b["maxctx"])) for x in cs}
+        if None not in us.values():
+            return min(cs, key=lambda x: (us[x["id"]], -x["prefill"], x["id"]))
+    return max(cs, key=lambda x: x["prefill"], default=None)
 
 
 def with_prefill(m, b, *, sku=None, dev=None, contract=None, ctx=None, want=None):
