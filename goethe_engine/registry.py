@@ -1,18 +1,23 @@
 """Plugins: the platform backends a pack runs on, the model types the engine serves, and the device mesh a backend opens on.
 
 platform  a device family and its runtime: cuda (gc-c, abi/gc.h) now; rocm, vulkan, metal are registered stubs that refuse
-model type  how a model is served: decoder (Engine: prefill, decode, speculative rounds) now; encoder-decoder (speech, whisper-style
-          and nemotron speech) and embedding (pooling head, no decode loop) are registered stubs that refuse
+model type  how a model is served: decoder (Engine: prefill, decode, speculative rounds), embedding (EmbedRunner: one pooled encoder
+          pass per sequence, no decode loop); encoder-decoder (speech, whisper-style and nemotron speech) is a registered stub that refuses
 mesh      devices and parallel axes (dp tp pp ep sp); the API takes a mesh everywhere, one device is the only size served now
 
 A new platform, model type or parallel axis is one entry here plus its module; nothing else names them."""
+import json
 import math
+import os
 from dataclasses import dataclass, field
 
 from . import pack as P
 
 
-def _gc_c(pack, weights, *, device, **kw):
+def _gc_c(pack, weights, *, device, model_type="decoder", **kw):
+    if model_type == "embedding":
+        from .embed import GcEmbed
+        return GcEmbed(pack, weights, device=device, **kw)
     from .gc_c import GcBackend
     return GcBackend(pack, weights, device=device, **kw)
 
@@ -22,8 +27,13 @@ def _decoder(backend, cfg, **kw):
     return Engine(backend, cfg, **kw)
 
 
+def _embedding(backend, cfg, **kw):
+    from .embed import EmbedRunner
+    return EmbedRunner(backend, cfg)
+
+
 PLATFORMS = {"cuda": _gc_c, "rocm": None, "vulkan": None, "metal": None}     # platform -> backend factory (None: planned)
-MODEL_TYPES = {"decoder": _decoder, "encoder-decoder": None, "embedding": None}  # model.type -> runner factory (None: planned)
+MODEL_TYPES = {"decoder": _decoder, "encoder-decoder": None, "embedding": _embedding}  # model.type -> runner factory (None: planned)
 
 
 @dataclass(frozen=True)
@@ -56,8 +66,22 @@ def _planned(kind, name, have):
                                f"registered so a plugin can be added in goethe_engine/registry.py")
 
 
-def open_backend(pack, weights, *, mesh=None, platform=P.PLATFORM, **kw):
-    """The backend of pack on mesh (default one device) for platform: the one entry serve and callers use."""
+def pack_type(pack):
+    """model.type of a pack file's manifest (unverified: it only picks the backend class, which verifies the pack and refuses
+    what is not one; an unreadable file reads as the default type so that refusal is the backend's)."""
+    path = pack[0] if isinstance(pack, (list, tuple)) else pack
+    try:
+        with open(path, "rb") as f:
+            raw = P.read_container(f, os.path.getsize(path))[2]
+        m = json.loads(raw)
+    except (OSError, ValueError, P.PackError):
+        return P.MODEL_TYPE
+    return model_type(m)
+
+
+def open_backend(pack, weights, *, mesh=None, platform=P.PLATFORM, model_type=None, **kw):
+    """The backend of pack on mesh (default one device) for platform and model type (default: the manifest's): the one entry serve and
+    callers use."""
     mesh = mesh or Mesh.single()
     if platform not in PLATFORMS:
         raise ValueError(f"platform {platform!r}: one of {sorted(PLATFORMS)}")
@@ -66,7 +90,10 @@ def open_backend(pack, weights, *, mesh=None, platform=P.PLATFORM, **kw):
     if mesh.size > 1:
         raise NotImplementedError(f"mesh {mesh.axes} over {mesh.size} devices: multi-device parallelism ({' '.join(P.MESH_AXES)}) "
                                   "is not implemented yet; open on Mesh.single(device)")
-    return PLATFORMS[platform](pack, weights, device=mesh.devices[0], **kw)
+    t = model_type or pack_type(pack)
+    if MODEL_TYPES.get(t) is None:
+        raise _planned("model type", t, [k for k, v in MODEL_TYPES.items() if v])
+    return PLATFORMS[platform](pack, weights, device=mesh.devices[0], model_type=t, **kw)
 
 
 def model_type(m):
@@ -80,7 +107,7 @@ def model_type(m):
 def runner(backend, cfg, **kw):
     """The serving loop of the backend's model type (a backend without a manifest, the reference model, is a decoder)."""
     m = getattr(backend, "m", None)          # GcBackend: its manifest; the reference backend: a model object
-    t = model_type(m if isinstance(m, dict) else None)
+    t = model_type(m if isinstance(m, dict) else None) if not hasattr(backend, "embed") else "embedding"
     if MODEL_TYPES[t] is None:
         raise _planned("model type", t, [k for k, v in MODEL_TYPES.items() if v])
     return MODEL_TYPES[t](backend, cfg, **kw)

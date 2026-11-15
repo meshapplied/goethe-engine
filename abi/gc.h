@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define GC_ABI_MAJOR 1
-#define GC_ABI_MINOR 1
+#define GC_ABI_MINOR 2
 #define GC_ABI_VERSION ((GC_ABI_MAJOR << 16) | GC_ABI_MINOR)
 
 #if defined(__GNUC__)
@@ -55,7 +55,7 @@ enum {
 /* gc_open_params.flags */
 enum {
   GC_OPEN_SPEC = 1u << 0,      /* buckets = {target, drafter}: a speculative pair, one linear stream */
-  GC_OPEN_NO_CHECK = 1u << 1   /* skip the weight file sha256 check (the manifest hash is still checked) */
+  GC_OPEN_NO_CHECK = 1u << 1   /* unused: weights are identified by structure by the loader, never hashed here */
 };
 
 typedef struct gc_open_params {
@@ -91,9 +91,15 @@ enum {
                                   a sequence's table is its one page */
   GC_L_DEVICE_ARGMAX = 1u << 1,/* a greedy step can return tokens without logits */
   GC_L_SPEC = 1u << 2,         /* opened as a speculative pair: a step with GC_W_SPEC runs a round */
-  GC_L_BOUNDED = 1u << 3       /* 1.1: with GC_L_PAGED, a sequence also holds bounded state (window ring, recurrent state) in a slot the
+  GC_L_BOUNDED = 1u << 3,      /* 1.1: with GC_L_PAGED, a sequence also holds bounded state (window ring, recurrent state) in a slot the
                                   library assigns at its first step and frees at gc_release: a prefix of it is not shareable by block */
+  GC_L_EMBED = 1u << 4,        /* 1.2: an embedding pack: gc_embed runs whole sequences to pooled rows; no KV; gc_step: GC_E_UNSUPPORTED */
+  GC_L_SEQ2SEQ = 1u << 5       /* 1.2: an encoder-decoder pack: gc_encode writes a sequence's cross-attention KV from float frames once,
+                                  gc_step then decodes as usual and reads it; gc_release frees both */
 };
+
+/* gc_layout.embd_pool: how a sequence's rows become its one pooled row */
+enum { GC_POOL_NONE = 0, GC_POOL_MEAN = 1, GC_POOL_CLS = 2, GC_POOL_LAST = 3 };
 
 typedef struct gc_layout {
   uint32_t size;
@@ -116,6 +122,10 @@ typedef struct gc_layout {
   uint32_t state_pages;        /* 1.1: pages beyond num_blocks (ids num_blocks .. num_blocks + state_pages - 1) that only
                                   gc_copy_blocks addresses: snapshots of a page pack's pages; 0 for a paged pack */
   uint32_t pad1;
+  uint32_t embd_dim;           /* 1.2, GC_L_EMBED: floats per pooled row */
+  uint32_t embd_pool;          /* 1.2, GC_L_EMBED: GC_POOL_* */
+  uint32_t enc_frames;         /* 1.2, GC_L_SEQ2SEQ: most frames one gc_encode takes */
+  uint32_t enc_feat;           /* 1.2, GC_L_SEQ2SEQ: floats per frame */
 } gc_layout;
 
 GC_API int gc_layout_get(gc_handle *h, gc_layout *out);
@@ -147,7 +157,8 @@ typedef struct gc_work {
 
 /* gc_step_in.flags */
 enum {
-  GC_S_HOST_LOGITS = 1u << 0   /* copy float32 logits to the caller's host buffer instead of exposing a device ptr */
+  GC_S_HOST_LOGITS = 1u << 0,  /* copy float32 logits to the caller's host buffer instead of exposing a device ptr */
+  GC_S_NORMALIZE = 1u << 1     /* 1.2, gc_embed: each row L2 normalized (sum of squares in double, as llama.cpp common_embd_normalize) */
 };
 
 typedef struct gc_step_in {
@@ -179,6 +190,22 @@ typedef struct gc_step_out {
 
 /* Runs the items as one step: decode, chunked prefill, spec verify or a spec round, by the items' shapes. */
 GC_API int gc_step(gc_handle *h, const gc_step_in *in, gc_step_out *out);
+
+typedef struct gc_embed_out {
+  uint32_t size;
+  uint32_t n_rows;             /* rows written: one per work item */
+  float *rows;                 /* host float32 [n_work, embd_dim] in work order */
+  uint64_t rows_cap;           /* capacity in floats; too small: GC_E_CAPACITY with n_rows set */
+} gc_embed_out;
+
+/* 1.2, GC_L_EMBED only: each item is one whole sequence (pos 0, n_tokens <= max_ctx, want 1, no blocks); its pooled row does not
+ * depend on the other items (batch invariance) and nothing is kept between calls. Exported only by a library that can report GC_L_EMBED. */
+GC_API int gc_embed(gc_handle *h, const gc_step_in *in, gc_embed_out *out);
+
+/* 1.2, GC_L_SEQ2SEQ only: runs the encoder once over frames (float32 [n_frames, n_feat], n_frames <= enc_frames, n_feat = enc_feat)
+ * and writes the cross-attention KV of sid; its decoder steps then read it. Again for a live sid: GC_E_STATE. Exported only by a library
+ * that can report GC_L_SEQ2SEQ. */
+GC_API int gc_encode(gc_handle *h, uint64_t sid, const float *frames, uint32_t n_frames, uint32_t n_feat);
 
 /* Tree verify commit: keeps the rows of `path` (indices into the last verify's tokens) as the sequence's rows
  * base .. base + n - 1. A chain backend accepts only the identity path. */

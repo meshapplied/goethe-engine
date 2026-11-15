@@ -51,7 +51,7 @@ HEX = re.compile(r"^[0-9a-f]{64}$")
 OVERLAY_SCHEMA = "gc-pack-overlay"
 OVERLAY_DOMAIN = b"gc-overlay-3\n"     # signed digest of an overlay = sha256(OVERLAY_DOMAIN + overlay manifest bytes)
 PLATFORM = "cuda"                       # the platform of a bucket without the field (every 3.0 pack)
-KINDS = ("decode", "stream", "prefill", "verify")
+KINDS = ("decode", "stream", "prefill", "verify", "encode")   # encode: a prefill-only graph (embedding, an encoder); never a decode bucket
 MESH_AXES = ("dp", "tp", "pp", "ep", "sp")  # data, tensor, pipeline, expert, sequence / context parallel
 MODEL_TYPE = "decoder"                  # model.type of a manifest without the field
 
@@ -495,9 +495,10 @@ def ver(s):
     return tuple(int(x) for x in s.split("."))
 
 
-def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False, want=None):
+def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False, want=None, kind=None):
     """The bucket for (sku or device, contract, B columns, ctx positions, role): the smallest ncol >= B, then the
-    smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch."""
+    smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch. kind "encode": only encode
+    buckets; otherwise never one (an encode graph serves no decode, prefill or verify)."""
     if dev is not None:
         hit = [b for b in m["buckets"] if b["requires"]["name"] == dev["name"] and b["requires"]["sms"] == dev["sms"]]
         need(hit, f"device {dev['name']} ({dev['sms']} SMs) matches no bucket's SKU in this pack "
@@ -519,6 +520,7 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     cand = [b for b in m["buckets"] if b["sku"] == sku and b["contract"] == c and b["role"] == role
             and b["id"] not in skip and ok(b)
             and not b.get("variant_of") and b["ncol"] >= B and (ctx is None or b["maxctx"] >= ctx)
+            and (axes(b)[1] == "encode") == (kind == "encode")
             and (verify or role != "target" or b["batch"] or b["ncol"] == 1)]   # a spec verify serves no batch
     need(cand, f"no {role} bucket for sku {sku}, contract {c}, B {B}, ctx {ctx} (skipped, unknown to this loader: "
          f"{skip or 'none'}; have "
@@ -601,6 +603,7 @@ def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):
              f"speculative pair {s['target']} / {s['drafter']}: contract revisions {rev(by[s['target']])} / {rev(by[s['drafter']])}")
     ps = [(by[s["target"]], by[s["drafter"]], s["policy"]) for s in m.get("spec", [])
           if s["policy"].get("kind") in POLICIES and not usable(m, by[s["target"]]) and not usable(m, by[s["drafter"]])
+          and "encode" not in (axes(by[s["target"]])[1], axes(by[s["drafter"]])[1])
           and (sku is None or by[s["target"]]["sku"] == sku) and (contract is None or by[s["target"]]["contract"]
                                                                  == contract)
           and (ctx is None or by[s["target"]]["maxctx"] >= ctx)]
@@ -613,7 +616,7 @@ def ladder(m, b):
     <= b's, same contract revision), smallest first (a shrinking batch steps down through them). Only batch buckets join a ladder: a
     one-sequence stream bucket (kind stream, a linear program the runtime opens alone) is b's ladder only when it is b."""
     return sorted((x for x in m["buckets"] if not x.get("variant_of") and x["ncol"] <= b["ncol"]
-                   and (x["batch"] or x["id"] == b["id"])
+                   and (x["batch"] or x["id"] == b["id"]) and axes(x)[1] != "encode"
                    and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)),
                   key=lambda x: x["ncol"])
 

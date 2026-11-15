@@ -12,6 +12,9 @@ class ByteTokenizer:
     def encode(self, text):
         return list(text.encode())
 
+    def embed_input(self, text):
+        return self.encode(text)
+
     def chat(self, messages):
         return self.encode("".join(f"<|{m['role']}|>{m['content']}\n" for m in messages) + "<|assistant|>")
 
@@ -45,6 +48,10 @@ class HFTokenizer:
 
     def encode(self, text):
         return self.t.encode(text, add_special_tokens=False)
+
+    def embed_input(self, text):
+        """An embedding model's input: the text with the tokenizer's special tokens (cls / sep, bos / eos) as the model was trained."""
+        return self.t.encode(text, add_special_tokens=True)
 
     def chat(self, messages):
         if not getattr(self.t, "chat_template", None):

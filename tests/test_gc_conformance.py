@@ -192,7 +192,7 @@ def test_abi_1_0_struct_sizes_still_load(make, tmp_path, key, mocklib):
     import ctypes as C
     from goethe_engine import gc_c
     be = make()
-    assert be.L.gc_abi_version() == (1 << 16 | 1) and be.state_pages == 0
+    assert be.L.gc_abi_version() == (1 << 16 | 2) and be.state_pages == 0
 
     class Open10(C.Structure):
         _fields_ = gc_c.OpenParams._fields_[:-1]

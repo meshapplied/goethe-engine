@@ -1,9 +1,11 @@
 """goethe-engine serve: the OpenAI-compatible upstream goethed proxies to (stdlib http.server, one engine thread).
 
-Routes: POST /v1/chat/completions, POST /v1/completions (JSON or SSE), GET /v1/models, GET /health.
+Routes: POST /v1/chat/completions, POST /v1/completions (JSON or SSE) for a decoder; POST /v1/embeddings for an embedding model;
+GET /v1/models, GET /health.
 Requests from many handler threads join one Engine; the engine thread steps it (continuous batching) and fans the
 token deltas out to per-request queues. Localhost by default."""
 import argparse
+import base64
 import hmac
 import json
 import os
@@ -14,7 +16,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import numerics_kw as NK
+from . import numerics_kw as NK, pack as P_
 from .tokenizer import ByteTokenizer, HFTokenizer, TextStream
 
 MAX_BODY = 8 << 20
@@ -54,6 +56,7 @@ class Choice:
 class Server:
     def __init__(self, engine, tok, name, ctx, api_key=None):
         self.engine, self.tok, self.name, self.ctx, self.key = engine, tok, name, ctx, api_key
+        self.embedding = hasattr(engine, "submit") and hasattr(engine, "embed")
         self.pending, self.wake, self.stop, self.dead = {}, threading.Event(), False, None
         self.created = int(time.time())
         self.thread = threading.Thread(target=self._loop, daemon=True, name="engine")
@@ -61,7 +64,7 @@ class Server:
     def _loop(self):
         try:
             while not self.stop:
-                if not self.engine.has_work():
+                if self.embedding or not self.engine.has_work():   # an embedding runner runs on its own thread
                     self.wake.wait(0.05)
                     self.wake.clear()
                     continue
@@ -175,8 +178,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._authed():
                 raise ApiError(401, "invalid api key", "authentication_error")
-            if path not in ("/v1/chat/completions", "/v1/completions"):
+            if path not in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
                 raise ApiError(404, f"no route {path}", "not_found_error")
+            if (path == "/v1/embeddings") != self.srv.embedding:
+                raise ApiError(400, f"{path}: this model is {'an embedding model (/v1/embeddings)' if self.srv.embedding else 'a decoder'}")
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
                 raise ApiError(413, "body too large")
@@ -188,11 +193,37 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(400, "body must be an object")
             if self.srv.dead:
                 raise ApiError(503, f"engine stopped: {self.srv.dead}", "server_error")
+            if self.srv.embedding:
+                return self._embeddings(body)
             self._complete(body, path.endswith("chat/completions"))
         except ApiError as e:
             self._error(e)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    # --- embeddings
+    def _embeddings(self, body):
+        s, inp = self.srv, body.get("input")
+        if body.get("encoding_format", "float") not in ("float", "base64"):
+            raise ApiError(400, "encoding_format must be float or base64")
+        if isinstance(inp, str) or (isinstance(inp, list) and inp and all(isinstance(t, int) for t in inp)):
+            inp = [inp]
+        if not isinstance(inp, list) or not inp or not all(isinstance(x, str) or (isinstance(x, list) and x and all(
+                isinstance(t, int) for t in x)) for x in inp):
+            raise ApiError(400, "input must be a string, a list of strings, a list of token ids or a list of such lists")
+        items = [s.tok.embed_input(x) if isinstance(x, str) else x for x in inp]
+        try:
+            res = s.engine.submit(items, norm=body.get("normalize", True) is not False).get()
+        except P_.PackError as e:
+            raise ApiError(400, str(e))
+        if isinstance(res, BaseException):
+            raise ApiError(500, f"{type(res).__name__}: {res}", "server_error")
+        rows = []
+        for i, r in enumerate(res):
+            e = base64.b64encode(r.numpy().astype("<f4").tobytes()).decode() if body.get("encoding_format") == "base64" else r.tolist()
+            rows.append(dict(object="embedding", index=i, embedding=e))
+        n = sum(len(t) for t in items)
+        self._json(200, dict(object="list", data=rows, model=s.name, usage=dict(prompt_tokens=n, total_tokens=n)))
 
     # --- completions
     def _prompt(self, body, chat):
@@ -306,6 +337,12 @@ def build(args):
     """(engine, tokenizer, ctx) from the CLI args: a pack backend, or the CPU reference model with --ref."""
     from . import registry
     from .scheduler import Config
+    if args.ref and args.ref_type == "embedding":
+        from .embed import RefEmbed
+        from .ref import RefModel
+        tok, ctx = ByteTokenizer(), args.context_length or 64
+        be = RefEmbed(RefModel(vocab=257, seed=0), max_cols=4 * ctx, max_seqs=args.max_running_requests or 8, max_len=ctx)
+        return registry.runner(be, None), tok, ctx
     if args.ref:
         from .ref import RefModel, TorchBackend
         tok = ByteTokenizer()
@@ -326,6 +363,8 @@ def build(args):
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")
         tok = HFTokenizer(tdir)
         ctx = args.context_length or be.max_len
+        if hasattr(be, "embed"):
+            return registry.runner(be, None), tok, ctx
     seqs = min(args.max_running_requests or be.max_seqs, be.max_seqs)
     eng = registry.runner(be, Config(max_num_seqs=seqs, max_model_len=ctx, kv_dtype="f16" if args.kv == "auto" else args.kv, prefix_cache=getattr(be, "prefix_cache", True)),
                  eos_ids=tok.eos_ids)
@@ -349,6 +388,7 @@ def parser():
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
     ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
+    ap.add_argument("--ref-type", choices=("decoder", "embedding"), default="decoder", help="model type of the --ref model")
     ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")
     ap.add_argument("--store", metavar="DIR", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
     ap.add_argument("--device", type=int, default=-1, help="device ordinal (default: the current device)")

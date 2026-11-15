@@ -170,10 +170,9 @@ def test_registry_stubs_refuse_with_a_clear_message():
     with pytest.raises(ValueError):
         R.Mesh((0,), {"tp": 2})
     assert R.Mesh.single(3).devices == (3,) and R.Mesh((0, 1, 2, 3), {"dp": 2, "tp": 2, "pp": 1}).key == {"dp": 2, "tp": 2}
-    for t in ("encoder-decoder", "embedding"):
-        be = type("B", (), {"m": dict(model=dict(type=t))})()
-        with pytest.raises(NotImplementedError, match=f"model type {t}"):
-            R.runner(be, None)
+    be = type("B", (), {"m": dict(model=dict(type="encoder-decoder"))})()
+    with pytest.raises(NotImplementedError, match="model type encoder-decoder"):
+        R.runner(be, None)
     with pytest.raises(P.PackError, match="model type"):
         R.model_type(dict(model=dict(type="diffusion")))
 
