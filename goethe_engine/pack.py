@@ -479,8 +479,21 @@ def verify(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, store=None):
     return st.manifest
 
 
+def cuda_arch_ok(dev, req, m):
+    """Why a cuda device cannot run a bucket that requires req in manifest m ("" if it can): its compute capability, the bucket's sm_XX
+    arch of that capability, the driver's CUDA version against the one the libraries were built with."""
+    if dev["cc"] != req["cc"]:
+        return f"device cc {dev['cc']} != pack cc {req['cc']}"
+    if not req["arch"].startswith("sm_" + dev["cc"].replace(".", "")):
+        return f"device cc {dev['cc']} vs bucket arch {req['arch']}"
+    if not (dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"])):
+        return f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}"
+    return ""
+
+
 def device(idx=None):
-    """The visible GPU: {name, cc, sms, uuid, cuda (driver's CUDA version)} from nvidia-smi and the CUDA runtime."""
+    """The visible cuda GPU: {platform, name, cc, sms, uuid, cuda (driver's CUDA version), arch_ok} from nvidia-smi and the CUDA runtime
+    (the cuda platform plugin's device query, registry.PLATFORMS)."""
     i = idx if idx is not None else os.environ.get("GC_GPU", "0")
     q = subprocess.run(["nvidia-smi", f"--id={i}", "--query-gpu=name,compute_cap,uuid", "--format=csv,noheader"],
                        capture_output=True, text=True, check=True).stdout.strip().split(", ")
@@ -488,7 +501,8 @@ def device(idx=None):
     cv = re.search(r"CUDA Version:\s*([\d.]+)", hdr)
     import torch                                    # the SM count: no nvidia-smi field has it
     p = torch.cuda.get_device_properties(0 if os.environ.get("CUDA_VISIBLE_DEVICES") else int(i))
-    return dict(name=q[0], cc=q[1], uuid=q[2], sms=p.multi_processor_count, cuda=cv[1] if cv else None)
+    return dict(platform="cuda", name=q[0], cc=q[1], uuid=q[2], sms=p.multi_processor_count, cuda=cv[1] if cv else None,
+                arch_ok=cuda_arch_ok)
 
 
 def ver(s):
@@ -497,20 +511,19 @@ def ver(s):
 
 def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target", verify=False, want=None, kind=None):
     """The bucket for (sku or device, contract, B columns, ctx positions, role): the smallest ncol >= B, then the
-    smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch. kind "encode": only encode
-    buckets; otherwise never one (an encode graph serves no decode, prefill or verify)."""
+    smallest maxctx >= ctx, among nominal (non-variant) buckets. Fail-closed on any device mismatch: dev is a platform plugin's
+    device record (name, sms, arch_ok(dev, requires, m) -> reason). kind "encode": only encode buckets; otherwise never one (an
+    encode graph serves no decode, prefill or verify)."""
     if dev is not None:
+        need(callable(dev.get("arch_ok")), f"device record {dev.get('name')!r} has no arch_ok: not a platform plugin's device (refused)")
         hit = [b for b in m["buckets"] if b["requires"]["name"] == dev["name"] and b["requires"]["sms"] == dev["sms"]]
         need(hit, f"device {dev['name']} ({dev['sms']} SMs) matches no bucket's SKU in this pack "
              f"({sorted({b['sku'] for b in m['buckets']})})")
         s = {b["sku"] for b in hit}
         need(sku is None or sku in s, f"--sku {sku} is not the device's SKU {sorted(s)}")
         sku = sku or s.pop()
-        need(dev["cc"] == hit[0]["requires"]["cc"], f"device cc {dev['cc']} != pack cc {hit[0]['requires']['cc']}")
-        need(hit[0]["requires"]["arch"].startswith("sm_" + dev["cc"].replace(".", "")),
-             f"device cc {dev['cc']} vs bucket arch {hit[0]['requires']['arch']}")
-        need(dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"]),
-             f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}")
+        why = dev["arch_ok"](dev, hit[0]["requires"], m)
+        need(not why, why)
     need(sku is not None, "no SKU: pass a device or a SKU")
     ok = want or (lambda b: True)
     # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request

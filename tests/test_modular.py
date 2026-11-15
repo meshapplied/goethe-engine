@@ -166,7 +166,7 @@ def test_registry_stubs_refuse_with_a_clear_message():
         with pytest.raises(NotImplementedError, match=f"platform {p}: not implemented yet"):
             R.open_backend("x.gcpack", [], platform=p)
     with pytest.raises(NotImplementedError, match="multi-device parallelism"):
-        R.open_backend("x.gcpack", [], mesh=R.Mesh((0, 1), {"tp": 2}))
+        R.open_backend("x.gcpack", [], mesh=R.Mesh((0, 1), {"tp": 2}), platform="cuda")
     with pytest.raises(ValueError):
         R.Mesh((0,), {"tp": 2})
     assert R.Mesh.single(3).devices == (3,) and R.Mesh((0, 1, 2, 3), {"dp": 2, "tp": 2, "pp": 1}).key == {"dp": 2, "tp": 2}
