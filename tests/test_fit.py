@@ -32,3 +32,10 @@ def test_old_pack_or_unknown_device_is_not_checked():
     b = bucket(8); del b["resident"]
     assert P.fit([b], 0, 1, pool_blocks=7) == (7, None)
     assert P.fit([bucket(8)], 0, None) == (None, None)
+
+
+def test_a_prefill_bucket_after_the_ladder_does_not_hide_the_pool():
+    pf = bucket(128, block=0, rows=0, slot=0)
+    pf["resident"]["slots"] = 1
+    pb, need = P.fit([bucket(2), bucket(64), pf], 4, 32 * G, margin=G)
+    assert pb is not None and 0 < pb < 64 * 128 and need <= 31 * G   # sized from the paged top, not "unpaged: the library default"
