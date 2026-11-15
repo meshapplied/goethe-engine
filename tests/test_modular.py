@@ -183,3 +183,11 @@ def test_cuda_plugin_opens_the_toy_pack_on_a_mesh_of_one(toy, key):
     be = R.open_backend(pack, w, mesh=R.Mesh.single(0), sku="mock", trusted=(key.kid,), B=8)
     assert be.bucket["ncol"] == 8
     be.close()
+
+
+def test_a_stream_bucket_never_joins_a_batch_ladder():
+    """gc_open runs a linear (stream) program alone: a BI:1 stream bucket beside the BI ladder must not be opened with it (15 Nov defect)."""
+    mk = lambda i, nc, batch: dict(id=i, ncol=nc, batch=batch, sku="s", contract="BI", role="target", maxctx=4096)
+    m = dict(buckets=[mk("BI.1", 1, False), mk("BI.2", 2, True), mk("BI.8", 8, True)])
+    assert [x["id"] for x in P.ladder(m, m["buckets"][2])] == ["BI.2", "BI.8"]
+    assert [x["id"] for x in P.ladder(m, m["buckets"][0])] == ["BI.1"]

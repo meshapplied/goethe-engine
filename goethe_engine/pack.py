@@ -601,9 +601,10 @@ def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):
 
 def ladder(m, b):
     """The nominal buckets a process serving up to b's columns loads beside b (same SKU, contract, role, maxctx; ncol
-    <= b's), smallest first (a shrinking batch steps down through them)."""
+    <= b's), smallest first (a shrinking batch steps down through them). Only batch buckets join a ladder: a one-sequence stream bucket
+    (kind stream, a linear program the runtime opens alone) is b's ladder only when it is b."""
     return sorted((x for x in m["buckets"] if not x.get("variant_of") and x["ncol"] <= b["ncol"]
-                   and (x["batch"] or x["ncol"] == 1)
+                   and (x["batch"] or x["id"] == b["id"])
                    and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx"))), key=lambda x: x["ncol"])
 
 
