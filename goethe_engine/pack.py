@@ -511,10 +511,14 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
         need(dev.get("cuda") and ver(dev["cuda"]) >= ver(m["cuda"]),
              f"driver CUDA {dev.get('cuda')} < the libraries' CUDA {m['cuda']}")
     need(sku is not None, "no SKU: pass a device or a SKU")
-    ok = want or (lambda b: True)
-    # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request
-    c = contract or next((x for x in m["contracts"] if any(b["contract"] == x and ok(b) for b in m["buckets"])), None) \
-        or next(iter(m["contracts"]), None)
+    ok = want or (lambda b: contract is not None or b.get("determinism") != "tolerance")   # tolerance buckets only when asked for
+    # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request (a tolerance
+    # request: a contract with tolerance buckets first)
+    pre = getattr(ok, "prefer", None)
+    order = sorted(m["contracts"], key=lambda x: not any(b["contract"] == x and ok(b) and pre and b.get("determinism") == pre
+                                                         for b in m["buckets"]))
+    c = contract or next((x for x in order if any(b["contract"] == x and ok(b) for b in m["buckets"])), None) \
+        or next((x for x in m["contracts"] if any(b["contract"] == x and ok(b) for b in m["buckets"])), None)
     skip = {b["id"]: usable(m, b) for b in m["buckets"] if usable(m, b)}
     cand = [b for b in m["buckets"] if b["sku"] == sku and b["contract"] == c and b["role"] == role
             and b["id"] not in skip and ok(b)
@@ -554,7 +558,7 @@ def feature(b, k):
 
 def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     """The bucket predicate of a request: numerics exact | deterministic (batch_invariant; exact also serves a handle of one
-    sequence, which has no batch to depend on) | fast (tolerance, else deterministic: no tolerance bucket exists yet), act auto
+    sequence, which has no batch to depend on) | fast (tolerance buckets preferred by select, else deterministic), act auto
     (a16 where a bucket has it: the pack's contract order) | a8 | a16 (exact buckets carry no act), kv auto (f16) | f16 | fp8."""
     numerics, act = NK.resolve(numerics, act)
     det = {"exact": {"exact"}, "deterministic": {"batch_invariant"} | ({"exact"} if single else set()),
@@ -562,8 +566,10 @@ def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     if numerics not in det or act not in ("auto", "a8", "a16") or kv not in ("auto", "f16", "fp8"):
         raise PackError(f"numerics {numerics!r} act {act!r} kv {kv!r}: numerics reference | invariant | invariant-hp | tolerance, act auto | a8 | "
                         "a16, kv auto | f16 | fp8")
-    return lambda b: (feature(b, "determinism") in det[numerics] and (act == "auto" or feature(b, "act") in (None, act))
-                      and feature(b, "kv") == ("f16" if kv == "auto" else kv))
+    f = lambda b: (feature(b, "determinism") in det[numerics] and (act == "auto" or feature(b, "act") in (None, act))
+                   and feature(b, "kv") == ("f16" if kv == "auto" else kv))
+    f.prefer = "tolerance" if numerics == "fast" else None
+    return f
 
 
 def need_bucket(m, sku, want, what):

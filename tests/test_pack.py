@@ -409,6 +409,14 @@ def test_numerics_request_selects_by_capability_records():
     assert pick(2, act="a8") == "a2"
     assert P.single_stream(m, sku="s", want=P.wanted("exact", single=True))["id"] == "e1"
     assert P.select(m, sku="s", B=2, want=P.wanted("fast"))["id"] == "h2"   # fast falls back to deterministic
+    m["contracts"].append("Tt")                   # a tolerance contract, listed last: only a tolerance request reaches it
+    m["buckets"].append(bk("t2", "Tt", 2, "tolerance", "a8"))
+    assert P.select(m, sku="s", B=2, want=P.wanted("fast"))["id"] == "t2"
+    assert pick(2) == "h2" and P.select(m, sku="s", B=2)["id"] == "h2"
+    only = dict(m, contracts=["Tt"], buckets=[m["buckets"][-1]])
+    with pytest.raises(P.PackError):
+        P.select(only, sku="s", B=2)               # never implicit, even as the only bucket
+    assert P.select(only, sku="s", B=2, contract="Tt")["id"] == "t2"
     with pytest.raises(P.PackError, match="kv=fp8.*the pack has"):
         P.need_bucket(m, "s", P.wanted(kv="fp8"), "kv=fp8")
     with pytest.raises(P.PackError, match="act"):
