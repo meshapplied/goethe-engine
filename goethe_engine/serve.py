@@ -1,7 +1,8 @@
 """goethe-engine serve: the OpenAI-compatible upstream goethed proxies to (stdlib http.server, one engine thread).
 
 Routes: POST /v1/chat/completions, POST /v1/completions (JSON or SSE) for a decoder; POST /v1/embeddings for an embedding model;
-GET /v1/models, GET /health.
+POST /v1/audio/transcriptions for an encoder-decoder (JSON {frames: [[f32] * F] * T, prompt: decoder ids, max_tokens}: the features the
+model's encoder takes); GET /v1/models, GET /health.
 Requests from many handler threads join one Engine; the engine thread steps it (continuous batching) and fans the
 token deltas out to per-request queues. Localhost by default."""
 import argparse
@@ -57,6 +58,7 @@ class Server:
     def __init__(self, engine, tok, name, ctx, api_key=None):
         self.engine, self.tok, self.name, self.ctx, self.key = engine, tok, name, ctx, api_key
         self.embedding = hasattr(engine, "submit") and hasattr(engine, "embed")
+        self.seq2seq = hasattr(engine, "frames")
         self.pending, self.wake, self.stop, self.dead = {}, threading.Event(), False, None
         self.created = int(time.time())
         self.thread = threading.Thread(target=self._loop, daemon=True, name="engine")
@@ -178,10 +180,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._authed():
                 raise ApiError(401, "invalid api key", "authentication_error")
-            if path not in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
+            if path not in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/audio/transcriptions"):
                 raise ApiError(404, f"no route {path}", "not_found_error")
-            if (path == "/v1/embeddings") != self.srv.embedding:
-                raise ApiError(400, f"{path}: this model is {'an embedding model (/v1/embeddings)' if self.srv.embedding else 'a decoder'}")
+            kind = "embedding" if self.srv.embedding else "encoder-decoder" if self.srv.seq2seq else "decoder"
+            want = {"/v1/embeddings": "embedding", "/v1/audio/transcriptions": "encoder-decoder"}.get(path, "decoder")
+            if kind != want:
+                raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model")
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
                 raise ApiError(413, "body too large")
@@ -195,6 +199,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(503, f"engine stopped: {self.srv.dead}", "server_error")
             if self.srv.embedding:
                 return self._embeddings(body)
+            if self.srv.seq2seq:
+                return self._transcribe(body)
             self._complete(body, path.endswith("chat/completions"))
         except ApiError as e:
             self._error(e)
@@ -224,6 +230,34 @@ class Handler(BaseHTTPRequestHandler):
             rows.append(dict(object="embedding", index=i, embedding=e))
         n = sum(len(t) for t in items)
         self._json(200, dict(object="list", data=rows, model=s.name, usage=dict(prompt_tokens=n, total_tokens=n)))
+
+    # --- transcriptions (encoder-decoder)
+    def _transcribe(self, body):
+        import torch
+        s = self.srv
+        try:
+            frames = torch.tensor(body.get("frames"), dtype=torch.float32)
+            prompt = body.get("prompt")
+            if not (isinstance(prompt, list) and prompt and all(isinstance(t, int) for t in prompt)):
+                raise ValueError("prompt must be the decoder's start token ids")
+            params = sampling(dict(body, temperature=0), s, len(prompt))
+            rid = uuid.uuid4().hex
+            q = s.pending[rid] = queue.Queue()
+            s.engine.add_request(rid, prompt, params, frames=frames)
+        except (ValueError, TypeError, RuntimeError) as e:
+            s.pending.pop(rid if "rid" in locals() else None, None)
+            raise ApiError(400, str(e))
+        s.wake.set()
+        ids = []
+        while True:
+            o = q.get()
+            if o is None:
+                raise ApiError(503, f"engine stopped: {s.dead}", "server_error")
+            ids += o.token_ids
+            if o.finished:
+                break
+        s.pending.pop(rid, None)
+        self._json(200, dict(text=s.tok.decode(ids), tokens=ids))
 
     # --- completions
     def _prompt(self, body, chat):
@@ -337,6 +371,12 @@ def build(args):
     """(engine, tokenizer, ctx) from the CLI args: a pack backend, or the CPU reference model with --ref."""
     from . import registry
     from .scheduler import Config
+    if args.ref and args.ref_type == "encoder-decoder":
+        from .seq2seq import RefSeq2Seq, RefSeq2SeqBackend
+        tok, ctx = ByteTokenizer(), args.context_length or 64
+        seqs = args.max_running_requests or 4
+        be = RefSeq2SeqBackend(RefSeq2Seq(vocab=257, seed=0), num_blocks=seqs * (-(-ctx // 4)) + 8, block_size=4, max_seqs=seqs)
+        return registry.runner(be, Config(max_num_seqs=seqs, max_model_len=ctx), eos_ids=tok.eos_ids), tok, ctx
     if args.ref and args.ref_type == "embedding":
         from .embed import RefEmbed
         from .ref import RefModel
@@ -388,7 +428,7 @@ def parser():
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
     ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
-    ap.add_argument("--ref-type", choices=("decoder", "embedding"), default="decoder", help="model type of the --ref model")
+    ap.add_argument("--ref-type", choices=("decoder", "embedding", "encoder-decoder"), default="decoder", help="model type of the --ref model")
     ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")
     ap.add_argument("--store", metavar="DIR", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
     ap.add_argument("--device", type=int, default=-1, help="device ordinal (default: the current device)")
