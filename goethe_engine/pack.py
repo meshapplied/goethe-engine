@@ -715,11 +715,12 @@ def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"
     rs = [b.get("resident") for b in lad]
     if free is None or not all(rs):
         return pool_blocks, None
-    top = rs[-1]
+    i = max((j for j, r in enumerate(rs) if r["block"]), default=len(rs) - 1)   # the pool's owner: the last paged bucket (a prefill bucket after it pages nothing)
+    top = rs[i]
     weights = sum({r["wset"]: r["weights"] for r in rs}.values())
     base = weights + sum(r["fixed"] for r in rs) + top["slot"] * (top["slots"] + state_pages)
     blk, rows = top["block"], top["block_rows"]
-    per_seq = lad[-1]["maxctx"] // rows if rows else 0
+    per_seq = lad[i]["maxctx"] // rows if rows else 0
     full = top["slots"] * per_seq
     budget = free - margin
 
