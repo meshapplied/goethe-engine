@@ -583,8 +583,10 @@ def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     if numerics not in det or act not in ("auto", "a8", "a16") or kv not in ("auto", "f16", "fp8"):
         raise PackError(f"numerics {numerics!r} act {act!r} kv {kv!r}: numerics reference | invariant | invariant-hp | tolerance, act auto | a8 | "
                         "a16, kv auto | f16 | fp8")
-    return lambda b: (feature(b, "determinism") in det[numerics] and (act == "auto" or feature(b, "act") in (None, act))
-                      and feature(b, "kv") == ("f16" if kv == "auto" else kv))
+    # an exact bucket that declares batch_invariant (one sequence per graph) also serves a deterministic request
+    return lambda b: ((feature(b, "determinism") in det[numerics] or (numerics == "deterministic" and feature(b, "determinism") == "exact"
+                                                                      and b.get("batch_invariant") is True))
+                      and (act == "auto" or feature(b, "act") in (None, act)) and feature(b, "kv") == ("f16" if kv == "auto" else kv))
 
 
 def need_bucket(m, sku, want, what):
