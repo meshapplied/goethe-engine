@@ -760,7 +760,10 @@ def open_ctx(pick, m, ctx, fits):
 
 def prefill(m, b):
     """The widest prefill chain bucket (manifest "prefill": W columns, a non-batch build that prefills a prompt chunk of one
-    sequence a launch beside b's ladder) with b's SKU, contract, revision, role and maxctx, or None."""
+    sequence a launch beside b's ladder) with b's SKU, contract, revision, role and maxctx, or None; None for a non-batch b (a stream
+    bucket opens alone: the runtime takes a chain only beside batch buckets)."""
+    if not b["batch"]:
+        return None
     return max((x for x in m["buckets"] if x.get("prefill") and not x["batch"]
                 and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and rev(x) == rev(b)),
                key=lambda x: x["prefill"], default=None)
