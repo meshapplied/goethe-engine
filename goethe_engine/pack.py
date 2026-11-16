@@ -33,7 +33,7 @@ a v4 file with an abi 3 manifest, or the reverse, is refused, so a signature nev
 import atexit, hashlib, json, lzma, os, re, shutil, stat, subprocess, sys, tempfile
 
 from . import numerics_kw as NK, sign, structure
-from .errors import Refused
+from .errors import OutOfMemory, Refused
 
 ABI = "3.0.0"                       # pack ABI semver: additive within a major
 MAGIC = b"GCPACK3\n"
@@ -738,7 +738,8 @@ def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"
     i = max((j for j, r in enumerate(rs) if r["block"]), default=len(rs) - 1)   # the pool's owner: the last paged bucket (a prefill bucket after it pages nothing)
     top = rs[i]
     weights = sum({r["wset"]: r["weights"] for r in rs}.values())
-    base = weights + sum(r["fixed"] for r in rs) + top["slot"] * (top["slots"] + state_pages)
+    # scratch: a bucket's launch workspace (activations, split-K partials) when the manifest declares it; every loaded bucket keeps its own
+    base = weights + sum(r["fixed"] + r.get("scratch", 0) for r in rs) + top["slot"] * (top["slots"] + state_pages)
     blk, rows = top["block"], top["block_rows"]
     per_seq = lad[i]["maxctx"] // rows if rows else 0
     full = top["slots"] * per_seq
@@ -766,7 +767,9 @@ def open_ctx(pick, m, ctx, fits):
     """(bucket, ladder, prefill bucket) of pick(ctx). ctx None: the context is sized at load, the largest maxctx of the pack whose
     pick fits the device (fits(buckets) raises PackError when not); a pack without resident records fits at its largest maxctx."""
     if ctx is not None:
-        return pick(ctx)
+        b, lad, pf = pick(ctx)
+        fits(lad + ([pf] if pf else []))
+        return b, lad, pf
     err = None
     for cx in sorted({b["maxctx"] for b in m["buckets"] if b["role"] == "target"}, reverse=True):
         try:
@@ -776,6 +779,18 @@ def open_ctx(pick, m, ctx, fits):
         except PackError as e:
             err = e                 # the smallest context's reason is the one to report
     raise err or PackError("no target bucket")
+
+
+def open_fit(pick, m, ctx, fits, widths):
+    """open_ctx for the widest of widths (batch columns, descending) whose ladder fits the device: a batch the card cannot hold
+    steps down to the next narrower ladder bucket instead of failing at launch; none fits: refused with every width's reason."""
+    why = []
+    for w in widths:
+        try:
+            return open_ctx(lambda cx: pick(cx, w), m, ctx, fits)
+        except PackError as e:
+            why.append(f"B {w}: {e}")
+    raise OutOfMemory("; ".join(why) or "no target bucket")
 
 
 def prefill_us(x, L, pos=0):

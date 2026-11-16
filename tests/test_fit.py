@@ -39,3 +39,25 @@ def test_a_prefill_bucket_after_the_ladder_does_not_hide_the_pool():
     pf["resident"]["slots"] = 1
     pb, need = P.fit([bucket(2), bucket(64), pf], 4, 32 * G, margin=G)
     assert pb is not None and 0 < pb < 64 * 128 and need <= 31 * G   # sized from the paged top, not "unpaged: the library default"
+
+
+def test_open_steps_down_to_the_widest_ladder_that_fits(tmp_path, key, mocklib, monkeypatch):
+    """Fit is decided before any launch: a device whose free memory holds the 2 column ladder but not the 8 column one opens the 2
+    column one (max_seqs 2); one that holds neither is refused (code oom) with each width's numbers."""
+    from goethe_engine.errors import OutOfMemory
+    from goethe_engine.gc_c import GcBackend
+    from toypack import toy_pack
+    G = 1 << 30
+
+    def mut(m):
+        for b in m["buckets"]:
+            b["resident"] = dict(weights=G, wset="w", fixed=0, scratch=G // 10, slot=G // 10, slots=b["ncol"], block=G // 100, block_rows=16)
+    pack, w, _ = toy_pack(str(tmp_path), key, mocklib, mutate=mut)
+    monkeypatch.setattr(P, "device_free", lambda i=None: int(3.0 * G))
+    be = GcBackend(pack, w, B=8, sku="mock", trusted=(key.kid,))
+    assert be.bucket["ncol"] == 2 and be.resident < 3.0 * G - (1 << 30)
+    be.close()
+    monkeypatch.setattr(P, "device_free", lambda i=None: int(2.5 * G))
+    with pytest.raises(OutOfMemory) as e:
+        GcBackend(pack, w, B=8, sku="mock", trusted=(key.kid,))
+    assert e.value.code == "oom" and "B 8:" in str(e.value) and "B 2:" in str(e.value)

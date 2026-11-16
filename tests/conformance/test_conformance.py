@@ -46,7 +46,35 @@ def run(m, kind):
     return np.asarray(m.transcribe([np.linspace(-0.5, 0.5, 1600).astype(np.float32)], m.backend.marker, 8))
 
 
+ISOLATED = r"""
+import json, sys
+import numpy as np
+sys.path.insert(0, {root!r})
+from goethe_engine import api
+sys.path.insert(0, {here!r})
+from test_conformance import run
+pack, ws, tr, sku, kind = json.loads({args!r})
+with api.open(pack, ws, trusted=tuple(tr), sku=sku, device=0) as m:
+    assert m.kind == kind
+    a, b = run(m, kind), run(m, kind)
+    assert np.isfinite(np.asarray(a, dtype=np.float64)).all() and np.asarray(a).tobytes() == np.asarray(b).tobytes(), kind
+assert "torch" not in sys.modules
+print("OK")
+"""
+
+
 def test_open_and_steps_are_deterministic(subject):
+    """In a fresh interpreter for a real pack: the test process imports torch (the reference fixtures), and torch would bind its
+    wheels' cuBLAS ahead of a pinned body's (refused, correctly)."""
+    import json
+    import subprocess
+    if REAL:
+        here = os.path.dirname(os.path.abspath(__file__))
+        for pack, ws, tr, sku, kind, _ in subject:
+            code = ISOLATED.format(root=os.path.join(here, "..", ".."), here=here, args=json.dumps([pack, ws, list(tr), sku, kind]))
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, errors="replace")
+            assert r.returncode == 0 and r.stdout.strip().endswith("OK"), r.stderr[-2000:]
+        return
     for pack, ws, tr, sku, kind, _ in subject:
         with api.open(pack, ws, trusted=tr, sku=sku, device=0) as m:
             assert m.kind == kind

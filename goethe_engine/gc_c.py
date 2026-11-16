@@ -111,13 +111,15 @@ class GcBackend:
             want = P.wanted(*req, single=B == 1)
             P.need_bucket(m, sku, want, f"numerics={req[0]} act={req[1]} kv={req[2]} for {B} sequence(s)")
 
-            def at(cx):
-                b = (B == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)) or \
-                    P.select(m, sku=sku, dev=dev, contract=contract, B=max(B, 2), ctx=cx, want=want)
-                if B == 1:
+            def at(cx, w):
+                b = (w == 1 and P.single_stream(m, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)) or \
+                    P.select(m, sku=sku, dev=dev, contract=contract, B=max(w, 2), ctx=cx, want=want)
+                if w == 1:
                     b = P.with_prefill(m, b, sku=sku, dev=dev, contract=contract, ctx=cx, want=want)
                 return b, P.ladder(m, b), P.prefill(m, b, plen)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
-            b, lad, pf = P.open_ctx(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, what=bl[0]["id"]))
+            # the requested batch, then the narrower batch buckets: the widest whose weights, slots, pool and scratch fit is opened
+            widths = [B] + sorted({x["ncol"] for x in m["buckets"] if x["batch"] and x["role"] == "target" and 1 < x["ncol"] < B}, reverse=True)
+            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, what=bl[0]["id"]), widths)
             load = lad + ([pf] if pf else [])
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
