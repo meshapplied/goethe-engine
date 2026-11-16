@@ -23,6 +23,16 @@ from .tokenizer import ByteTokenizer, HFTokenizer, TextStream
 MAX_BODY = 8 << 20
 UNSUPPORTED = ("tools", "tool_choice", "functions", "function_call", "logprobs", "top_logprobs", "logit_bias",
                "suffix", "best_of", "echo")
+# The body fields each route reads; any other non-null field is refused (unsupported_parameter), never silently ignored.
+FIELDS = {"generate": ("model", "messages", "prompt", "stream", "stream_options", "user", "max_tokens", "max_completion_tokens", "temperature",
+                       "top_p", "top_k", "seed", "n", "stop", "frequency_penalty", "presence_penalty", "response_format") + UNSUPPORTED,
+          "embed": ("model", "input", "encoding_format", "user", "normalize", "dimensions", "truncation")}
+
+
+def known_fields(body, task):
+    k = next((k for k, v in body.items() if v is not None and k not in FIELDS[task]), None)
+    if k is not None:
+        raise ApiError(400, f"{k} is not a parameter of this endpoint", code="unsupported_parameter", param=k)
 
 
 class ApiError(Exception):
@@ -111,6 +121,7 @@ def parse_stop(v):
 
 
 def sampling(body, srv, plen):
+    known_fields(body, "generate")
     for k in UNSUPPORTED:
         if body.get(k) not in (None, False):
             raise ApiError(400, f"{k} is not supported", code="unsupported_parameter", param=k)
@@ -228,8 +239,13 @@ class Handler(BaseHTTPRequestHandler):
                 isinstance(t, int) for t in x)) for x in inp):
             raise ApiError(400, "input must be a string, a list of strings, a list of token ids or a list of such lists", code="invalid_parameter",
                            param="input")
+        known_fields(body, "embed")
         items = [s.tok.embed_input(x) if isinstance(x, str) else x for x in inp]
-        r = checked("embed", dict(normalize=body.get("normalize", True) is not False, dimensions=body.get("dimensions")), s)
+        r = checked("embed", dict(normalize=body.get("normalize", True) is not False, dimensions=body.get("dimensions"),
+                                  truncation=body.get("truncation")), s)
+        if r.get("truncation") == "right":       # as api.Model.embed: cut each input to the longest the pack embeds
+            be = getattr(s.engine, "be", None) or getattr(s.engine, "backend", None)
+            items = [list(t)[:min(be.max_len, be.max_cols)] for t in items]
         try:
             res = s.engine.submit(items, norm=r["normalize"] and "dimensions" not in r).get()
         except P_.PackError as e:

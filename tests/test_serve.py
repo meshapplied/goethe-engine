@@ -178,7 +178,8 @@ def test_parameter_refusals_have_one_shape(srv):
     import os as O
     codes = J.load(open(O.path.join(O.path.dirname(__file__), "..", "goethe_engine", "spec", "errors.json")))["codes"]
     for body, code, param in ((dict(top_p=2.0), "invalid_parameter", "top_p"), (dict(logprobs=True), "unsupported_parameter", "logprobs"),
-                              (dict(presence_penalty=0.5), "unsupported_parameter", "presence_penalty"), (dict(stop=[""]), "invalid_parameter", "stop")):
+                              (dict(presence_penalty=0.5), "unsupported_parameter", "presence_penalty"), (dict(stop=[""]), "invalid_parameter", "stop"),
+                              (dict(foo_bar=1), "unsupported_parameter", "foo_bar")):
         st, r = call(srv[0], "/v1/completions", dict(dict(prompt="hi", max_tokens=2), **body))
         e = r["error"]
         assert st == 400 and e["type"] == "invalid_request_error" and e["code"] == code and e["param"] == param and e["message"], body

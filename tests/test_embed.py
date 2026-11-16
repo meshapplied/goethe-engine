@@ -160,5 +160,17 @@ def test_v1_embeddings(esrv):
     v = torch.frombuffer(bytearray(base64.b64decode(b64["data"][0]["embedding"])), dtype=torch.float32)
     assert torch.equal(v, e0)
     assert call(base, "/v1/embeddings", dict(input="x" * 40))[0] == 400
+    st, r = call(base, "/v1/embeddings", dict(input="x" * 40, truncation="right"))
+    assert st == 400 and r["error"]["code"] == "unsupported_parameter" and r["error"]["param"] == "truncation"   # not declared: refused
+    st, r = call(base, "/v1/embeddings", dict(input="x", foo_bar=1))
+    assert st == 400 and r["error"]["code"] == "unsupported_parameter" and r["error"]["param"] == "foo_bar"
+    be = getattr(s.engine, "be", None) or s.engine.backend
+    old = getattr(be, "bucket", None)
+    be.bucket = {"io": {"params": ["normalize", "truncation"]}}
+    try:
+        st, r = call(base, "/v1/embeddings", dict(input="x" * 40, truncation="right"))
+        assert st == 200 and r["usage"]["prompt_tokens"] == 32
+    finally:
+        be.bucket = old
     assert call(base, "/v1/embeddings", dict(input=[]))[0] == 400
     assert call(base, "/v1/completions", dict(prompt="hi"))[0] == 400
