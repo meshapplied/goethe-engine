@@ -65,7 +65,8 @@ class Model:
         self.runner = R.runner(self.backend, self.cfg, **({"eos_ids": eos_ids} if self.type == "decoder" else {}))
 
     def _need(self, kind):
-        P.need(self.kind == kind, f"this pack is model.type {self.type} (task {self.kind}), not {kind}")
+        w = {"generate": "a text", "embed": "an embedding", "transcribe": "a speech"}       # the words customers see
+        P.need(self.kind == kind, f"this model is {w[self.kind]} model, not {w[kind]} model")
 
     def check(self, **req):
         """The request parameters validated against the task schema and this pack's io.params (params.check)."""

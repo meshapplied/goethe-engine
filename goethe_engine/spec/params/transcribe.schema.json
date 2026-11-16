@@ -1,6 +1,7 @@
 {
  "$schema": "https://json-schema.org/draft/2020-12/schema",
- "title": "transcribe request parameters",
+ "title": "speech model request parameters",
+ "description": "parameters of a speech-to-text request; a pack serves the names its bucket declares in io.params (absent: default_declared)",
  "type": "object",
  "additionalProperties": false,
  "properties": {

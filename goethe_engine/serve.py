@@ -1,6 +1,6 @@
 """goethe-engine serve: the OpenAI-compatible upstream goethed proxies to (stdlib http.server, one engine thread).
 
-Routes: POST /v1/chat/completions, POST /v1/completions (JSON or SSE) for a decoder; POST /v1/embeddings for an embedding model;
+Routes: POST /v1/chat/completions, POST /v1/completions (JSON or SSE) for a text model; POST /v1/embeddings for an embedding model;
 POST /v1/audio/transcriptions for an encoder-decoder (JSON {frames: [[f32] * F] * T, prompt: decoder ids, max_tokens}: the features the
 model's encoder takes); GET /v1/models, GET /health.
 Requests from many handler threads join one Engine; the engine thread steps it (continuous batching) and fans the
@@ -67,6 +67,9 @@ class Choice:
             out, self.held = self.held[:len(self.held) - keep], self.held[len(self.held) - keep:]
         self.text += out
         return out
+
+
+KIND_WORD = {"decoder": "text", "embedding": "embedding", "encoder-decoder": "speech", "media": "speech"}   # the words customers see
 
 
 class Server:
@@ -195,7 +198,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(ApiError(401, "invalid api key", "authentication_error"))
         if path == "/v1/models":
             return self._json(200, {"object": "list", "data": [dict(id=s.name, object="model", created=s.created,
-                                                                    owned_by="goethe-engine", max_model_len=s.ctx)]})
+                                                                    owned_by="goethe-engine", max_model_len=s.ctx,
+                                                                    kind=KIND_WORD["embedding" if s.embedding else "media" if s.media else "encoder-decoder" if s.seq2seq else "decoder"])]})
         self._error(ApiError(404, f"no route {path}", "not_found_error"))
 
     def do_POST(self):
@@ -213,7 +217,10 @@ class Handler(BaseHTTPRequestHandler):
             kind = "embedding" if self.srv.embedding else "encoder-decoder" if self.srv.seq2seq else "media" if self.srv.media else "decoder"
             want = {"/v1/embeddings": ("embedding",), "/v1/audio/transcriptions": ("encoder-decoder", "media")}.get(path, ("decoder",))
             if kind not in want:
-                raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model", code="unsupported_task")
+                word = KIND_WORD[kind]
+                raise ApiError(400, f"{path}: this model is {'an' if word[0] in 'ae' else 'a'} {word} model, not "
+                                    f"{' or '.join(('an ' if KIND_WORD[w][0] in 'ae' else 'a ') + KIND_WORD[w] for w in dict.fromkeys(want))} model",
+                               code="unsupported_task")
             if self.srv.media:
                 return self._transcribe_media(raw)
             try:

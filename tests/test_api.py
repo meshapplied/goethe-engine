@@ -17,7 +17,7 @@ def test_generate_and_capabilities(tmp_path, key, mocklib):
     ps = [[1, 2, 3], [9, 9]]
     with api.open(pack, w, B=2, sku="mock", trusted=(key.kid,)) as m:
         assert m.kind == "generate" and m.generate(ps, 7) == [fake_greedy(p, 7) for p in ps]
-        with pytest.raises(P.PackError, match=r"\(task generate\), not embed"):
+        with pytest.raises(P.PackError, match="this model is a text model, not an embedding model"):
             m.embed([[1]])
 
 

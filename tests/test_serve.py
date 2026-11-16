@@ -202,3 +202,11 @@ def test_a_refused_request_leaves_a_kept_alive_connection_usable(srv):
         r = c.getresponse()
         assert r.status == 200 and json.loads(r.read())["usage"]["completion_tokens"] == 2, path
     c.close()
+
+
+def test_wrong_task_names_the_model_kinds_customers_see(srv):
+    st, r = call(srv[0], "/v1/embeddings", dict(input="hi"))
+    assert st == 400 and r["error"]["code"] == "unsupported_task"
+    assert "this model is a text model, not an embedding model" in r["error"]["message"]
+    st, r = call(srv[0], "/v1/models")
+    assert r["data"][0]["kind"] == "text"
