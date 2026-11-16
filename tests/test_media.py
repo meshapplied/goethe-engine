@@ -100,3 +100,13 @@ def test_read_wav(tmp_path):
         read_wav(p, 16000)
     wav(p, [16384, 0, -16384, -16384], ch=2)
     assert read_wav(p).tolist() == [0.25, -0.5]
+
+
+def test_media_path_never_imports_torch(tmp_path, key, mockgcm):
+    """torch preloads its wheels' cuBLAS copies: a pinned body would bind those, not its provenance's (measured: 12.8.4 for 12.8.3)."""
+    import sys
+    pack, ws = media_pack(tmp_path, key, mockgcm)
+    code = (f"import sys; from goethe_engine import api; m = api.open({pack!r}, {ws!r}, device=0, sku='mock', trusted=({key.kid!r},)); "
+            "m.transcribe([__import__('numpy').ones(4, 'float32')], '<m>', 2); m.close(); assert 'torch' not in sys.modules, 'torch imported'")
+    root = os.path.join(os.path.dirname(__file__), "..")
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=root, env=dict(os.environ, PYTHONPATH=root))

@@ -547,13 +547,15 @@ def device(idx=None):
     """The visible cuda GPU: {platform, name, cc, sms, smem_block (opt-in shared memory per block), uuid, cuda (driver's CUDA version),
     arch_ok} from nvidia-smi and the driver API (the cuda platform plugin's device query, registry.PLATFORMS)."""
     import ctypes as C
-    i = idx if idx is not None else os.environ.get("GC_GPU", "0")
+    vis = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    # nvidia-smi ignores CUDA_VISIBLE_DEVICES: it is asked for the visible device's own index or UUID
+    i = vis[idx or 0] if vis else idx if idx is not None else os.environ.get("GC_GPU", "0")
     q = subprocess.run(["nvidia-smi", f"--id={i}", "--query-gpu=name,compute_cap,uuid", "--format=csv,noheader"],
                        capture_output=True, text=True, check=True).stdout.strip().split(", ")
     hdr = subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout
     cv = re.search(r"CUDA Version:\s*([\d.]+)", hdr)
     cu, d, v = C.CDLL("libcuda.so.1"), C.c_int(), C.c_int()
-    need(cu.cuInit(0) == 0 and cu.cuDeviceGet(C.byref(d), 0 if os.environ.get("CUDA_VISIBLE_DEVICES") else int(i)) == 0,
+    need(cu.cuInit(0) == 0 and cu.cuDeviceGet(C.byref(d), (idx or 0) if vis else int(i)) == 0,
          f"driver API: no CUDA device {i}")
     attr = lambda a: v.value if cu.cuDeviceGetAttribute(C.byref(v), a, d) == 0 else None   # CUdevice_attribute values (cuda.h)
     return dict(platform="cuda", name=q[0], cc=q[1], uuid=q[2], sms=attr(16), smem_block=attr(97), cuda=cv[1] if cv else None,

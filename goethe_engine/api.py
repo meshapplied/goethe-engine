@@ -32,19 +32,28 @@ def capabilities(pack):
                 spec=sorted({s["policy"].get("kind") for s in m.get("spec", [])}), skus=sorted({b["sku"] for b in bs}))
 
 
+def files(weights):
+    """Weight file paths: a directory stands for its *.safetensors shards (an HF checkpoint), sorted."""
+    out = []
+    for w in [weights] if isinstance(weights, str) else weights:
+        out += sorted(os.path.join(w, f) for f in os.listdir(w) if f.endswith(".safetensors")) if os.path.isdir(w) else [w]
+    return out
+
+
 class Model:
     """A pack opened on one device for its task kind. B, ctx, plen, numerics, drafter: decoder handles only."""
 
     def __init__(self, pack, weights, *, drafter=None, B=1, ctx=None, plen=None, numerics="invariant", device=-1, sku=None,
                  trusted=None, store=None, cfg=None, eos_ids=(), **kw):
-        from .scheduler import Config
         self.type = R.pack_type(pack)
         self.kind = KIND[self.type]
         if self.type in ("decoder", "encoder-decoder"):
-            kw.update(B=B, ctx=ctx, plen=plen, numerics=numerics, drafter_weights=drafter)
-        self.backend = R.open_backend(pack, weights, mesh=R.Mesh.single(device), sku=sku, trusted=trusted, store=store, **kw)
-        n = getattr(self.backend, "max_len", None)
-        self.cfg = cfg or Config(max_model_len=n or 4096)
+            kw.update(B=B, ctx=ctx, plen=plen, numerics=numerics, drafter_weights=drafter and files(drafter))
+        self.backend = R.open_backend(pack, files(weights), mesh=R.Mesh.single(device), sku=sku, trusted=trusted, store=store, **kw)
+        self.cfg = cfg
+        if self.type in ("decoder", "encoder-decoder") and cfg is None:   # the media path stays torch free: a pinned body binds its own
+            from .scheduler import Config                                  # cuBLAS, and torch preloads the wheels' copies
+            self.cfg = Config(max_model_len=getattr(self.backend, "max_len", None) or 4096)
         self.runner = R.runner(self.backend, self.cfg, **({"eos_ids": eos_ids} if self.type == "decoder" else {}))
 
     def _need(self, kind):

@@ -92,7 +92,7 @@ class GcMedia:
         v = L.gcm_abi_version()
         P.need(v >> 16 == 1, f"{b['lib']}: media ABI {v >> 16}.{v & 0xFFFF}, this engine speaks 1.x")
         h = C.c_void_p()
-        rc = L.gcm_open(os.fsencode(ws[0]), os.fsencode(ws[1]), device, C.byref(h))
+        rc = L.gcm_open(os.fsencode(ws[0]), os.fsencode(ws[1]), max(device, 0), C.byref(h))   # -1 (current device): ordinal 0
         P.need(rc == 0, f"gcm_open {rc}: {(L.gcm_last_error(None) or b'').decode()}")
         self.h = h.value
         buf = C.create_string_buffer(4096)
