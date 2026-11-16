@@ -33,6 +33,7 @@ a v4 file with an abi 3 manifest, or the reverse, is refused, so a signature nev
 import atexit, hashlib, json, lzma, os, re, shutil, stat, subprocess, sys, tempfile
 
 from . import numerics_kw as NK, sign, structure
+from .errors import Refused
 
 ABI = "3.0.0"                       # pack ABI semver: additive within a major
 MAGIC = b"GCPACK3\n"
@@ -56,7 +57,7 @@ MESH_AXES = ("dp", "tp", "pp", "ep", "sp")  # data, tensor, pipeline, expert, se
 MODEL_TYPE = "decoder"                  # model.type of a manifest without the field
 
 
-class PackError(Exception):
+class PackError(Refused):
     """Any mismatch between a pack, its blobs, the weights and the device: the pack is not loaded."""
 
 

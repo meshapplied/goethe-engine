@@ -1,0 +1,21 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "generate request parameters",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "temperature": {"type": "number", "minimum": 0},
+  "top_p": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+  "top_k": {"type": "integer", "minimum": 0},
+  "max_tokens": {"type": "integer", "minimum": 1},
+  "stop": {"type": "array", "maxItems": 4, "items": {"type": "string", "minLength": 1}},
+  "stop_token_ids": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+  "seed": {"type": "integer", "minimum": 0},
+  "n": {"type": "integer", "minimum": 1},
+  "ignore_eos": {"type": "boolean"},
+  "logprobs": {"type": "integer", "minimum": 0},
+  "structured": {"type": "object", "additionalProperties": false, "required": ["kind", "spec"],
+                 "properties": {"kind": {"enum": ["json_schema", "regex", "ebnf"]}, "spec": {"type": "string"}}}
+ },
+ "default_declared": ["temperature", "top_p", "top_k", "max_tokens", "stop", "stop_token_ids", "seed", "n", "ignore_eos"]
+}

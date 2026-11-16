@@ -24,6 +24,9 @@ goethe-engine = "goethe_engine.cli:main"
 [tool.setuptools]
 packages = ["goethe_engine"]
 
+[tool.setuptools.package-data]
+goethe_engine = ["spec/*.json", "spec/params/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["gpu: needs a GPU box and a real pack"]

@@ -1,0 +1,10 @@
+{
+ "schema": "goethe-errors-1",
+ "codes": {
+  "refused": "the pack, its weights or the device cannot serve the request (signature, structure, arch, fit, limits, broken variant); the message names the reason",
+  "oom": "device memory: the open or a step does not fit; the message carries the fit numbers",
+  "unsupported_parameter": "a request parameter the task does not define, or one this pack does not declare in io.params",
+  "invalid_parameter": "a declared parameter with a value outside its schema (type, range, enum)",
+  "no_contract": "a numerics request the pack has no measured contract for"
+ }
+}

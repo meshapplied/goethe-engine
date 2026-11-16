@@ -106,7 +106,6 @@ def parse_stop(v):
 
 
 def sampling(body, srv, plen):
-    from .sampling import SamplingParams
     for k in UNSUPPORTED:
         if body.get(k) not in (None, False):
             raise ApiError(400, f"{k} is not supported")
@@ -116,14 +115,20 @@ def sampling(body, srv, plen):
     if (body.get("response_format") or {}).get("type", "text") != "text":
         raise ApiError(400, "response_format is not supported")
     mt = body.get("max_completion_tokens", body.get("max_tokens"))
-    num = lambda k, d, t: d if body.get(k) is None else t(body[k])
+    req = dict(temperature=body.get("temperature", 1.0), top_p=body.get("top_p"), top_k=body.get("top_k"), seed=body.get("seed"),
+               max_tokens=srv.ctx if mt is None else mt, n=body.get("n"))
+    from .sampling import SamplingParams
+    return SamplingParams(**checked("generate", req, srv))
+
+
+def checked(task, req, srv):
+    """params.check against the served pack's bucket (the one mechanism of api.Model), as an HTTP 400 with the error code."""
+    from . import params
+    from .errors import EngineError
     try:
-        return SamplingParams(temperature=num("temperature", 1.0, float), top_p=num("top_p", 1.0, float),
-                              top_k=num("top_k", 0, int), seed=num("seed", None, int),
-                              max_tokens=num("max_tokens", srv.ctx, int) if mt is None else int(mt),
-                              n=num("n", 1, int), stop_token_ids=())
-    except (TypeError, ValueError) as e:
-        raise ApiError(400, f"bad sampling parameter: {e}")
+        return params.check(task, req, getattr(getattr(srv.engine, "be", None) or getattr(srv.engine, "backend", None), "bucket", None))
+    except EngineError as e:
+        raise ApiError(400, f"{e.code}: {e}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -218,12 +223,17 @@ class Handler(BaseHTTPRequestHandler):
                 isinstance(t, int) for t in x)) for x in inp):
             raise ApiError(400, "input must be a string, a list of strings, a list of token ids or a list of such lists")
         items = [s.tok.embed_input(x) if isinstance(x, str) else x for x in inp]
+        r = checked("embed", dict(normalize=body.get("normalize", True) is not False, dimensions=body.get("dimensions")), s)
         try:
-            res = s.engine.submit(items, norm=body.get("normalize", True) is not False).get()
+            res = s.engine.submit(items, norm=r["normalize"] and "dimensions" not in r).get()
         except P_.PackError as e:
             raise ApiError(400, str(e))
         if isinstance(res, BaseException):
             raise ApiError(500, f"{type(res).__name__}: {res}", "server_error")
+        if "dimensions" in r:
+            from .embed import normalize
+            res = res[:, :r["dimensions"]]
+            res = normalize(res) if r["normalize"] else res
         rows = []
         for i, r in enumerate(res):
             e = base64.b64encode(r.astype("<f4").tobytes()).decode() if body.get("encoding_format") == "base64" else r.tolist()

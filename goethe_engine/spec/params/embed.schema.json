@@ -1,0 +1,12 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "embed request parameters",
+ "type": "object",
+ "additionalProperties": false,
+ "properties": {
+  "normalize": {"type": "boolean"},
+  "truncation": {"enum": ["none", "right"]},
+  "dimensions": {"type": "integer", "minimum": 1}
+ },
+ "default_declared": ["normalize"]
+}

@@ -10,7 +10,8 @@ import io
 import json
 import os
 
-from . import pack as P, registry as R
+from . import pack as P, params as P_, registry as R
+from .errors import UnsupportedParameter
 
 KIND = {"decoder": "generate", "embedding": "embed", "encoder-decoder": "transcribe", "media": "transcribe"}
 
@@ -66,25 +67,56 @@ class Model:
     def _need(self, kind):
         P.need(self.kind == kind, f"this pack is model.type {self.type} (task {self.kind}), not {kind}")
 
-    def generate(self, prompts, max_tokens=64, params=None):
-        """Per prompt (a token id list) the generated ids; greedy unless params (SamplingParams) say otherwise."""
+    def check(self, **req):
+        """The request parameters validated against the task schema and this pack's io.params (params.check)."""
+        return P_.check(self.kind, req, getattr(self.backend, "bucket", None))
+
+    def sampling(self, **req):
+        """SamplingParams of a generate request (checked)."""
         from .sampling import SamplingParams
+        r = self.check(**req)
+        for k in ("logprobs",):
+            if k in r:
+                raise UnsupportedParameter(f"{k!r}: declared by the pack, not implemented by this engine")
+        if "structured" in r:
+            r["grammar"] = (r["structured"]["kind"], r.pop("structured")["spec"])
+        if "stop" in r:
+            r["stop_sequences"] = tuple(r.pop("stop"))
+        if "stop_token_ids" in r:
+            r["stop_token_ids"] = tuple(r["stop_token_ids"])
+        return SamplingParams(**r)
+
+    def generate(self, prompts, max_tokens=64, **params):
+        """Per prompt (a token id list) the generated ids; greedy unless params say otherwise (spec/params/generate.schema.json)."""
         self._need("generate")
-        sp = params or SamplingParams(max_tokens=max_tokens)
+        sp = self.sampling(max_tokens=max_tokens, **params)
         return [o[0] for o in self.runner.generate([(list(p), sp) for p in prompts])]
 
-    def embed(self, items, norm=True):
+    def embed(self, items, normalize=True, **params):
+        """float32 rows of token lists (spec/params/embed.schema.json): dimensions keeps the leading components (then normalizes),
+        truncation right cuts an input to the longest the pack embeds."""
         self._need("embed")
-        return self.runner.embed(items, norm)
+        r = self.check(normalize=normalize, **params)
+        if r.get("truncation") == "right":
+            items = [list(t)[:min(self.backend.max_len, self.backend.max_cols)] for t in items]
+        if "dimensions" not in r:
+            return self.runner.embed(items, r["normalize"])
+        from .embed import normalize as l2
+        x = self.runner.embed(items, False)[:, :r["dimensions"]]
+        return l2(x) if r["normalize"] else x
 
-    def transcribe(self, media, prompt, max_tokens=2048):
+    def transcribe(self, media, prompt, max_new_tokens=2048, **params):
         """media: PCM arrays (one per marker of prompt, a chat-templated string) for a media pack; frames [T, F] and decoder prompt ids
-        for an encoder-decoder pack."""
+        for an encoder-decoder pack (spec/params/transcribe.schema.json)."""
         self._need("transcribe")
+        r = self.check(max_new_tokens=max_new_tokens, **params)
+        extra = sorted(set(r) - {"max_new_tokens"})
+        if extra:
+            raise UnsupportedParameter(f"{extra}: declared by the pack, not implemented by this engine's {self.type} runner")
         if self.type == "media":
-            return self.runner.transcribe(media, prompt, max_tokens)
+            return self.runner.transcribe(media, prompt, r["max_new_tokens"])
         from .sampling import SamplingParams
-        self.runner.add_request(0, prompt, SamplingParams(max_tokens=max_tokens), frames=media)
+        self.runner.add_request(0, prompt, SamplingParams(max_tokens=r["max_new_tokens"]), frames=media)
         out = []
         while self.runner.has_work():
             for o in self.runner.step():
