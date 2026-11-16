@@ -56,23 +56,23 @@ def encode_buckets(m):
 class GcEmbed:
     """An encode bucket of a gc-c pack: gc_open on that one bucket, gc_embed per launch."""
 
-    def __init__(self, pack, weights, *, device=-1, contract=None, sku=None, trusted=None, store=None, numerics="invariant", **_):
+    def __init__(self, pack, weights, *, device=-1, contract=None, sku=None, trusted=None, store=None, numerics="invariant", price=None, **_):
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open(weights, device, contract, sku, numerics)
+            self._open(weights, device, contract, sku, numerics, price)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, device, contract, sku, numerics):
+    def _open(self, weights, device, contract, sku, numerics, price=None):
         ws = [weights] if isinstance(weights, str) else list(weights)
         want = P.wanted(numerics, single=True)
 
         def pick(m, dev):
             b = P.select(m, sku=sku, dev=dev, contract=contract, want=want, kind="encode")
             return b, [b], b
-        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device)
+        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device, price=price)
         self.m = dict(br.m, buckets=encode_buckets(br.m))
         b = self.bucket = br.bucket
         lib = br.lib

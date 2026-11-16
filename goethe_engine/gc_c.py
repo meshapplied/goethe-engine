@@ -83,17 +83,18 @@ def arr(ctype, xs):
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="invariant", act="auto", kv="auto", store=None, plen=None):
+                 numerics="invariant", act="auto", kv="auto", store=None, plen=None, price=None):
         """store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen)
+            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen,
+                       price)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None):
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
         dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
@@ -120,7 +121,7 @@ class GcBackend:
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
 
-        br = P.open_branch(self.stage, ws, pick, drafter_files=dws, sku=sku, ordinal=device)
+        br = P.open_branch(self.stage, ws, pick, drafter_files=dws, sku=sku, ordinal=device, price=price)
         m, b, lad, pf, ids, pol = br.m, br.bucket, got["lad"], got["pf"], got["ids"], got["pol"]
         self.m, self.bucket = m, b
         pol_s = (policy or self._policy(pol)) if self.spec else None

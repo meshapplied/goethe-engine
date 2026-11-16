@@ -64,3 +64,20 @@ def test_driver_and_explicit_sku():
     with pytest.raises(P.PackError, match="--sku a170 does not run on device unknown card: the plan's grid needs 170 SMs"):
         P.pick_sku(man(), dev("12.0", 100), sku="a170")
     assert P.pick_sku(man(), dev("12.0", 188), sku="a84") == "a84"
+
+
+def test_one_signed_pack_file_holds_every_arch(tmp_path, key, mocklib):
+    """One pack per model: buckets of two arches in one signed file (manifest arches); the selector picks per device over the union."""
+    from toypack import toy_pack
+
+    def mut(m):
+        req = dict(m["buckets"][0]["requires"], arch="sm_100a", cc="10.0", sms=148, smem_block=232448, name="b200")
+        m["buckets"] += [dict(b, id=b["id"].replace("mock", "b200"), sku="b200", requires=req) for b in m["buckets"]]
+        m["arches"] = {"sm_100a": dict(platform="cuda", cc="10.0")}
+        m["hw"]["b200"] = m["hw"]["mock"]
+    pack, _, _ = toy_pack(str(tmp_path), key, mocklib, mutate=mut)
+    m = P.verify(pack, trusted=(key.kid,))
+    assert P.arches(m) == {"sm_120a", "sm_100a"}
+    assert P.pick_sku(m, dev("10.0", 148, smem=232448)) == "b200"
+    assert P.pick_sku(m, dev("12.0", 170)) == "mock"
+    assert P.select(m, dev=dev("10.0", 148, smem=232448), B=8)["sku"] == "b200"

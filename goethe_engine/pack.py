@@ -881,14 +881,14 @@ class Branch:
         self.m, self.dev, self.bucket, self.load, self.lib = m, dev, bucket, load, lib
 
 
-def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1):
+def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1, price=None):
     """The one open sequence of every model type: the weights pick their variant by structure (header reads), the manifest is
     restricted to it, pick(m, dev) -> (bucket, [buckets to load], lib bucket) chooses on the device (dev None when sku names the
     SKU), the weights are checked against the variant, only the loaded buckets' blobs are read, and the lib bucket's files are
-    materialized."""
+    materialized. price(sku, dev) -> predicted cost: pick_sku's ranking among fitting SKUs (the probe-lite hook; None: SM count)."""
     m0 = st.manifest
     m = restrict(for_variant(m0, pick_variant(m0, files), pick_variant(m0, drafter_files, "drafter") if drafter_files else None))
-    dev = None if sku else device(None if ordinal < 0 else ordinal)
+    dev = None if sku else dict(device(None if ordinal < 0 else ordinal), **({"price": price} if price else {}))
     b, load, top = pick(m, dev)
     check_weights(m, files, drafter_files)
     st.ensure(load)
