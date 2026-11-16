@@ -14,6 +14,7 @@ from goethe_engine import api, pack as P  # noqa: E402
 from goethe_engine.errors import Refused  # noqa: E402
 from test_embed import mockgce  # noqa: E402,F401 (fixture)
 from test_media import mockgcm  # noqa: E402,F401 (fixture)
+from cf_run import run  # noqa: E402
 
 REAL = os.environ.get("CONF_PACK")
 
@@ -33,26 +34,13 @@ def subject(tmp_path, key, mocklib, mockgce, mockgcm):
             (m[0], m[1], (key.kid,), "mock", "transcribe", True)]
 
 
-def run(m, kind):
-    if kind == "generate":
-        be = m.backend
-        from goethe_engine.backend import Work
-        bl = list(range(-(-40 // be.geometry.block_size))) if be.paged else [0]
-        r = np.asarray(be.step([Work(1, [5, 7, 11, 13], 0, bl, 1)]))
-        be.release(1)
-        return r
-    if kind == "embed":
-        return m.embed([[5, 7, 11, 13], [3]], normalize=False)
-    return np.asarray(m.transcribe([np.linspace(-0.5, 0.5, 1600).astype(np.float32)], m.backend.marker, 8))
-
-
 ISOLATED = r"""
 import json, sys
 import numpy as np
 sys.path.insert(0, {root!r})
 from goethe_engine import api
 sys.path.insert(0, {here!r})
-from test_conformance import run
+from cf_run import run
 pack, ws, tr, sku, kind = json.loads({args!r})
 with api.open(pack, ws, trusted=tuple(tr), sku=sku, device=0) as m:
     assert m.kind == kind
