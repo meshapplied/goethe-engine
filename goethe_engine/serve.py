@@ -199,6 +199,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > MAX_BODY:
+                self.close_connection = True     # the body stays unread: the connection cannot carry another request
+                raise ApiError(413, "body too large", code="invalid_request")
+            raw = self.rfile.read(n)             # read before any refusal, else a kept-alive connection parses it as the next request
             if not self._authed():
                 raise ApiError(401, "invalid api key", "authentication_error")
             if path not in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/audio/transcriptions"):
@@ -207,11 +212,8 @@ class Handler(BaseHTTPRequestHandler):
             want = {"/v1/embeddings": "embedding", "/v1/audio/transcriptions": "encoder-decoder"}.get(path, "decoder")
             if kind != want:
                 raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model", code="unsupported_task")
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_BODY:
-                raise ApiError(413, "body too large", code="invalid_request")
             try:
-                body = json.loads(self.rfile.read(n))
+                body = json.loads(raw)
             except ValueError:
                 raise ApiError(400, "body is not JSON", code="invalid_request")
             if not isinstance(body, dict):
@@ -272,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
             prompt = body.get("prompt")
             if not (isinstance(prompt, list) and prompt and all(isinstance(t, int) for t in prompt)):
                 raise ValueError("prompt must be the decoder's start token ids")
-            params = sampling(dict(body, temperature=0), s, len(prompt))
+            params = sampling(dict({k: v for k, v in body.items() if k != "frames"}, temperature=0), s, len(prompt))
             rid = uuid.uuid4().hex
             q = s.pending[rid] = queue.Queue()
             s.engine.add_request(rid, prompt, params, frames=frames)

@@ -184,3 +184,21 @@ def test_parameter_refusals_have_one_shape(srv):
         e = r["error"]
         assert st == 400 and e["type"] == "invalid_request_error" and e["code"] == code and e["param"] == param and e["message"], body
         assert e["code"] in codes
+
+
+def test_a_refused_request_leaves_a_kept_alive_connection_usable(srv):
+    """A refusal before the body is used (bad key, no route, wrong task) still reads it: the next request on the connection (goethed
+    pools them) is parsed from its own start."""
+    import http.client
+    import urllib.parse
+    u = urllib.parse.urlparse(srv[0])
+    c = http.client.HTTPConnection(u.hostname, u.port, timeout=60)
+    ok = {"Authorization": "Bearer k", "Content-Type": "application/json"}
+    for path, h in (("/v1/embeddings", ok), ("/nope", ok), ("/v1/completions", {"Authorization": "Bearer bad"})):
+        c.request("POST", path, json.dumps(dict(prompt="hi", input=["a"], max_tokens=2)), h)
+        r = c.getresponse()
+        assert r.status in (400, 401, 404) and "error" in json.loads(r.read()), path
+        c.request("POST", "/v1/completions", json.dumps(dict(prompt="hi", max_tokens=2, temperature=0)), ok)
+        r = c.getresponse()
+        assert r.status == 200 and json.loads(r.read())["usage"]["completion_tokens"] == 2, path
+    c.close()
