@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
+r"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
 
   b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len] or [off, len, "xz"]}})  payload
   offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by the sha256 of its raw bytes;
@@ -995,7 +995,7 @@ def materialize(st, b, out=None):
     return out
 
 
-def main(a):
+def parser():
     import argparse
     ap = argparse.ArgumentParser(prog="goethe-engine pack", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
 verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}, and with
@@ -1022,7 +1022,11 @@ prints {"runs": true|false, "sku": the SKU it would run or null, "device": name,
     ap.add_argument("--numerics", default="invariant", choices=NK.CHOICES)
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
-    o = ap.parse_args(a)
+    return ap
+
+
+def main(a):
+    o = parser().parse_args(a)
 
     def files_of(d):
         from .index import model_sets
