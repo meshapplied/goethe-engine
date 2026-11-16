@@ -81,3 +81,28 @@ def test_one_signed_pack_file_holds_every_arch(tmp_path, key, mocklib):
     assert P.pick_sku(m, dev("10.0", 148, smem=232448)) == "b200"
     assert P.pick_sku(m, dev("12.0", 170)) == "mock"
     assert P.select(m, dev=dev("10.0", 148, smem=232448), B=8)["sku"] == "b200"
+
+
+def test_pack_cost_model_ranks_the_fitting_skus(tmp_path, key, mocklib, monkeypatch):
+    """gc_probe / gc_price of the pack's library rank the fitting SKUs (no exact match); perturbing a probed constant flips the pick;
+    a library that declines (no probe) falls back to the most SMs; the probe blob is cached per device, driver, manifest and library."""
+    from toypack import toy_pack
+
+    def mut(m):
+        req = dict(m["buckets"][0]["requires"], sms=100, name="small card")
+        m["buckets"] += [dict(b, id=b["id"].replace("mock", "b2"), sku="b2", requires=req) for b in m["buckets"]]
+        m["hw"]["b2"] = m["hw"]["mock"]
+    pack, _, _ = toy_pack(str(tmp_path), key, mocklib, mutate=mut)
+    st = P.stage(pack, trusted=(key.kid,), defer=True)
+    try:
+        d = dev("12.0", 188, uuid="GPU-1")
+        assert P.pick_sku(st.manifest, dict(d, price=P.lib_price(st, st.manifest))) == "mock"     # unpriced: most SMs (170 > 100)
+        P.PRICE_CACHE.clear()
+        monkeypatch.setenv("GCK_MOCK_PROBE", "9.0,5.0")
+        assert P.pick_sku(st.manifest, dict(d, price=P.lib_price(st, st.manifest))) == "b2"
+        monkeypatch.setenv("GCK_MOCK_PROBE", "4.0,5.0")
+        assert P.pick_sku(st.manifest, dict(d, price=P.lib_price(st, st.manifest))) == "b2"          # cached constants
+        assert P.pick_sku(st.manifest, dict(d, uuid="GPU-2", price=P.lib_price(st, st.manifest))) == "mock"   # another device: probed again
+    finally:
+        st.close()
+        P.PRICE_CACHE.clear()

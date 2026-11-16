@@ -229,6 +229,13 @@ GC_API const char *gc_last_error(gc_handle *h);
 /* Frees everything the handle holds. NULL is accepted. */
 GC_API void gc_close(gc_handle *h);
 
+/* Pricing (optional symbols; a library without them is ranked by the loader's fallback). gc_probe measures the cost constants of a
+ * device once (an opaque blob the library's own cost model reads; it may launch bounded probe kernels, never touches a handle's KV
+ * or weights); GC_E_CAPACITY sets *size. gc_price is host math only: the predicted step of one bucket of this pack on the device the
+ * constants describe. The loader caches the blob by device uuid, driver and manifest sha. Neither needs a handle. */
+GC_API int gc_probe(int device, void *constants, uint64_t cap, uint64_t *size);
+GC_API int gc_price(const void *constants, uint64_t size, const char *bucket_id, double *step_us);
+
 #ifdef __cplusplus
 }
 #endif

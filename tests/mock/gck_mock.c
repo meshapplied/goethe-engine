@@ -190,3 +190,22 @@ GC_API void gc_close(gc_handle *h) {
   for (int i = 0; i < MAXSEQ; i++) free(h->seqs[i].blocks);
   free(h->tok); free(h->rpos); free(h);
 }
+
+/* pricing: GCK_MOCK_PROBE="a,b" -> constants {a, b}; a bucket's step_us is a for sku "mock" ids, b for any other; unset: unsupported */
+GC_API int gc_probe(int device, void *constants, uint64_t cap, uint64_t *size) {
+  (void) device;
+  const char *e = getenv("GCK_MOCK_PROBE");
+  double v[2];
+  if (!e || sscanf(e, "%lf,%lf", &v[0], &v[1]) != 2) return GC_E_UNSUPPORTED;
+  *size = sizeof v;
+  if (cap < sizeof v) return GC_E_CAPACITY;
+  memcpy(constants, v, sizeof v);
+  return GC_OK;
+}
+
+GC_API int gc_price(const void *constants, uint64_t size, const char *bucket_id, double *step_us) {
+  if (size != 2 * sizeof(double)) return GC_E_ARG;
+  const double *v = constants;
+  *step_us = strstr(bucket_id, ".mock.") ? v[0] : v[1];
+  return GC_OK;
+}

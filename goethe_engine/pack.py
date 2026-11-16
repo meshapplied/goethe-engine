@@ -537,7 +537,7 @@ def fits(dev, req, m):
 
 def pick_sku(m, dev, sku=None):
     """The SKU (variant) of the pack to run on dev: among the SKUs whose requires fit dev (fits), the exact (name, SMs) one, else the
-    least dev["price"](sku, dev) (probe-lite lintile price, when the device record carries one), then the most SMs and smem
+    least dev["price"](sku, dev) (the pack's gc_probe / gc_price cost model, lib_price; an unpriced SKU ranks after the priced), then the most SMs and smem
     (fewest idle). No fit: refused with every SKU's reason and what to do instead."""
     req = {}
     for b in m["buckets"]:
@@ -557,7 +557,8 @@ def pick_sku(m, dev, sku=None):
     if exact:
         return exact[0]
     price = dev.get("price")
-    return min(ok, key=lambda s: (price(s, dev) if price else 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
+    us = {s: price(s, dev) if price else None for s in ok}
+    return min(ok, key=lambda s: (us[s] is None, us[s] or 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
 
 
 def device(idx=None):
@@ -901,6 +902,45 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     return v, bs
 
 
+PRICE_CACHE = {}       # (device uuid, driver, manifest sha, library sha) -> cost constants blob (gc_probe)
+
+
+def lib_price(st, m, ordinal=-1):
+    """price(sku, dev) -> predicted step_us of the sku's one-sequence bucket from the pack's own cost model (gc.h gc_probe /
+    gc_price in that bucket's library), or None when the library has no such symbols or declines (pick_sku then ranks by SMs).
+    Libraries are read and loaded only for the SKUs pick_sku asks about; the probe runs once per device and library."""
+    import ctypes as C
+
+    def price(sku, dev):
+        bs = [b for b in m["buckets"] if b["sku"] == sku and b["role"] == "target" and axes(b)[1] != "encode"]
+        if not bs:
+            return None
+        b = min(bs, key=lambda x: (x["ncol"], x["maxctx"], x["id"]))
+        st.ensure([b])
+        path = os.path.join(materialize(st, b), b["lib"])
+        try:
+            L = C.CDLL(path)
+            probe, pr = L.gc_probe, L.gc_price
+        except (OSError, AttributeError):
+            return None
+        probe.restype = pr.restype = C.c_int
+        probe.argtypes = [C.c_int, C.c_void_p, C.c_uint64, C.POINTER(C.c_uint64)]
+        pr.argtypes = [C.c_void_p, C.c_uint64, C.c_char_p, C.POINTER(C.c_double)]
+        key = (dev.get("uuid") or dev.get("name"), dev.get("cuda"), st.manifest_sha256, b["files"].get(b["lib"]))
+        if key not in PRICE_CACHE:
+            n = C.c_uint64()
+            rc = probe(max(ordinal, 0), None, 0, C.byref(n))
+            if rc not in (0, -7):
+                return None
+            buf = C.create_string_buffer(max(n.value, 1))
+            if probe(max(ordinal, 0), buf, n.value, C.byref(n)):
+                return None
+            PRICE_CACHE[key] = buf.raw[:n.value]
+        blob, us = PRICE_CACHE[key], C.c_double()
+        return us.value if pr(blob, len(blob), b["id"].encode(), C.byref(us)) == 0 else None
+    return price
+
+
 class Branch:
     """What every backend opens: the manifest restricted to the weights' variant(s) on this platform, the device record, the chosen
     bucket, the buckets whose blobs are read (ensured) and the materialized library path of the last of them."""
@@ -917,7 +957,7 @@ def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1, pr
     m0 = st.manifest
     m = restrict(for_variant(m0, pick_variant(m0, files, allow_broken=allow_broken),
                              pick_variant(m0, drafter_files, "drafter", allow_broken) if drafter_files else None))
-    dev = None if sku else dict(device(None if ordinal < 0 else ordinal), **({"price": price} if price else {}))
+    dev = None if sku else dict(device(None if ordinal < 0 else ordinal), price=price or lib_price(st, m, ordinal))
     b, load, top = pick(m, dev)
     check_weights(m, files, drafter_files)
     st.ensure(load)
