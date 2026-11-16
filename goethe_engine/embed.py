@@ -14,7 +14,7 @@ import threading
 import numpy as np
 
 from . import pack as P
-from .gc_c import OK, E_CAPACITY, OPEN_NO_CHECK, OpenParams, StepIn, Work, arr
+from .gc_c import OPEN_NO_CHECK, OpenParams, StepIn, Work, arr
 
 L_EMBED = 1 << 4
 S_HOST_LOGITS, S_NORMALIZE = 1, 2
