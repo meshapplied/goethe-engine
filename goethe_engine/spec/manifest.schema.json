@@ -24,7 +24,8 @@
   "arches": {"type": "object", "additionalProperties": {"type": "object", "properties": {"platform": {"type": "string"}, "cc": {"type": "string"}}}},
   "cuda": {"type": "string"},
   "hw": {"type": "object", "additionalProperties": {"type": "string"}},
-  "runtime": {"type": "object", "required": ["kind", "version"], "properties": {"kind": {"type": "string"}, "version": {"type": "integer"}}},
+  "runtime": {"type": "object", "required": ["kind", "version"], "properties": {"kind": {"type": "string"}, "version": {"type": "integer"},
+              "overhead": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}}},
   "contracts": {"type": "array", "items": {"type": "string"}},
   "variants": {
    "type": "object",
@@ -62,7 +63,8 @@
                                  "name": {"type": "string"}}},
      "io": {"type": ["object", "null"], "properties": {"params": {"type": "array", "items": {"type": "string"}}, "media": {"type": "string"}}},
      "provenance": {"type": "object", "properties": {"body": {"type": "string"}}},
-     "resident": {"type": "object"}
+     "resident": {"type": "object", "properties": {"wparts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+                                                  "scratch": {"type": "integer", "minimum": 0}}}
     }
    }
   },

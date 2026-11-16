@@ -119,7 +119,7 @@ class GcBackend:
                 return b, P.ladder(m, b), P.prefill(m, b, plen)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
             # the requested batch, then the narrower batch buckets: the widest whose weights, slots, pool and scratch fit is opened
             widths = [B] + sorted({x["ncol"] for x in m["buckets"] if x["batch"] and x["role"] == "target" and 1 < x["ncol"] < B}, reverse=True)
-            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, what=bl[0]["id"]), widths)
+            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, P.overhead(m, bl[0]["sku"]), bl[0]["id"]), widths)
             load = lad + ([pf] if pf else [])
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
@@ -129,7 +129,7 @@ class GcBackend:
         self.m, self.bucket = m, b
         pol_s = (policy or self._policy(pol)) if self.spec else None
         if not self.spec:   # weights, slots and the smallest pool must fit the device; no pool_blocks: the largest that fits
-            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, what=b["id"])
+            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, b["sku"]), b["id"])
         libpath = br.lib
         self.L = bind(libpath)
         paths = ws + ([None] + dws if dws else [])     # groups: the target's files, a NULL, a drafter's (the runtime finds tensors by name)

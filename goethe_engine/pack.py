@@ -726,9 +726,14 @@ def device_free(idx=None):
         return None
 
 
+def overhead(m, sku):
+    """Device bytes a handle needs beyond its declared parts on this SKU: the manifest's measured runtime.overhead, else 1 GiB."""
+    return ((m.get("runtime") or {}).get("overhead") or {}).get(sku, 1024 * MIB)
+
+
 def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"):
-    """(pool_blocks or None, resident bytes) for opening the ladder lad on a device with free bytes: resident = the ladder's distinct weight
-    sets + fixed regions + slot bytes * (slots + state_pages) + block bytes * pool_blocks, from each bucket's manifest `resident`.
+    """(pool_blocks or None, resident bytes) for opening the ladder lad on a device with free bytes, keeping margin bytes (overhead(m, sku)):
+    resident = the union of the ladder's weight parts + fixed regions + slot bytes * (slots + state_pages) + block bytes * pool_blocks, from each bucket's manifest `resident`.
     pool_blocks None: the largest pool that fits (None when the pack's full pool does, or the pack has no paged KV). Refuses, with
     the numbers, a pack whose weights and smallest pool (one full context) do not fit, or an explicit pool_blocks that does not.
     free None or a bucket without `resident` (an older pack): no check."""
@@ -737,8 +742,9 @@ def fit(lad, state_pages, free, pool_blocks=None, margin=1024 * MIB, what="pack"
         return pool_blocks, None
     i = max((j for j, r in enumerate(rs) if r["block"]), default=len(rs) - 1)   # the pool's owner: the last paged bucket (a prefill bucket after it pages nothing)
     top = rs[i]
-    weights = sum({r["wset"]: r["weights"] for r in rs}.values())
-    # scratch: a bucket's launch workspace (activations, split-K partials) when the manifest declares it; every loaded bucket keeps its own
+    # a handle relays each weight part once across its buckets: the union of the buckets' parts (resident.wparts), else per weight set
+    weights = sum({k: v for r in rs for k, v in (r.get("wparts") or {r["wset"]: r["weights"]}).items()}.values())
+    # scratch: a bucket's launch workspace when the manifest declares it (runtime.overhead covers it otherwise)
     base = weights + sum(r["fixed"] + r.get("scratch", 0) for r in rs) + top["slot"] * (top["slots"] + state_pages)
     blk, rows = top["block"], top["block_rows"]
     per_seq = lad[i]["maxctx"] // rows if rows else 0

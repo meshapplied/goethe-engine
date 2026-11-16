@@ -61,3 +61,20 @@ def test_open_steps_down_to_the_widest_ladder_that_fits(tmp_path, key, mocklib, 
     with pytest.raises(OutOfMemory) as e:
         GcBackend(pack, w, B=8, sku="mock", trusted=(key.kid,))
     assert e.value.code == "oom" and "B 8:" in str(e.value) and "B 2:" in str(e.value)
+
+
+def test_weights_are_the_union_of_parts_and_the_margin_is_the_measured_overhead():
+    """A handle relays each weight part once: two buckets sharing part a count it once (resident.wparts); without wparts each weight set
+    counts once. The kept margin is the manifest's runtime.overhead for the SKU, else 1 GiB."""
+    G = 1 << 30
+    r = lambda parts, w, ws: dict(ncol=2, maxctx=4096, resident=dict(weights=w, wset=ws, wparts=parts, fixed=0, slot=0, block=0,
+                                                                      slots=2, block_rows=0))
+    lad = [r(dict(a=2 * G, b=G), 3 * G, "x"), r(dict(a=2 * G, c=G), 3 * G, "y")]
+    assert P.fit(lad, 0, 10 * G, margin=0)[1] == 4 * G                     # union a + b + c, not 3 + 3
+    lad2 = [dict(b, resident={k: v for k, v in b["resident"].items() if k != "wparts"}) for b in lad]
+    assert P.fit(lad2, 0, 10 * G, margin=0)[1] == 6 * G                    # two weight sets without parts
+    m = dict(runtime=dict(kind="gc-c", version=1, overhead=dict(s1=2 * G)))
+    assert P.overhead(m, "s1") == 2 * G and P.overhead(m, "s2") == G and P.overhead({"runtime": {}}, "s1") == G
+    with pytest.raises(P.PackError):
+        P.fit(lad, 0, 5 * G, margin=P.overhead(m, "s1"))                   # 4 GiB parts + 2 GiB overhead > 5 GiB free
+    assert P.fit(lad, 0, 6 * G, margin=P.overhead(m, "s1"))[1] == 4 * G
