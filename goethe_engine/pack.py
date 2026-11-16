@@ -1008,8 +1008,10 @@ need reads a PREFIX file (the first bytes of a pack: 16 bytes, the header, the m
 once the ranges are fetched, and the caller compares manifest_sha256 with the index entry's.
 Exit 0 ok; 1 refused (signature missing or bad, key id not pinned, container malformed, a needed blob missing or not hashing to its name,
 ABI major not 3, runtime not run here, --arch differs, no variant has the model's structure), reason on stderr.
+runs (signature and manifest only: no blob, no weights, no model load) asks whether the visible device runs one of the pack's SKUs and
+prints {"runs": true|false, "sku": the SKU it would run or null, "device": name, "sms": N, "why": the reason or null}: exit 0 runs, 3 not.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1054,8 +1056,19 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
                                   **({"store": [h for h in hs if h not in blobs]} if v == 4 else {}))))   # pack 4: fetch these by hash
             return
         st = stage(o.file, o.sig, arch=o.arch, defer=True, overlays=o.overlay, store=o.store)
-    except PackError as e:
+        if o.cmd == "runs":
+            m = st.manifest
+            st.close()
+            dev = device()
+    except (PackError, OSError, subprocess.CalledProcessError) as e:
         sys.exit(f"pack: REFUSED: {e}")
+    if o.cmd == "runs":
+        try:
+            sku, why = pick_sku(m, dev, o.sku), None
+        except PackError as e:
+            sku, why = None, str(e)
+        print(json.dumps(dict(runs=sku is not None, sku=sku, device=dev["name"], sms=dev["sms"], why=why)))
+        sys.exit(0 if sku else 3)
     try:
         m = st.manifest
         if o.cmd == "verify":
