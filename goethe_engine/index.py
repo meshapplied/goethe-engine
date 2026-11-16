@@ -143,8 +143,7 @@ def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):
     return sorted(hit, key=lambda e: (RT_PREF.get(e["runtime"]["kind"], 9), e["tier"], e["manifest_sha256"]))
 
 
-def main(argv, trusted=None):
-    """`index verify` and `pack match`: exit 0 ok, 1 refused (signature, key, schema, rollback, expiry), 3 no pack."""
+def parser():
     ap = argparse.ArgumentParser(prog="goethe-engine", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
 Commands (cmd = verify for `index verify`, match for `pack match`); offline, JSON on stdout.
   index verify  -> {"serial", "expires", "keyid", "entries"}
@@ -165,7 +164,12 @@ Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last
     ap.add_argument("--model-dir")
     ap.add_argument("--tier")
     ap.add_argument("--engine-version", default=__version__)
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv, trusted=None):
+    """`index verify` and `pack match`: exit 0 ok, 1 refused (signature, key, schema, rollback, expiry), 3 no pack."""
+    a = parser().parse_args(argv)
     try:
         ix, kid = verify(pack.read_capped(a.index), pack.read_capped(a.sig, sign.MAX_SIG) if os.path.lexists(a.sig) else None,
                          a.last_serial, when(a.now, "--now") if a.now else None, trusted)
