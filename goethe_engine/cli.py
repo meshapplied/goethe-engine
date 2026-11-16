@@ -1,4 +1,4 @@
-"""goethe-engine: serve | worker | index verify | pack match|verify|show."""
+"""goethe-engine: serve | worker | index verify | pack match|verify|show|need|runs."""
 import sys
 
 USAGE = """usage: goethe-engine serve [--host H --port P --context-length N --max-running-requests N --served-model-name S
@@ -8,6 +8,7 @@ USAGE = """usage: goethe-engine serve [--host H --port P --context-length N --ma
        goethe-engine pack match --index F --sig F --model-dir DIR --arch sm_XX [--last-serial N] [--tier T]
        goethe-engine pack need PREFIX --model-dir DIR [--arch sm_XX --sku S --numerics ..]
        goethe-engine pack verify FILE [--sig F] [--overlay O]... [--arch sm_XX] [--partial --model-dir DIR] | pack show FILE [--sig F]
+       goethe-engine pack runs FILE [--sig F]     (does the visible device run this pack: one JSON line; exit 0 yes, 3 no, 1 error)
        goethe-engine --version"""
 
 
@@ -32,7 +33,7 @@ def main(argv=None):
     if a[:2] == ["index", "verify"] or a[:2] == ["pack", "match"]:
         from . import index
         return index.main(a[1:])
-    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["need"]):
+    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["need"], ["runs"]):
         from . import pack
         pack.main(a[1:])
         return 0

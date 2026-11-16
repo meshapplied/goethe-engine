@@ -12,4 +12,6 @@ def run(m, kind):
         return r
     if kind == "embed":
         return m.embed([[5, 7, 11, 13], [3]], normalize=False)
-    return np.asarray(m.transcribe([np.linspace(-0.5, 0.5, 400).astype(np.float32)], m.backend.marker, 8))
+    be = m.backend
+    n = max(400, min((be.rate or 0) // 10, 4 * (be.bucket["maxctx"] - 16)))   # 100 ms at the bucket rate inside the context: real encoders refuse 25 ms
+    return np.asarray(m.transcribe([np.linspace(-0.5, 0.5, n).astype(np.float32)], be.marker, 8))

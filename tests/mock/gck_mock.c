@@ -93,6 +93,8 @@ static int spec_step(gc_handle *h, const gc_step_in *in, gc_step_out *o) {
 GC_API int gc_step(gc_handle *h, const gc_step_in *in, gc_step_out *o) {
   if (!h || !in || !o || !in->n_work) return GC_E_ARG;
   if (h->spec) return spec_step(h, in, o);
+  const char *lm = getenv("GCK_MOCK_LAUNCH_MAX");   /* a launch of more columns cannot get its device memory */
+  if (lm && in->n_work > (uint32_t)atoi(lm)) return fail(h, GC_E_DEVICE, "launch: out of memory");
   int greedy = 1; uint32_t rows = 0, frows = 0;
   for (uint32_t i = 0; i < in->n_work; i++) {
     const gc_work *w = in->work[i];

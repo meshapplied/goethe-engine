@@ -57,6 +57,7 @@
      "platform": {"type": "string"}, "kind": {"type": "string"}, "mesh": {"type": "object"},
      "determinism": {"type": "string"}, "act": {}, "kv": {"type": "string"},
      "prefill": {"type": "integer", "minimum": 1}, "form": {"enum": ["chain", "seq"]},
+     "needs": {"type": "array", "uniqueItems": true, "items": {"enum": ["cublas"]}},
      "step_us": {"type": "number", "minimum": 0}, "step_us_kv": {"type": "array", "items": {"type": "array"}},
      "requires": {"type": "object", "required": ["arch", "sms"],
                   "properties": {"arch": {"type": "string"}, "cc": {"type": "string"}, "sms": {"type": "integer"}, "smem_block": {"type": "integer"},

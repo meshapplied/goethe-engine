@@ -534,7 +534,7 @@ def build(args):
         tok = HFTokenizer(tdir)
         if mo.type == "decoder":
             mo.runner.eos = set(tok.eos_ids)        # the pack opens (and is verified) before the tokenizer is read
-        ctx = args.context_length or mo.backend.max_len
+        ctx = mo.cfg.max_model_len if mo.cfg else args.context_length or mo.backend.max_len   # clamped to the handle's limit
         return mo.runner, tok, ctx
     seqs = min(args.max_running_requests or be.max_seqs, be.max_seqs)
     eng = registry.runner(be, Config(max_num_seqs=seqs, max_model_len=ctx, kv_dtype="f16" if args.kv == "auto" else args.kv, prefix_cache=getattr(be, "prefix_cache", True)),
