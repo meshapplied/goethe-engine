@@ -257,6 +257,7 @@ class MediaRunner:
         lim = self.be.bucket["maxctx"]
         P.need(not self.be.can_decode or n + max_tokens <= lim, f"prompt and media take {n} positions, with max_new_tokens {max_tokens} more than the context {lim} "
                                      "(shorter audio or fewer new tokens)")
+        self.last_input = n                    # prompt + media positions of the last request (usage metering)
         return self.be.decode(chunks, max_tokens)
 
     def numerics(self):

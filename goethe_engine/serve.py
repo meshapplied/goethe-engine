@@ -312,6 +312,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt = s.engine.text.render(s.engine.be.marker + instr)
                 ids = s.engine.transcribe([pcm], prompt, max_new)
                 text = s.engine.text.detokenize(ids)
+                usage = dict(input_tokens=s.engine.last_input, output_tokens=len(ids), total_tokens=s.engine.last_input + len(ids))
         except P_.PackError as e:
             raise ApiError(400, str(e), code=e.code)
         if fmt == "text":
@@ -319,10 +320,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
+            self.send_header("X-Usage", json.dumps(usage))          # a text reply carries its usage in a header
             self.end_headers()
             self.wfile.write(b)
             return
-        self._json(200, dict(text=text))
+        self._json(200, dict(text=text, usage=usage))
 
     # --- transcriptions (encoder-decoder)
     def _transcribe(self, body):

@@ -163,6 +163,8 @@ def test_openai_transcriptions_route(tmp_path, key, mockgcm, monkeypatch):
         r = J.loads(b)
         # prompt "[<m>hi]" -> text chunks "[" and "hi]", one audio chunk of 4 rows; mock decode ids -> pieces
         assert st == 200 and isinstance(r["text"], str) and len(r["text"]) > 0
+        assert r["usage"]["input_tokens"] == 1 + 4 + 3 and r["usage"]["output_tokens"] > 0     # "[" + 4 rows + "hi]"
+        assert s.engine.be.files == ws                                     # both listed weights are targets, none a drafter
         st, b = post(dict(model="x", response_format="text"), open(w, "rb").read())
         assert st == 200 and b.decode() == r["text"]
         for fields, code, param in ((dict(temperature="0.7"), "unsupported_parameter", "temperature"),
