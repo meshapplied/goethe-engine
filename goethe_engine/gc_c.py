@@ -231,22 +231,30 @@ class GcBackend:
         print(f"goethe-engine: {note}", file=sys.stderr, flush=True)
 
     def _warm(self):
-        """One step of every loaded bucket (k one-token sequences per ladder width k; a 2-token prompt through a loaded prefill chain), so a
-        launch that cannot get its device memory (local memory, workspace: not in the manifest's resident) fails at open, not on a request.
-        warm_bytes: the device memory those launches took."""
-        f0, n = P.device_free(self.device), min(self.max_seqs, self.geometry.num_blocks)
-        steps = [[W(i + 1, [0], 0, [i], 1) for i in range(min(k, n))] for k in sorted({x["ncol"] for x in self.ladder})]
-        if self.pf:
-            steps.append([W(1, [0, 0], 0, [0], 1)])
-        for ws in steps:
-            try:
-                self.step(ws)
-            finally:
-                for w in ws:
-                    try:
-                        self.release(w.sid)
-                    except (RuntimeError, P.OutOfMemory):
-                        pass
+        """One step of every loaded bucket at the first and at the last positions of the context (k one-token sequences per ladder width
+        k; a 2-token prompt through a loaded prefill chain), so a launch that cannot get its device memory (local memory, workspace: not
+        in the manifest's resident; a long-position step variant) fails at open, not on a request. warm_bytes: the memory they took.
+        Only an out-of-memory refusal counts at the last positions (a runtime may refuse a fresh sequence there for other reasons)."""
+        f0, n, L = P.device_free(self.device), min(self.max_seqs, self.geometry.num_blocks), self.layout.max_ctx
+        bs, nb = self.geometry.block_size, self.geometry.num_blocks
+        full = list(range(min(nb, -(-L // bs))))              # one context's block table, shared: the rows are scratch
+        blocks = (lambda i: full) if self.paged else (lambda i: [i])
+        for pos in (0, L - 3):
+            steps = [[W(i + 1, [0], pos, blocks(i), 1) for i in range(min(k, n))] for k in sorted({x["ncol"] for x in self.ladder})]
+            if self.pf:
+                steps.append([W(1, [0, 0], pos, blocks(0), 1)])
+            for ws in steps:
+                try:
+                    self.step(ws)
+                except RuntimeError:
+                    if not pos:
+                        raise
+                finally:
+                    for w in ws:
+                        try:
+                            self.release(w.sid)
+                        except (RuntimeError, P.OutOfMemory):
+                            pass
         f1 = P.device_free(self.device)
         self.warm_bytes = f0 - f1 if f0 is not None and f1 is not None else None
         self.stats["steps"] = 0
