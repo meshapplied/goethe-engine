@@ -1,0 +1,73 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "title": "gc-pack manifest (pack ABI 3.x / 4.x)",
+ "description": "Versioning: abi is MAJOR.MINOR.PATCH; a minor only adds optional fields and enum values (readers ignore unknown fields and skip buckets with unknown enum values); a major may change anything and a reader refuses another major. model.name is required from minor 1. Signed: the digest is sha256(domain + manifest bytes), domain gc-pack-3 or gc-pack-4 by the container magic.",
+ "type": "object",
+ "required": ["schema", "abi", "compiler", "model", "arch", "cuda", "hw", "runtime", "contracts", "buckets", "variants"],
+ "properties": {
+  "schema": {"enum": ["gc-pack"]},
+  "abi": {"type": "string", "pattern": "[0-9]+\\.[0-9]+\\.[0-9]+"},
+  "compiler": {"type": "object", "properties": {"commit": {"type": "string"}, "dirty": {"type": "boolean"}}},
+  "model": {
+   "type": "object", "required": ["weights"],
+   "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "type": {"enum": ["decoder", "embedding", "encoder-decoder", "media"]},
+    "weights": {"type": "array", "items": {"type": "object", "required": ["file"],
+                "properties": {"file": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}, "sha256": {"type": "string"}}}},
+    "limits": {"type": "array", "items": {"type": "object", "required": ["maxctx", "why"],
+               "properties": {"maxctx": {"type": "integer", "minimum": 1}, "why": {"type": "string"}}}},
+    "graph_sha256": {"type": "string"}
+   }
+  },
+  "arch": {"type": "string"},
+  "arches": {"type": "object", "additionalProperties": {"type": "object", "properties": {"platform": {"type": "string"}, "cc": {"type": "string"}}}},
+  "cuda": {"type": "string"},
+  "hw": {"type": "object", "additionalProperties": {"type": "string"}},
+  "runtime": {"type": "object", "required": ["kind", "version"], "properties": {"kind": {"type": "string"}, "version": {"type": "integer"}}},
+  "contracts": {"type": "array", "items": {"type": "string"}},
+  "variants": {
+   "type": "object",
+   "additionalProperties": {
+    "type": "object", "required": ["structure", "weights"],
+    "properties": {
+     "structure": {"type": "object", "required": ["sha256", "keys", "kv", "tensors"],
+                   "properties": {"sha256": {"type": "string", "pattern": "[0-9a-f]{64}"}, "keys": {"type": "array"}, "kv": {"type": "object"},
+                                  "tensors": {"type": "array"}}},
+     "weights": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+     "desc": {"type": "object", "properties": {"format": {"type": "string"}, "quant": {"type": "string"}, "registry_key": {"type": "string"},
+                                              "broken": {"type": "string"}}},
+     "pins": {"type": "object", "properties": {"capture": {}, "reference": {}}}
+    }
+   }
+  },
+  "buckets": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": ["id", "role", "variant", "sku", "contract", "ncol", "batch", "maxctx", "files", "lib", "requires"],
+    "properties": {
+     "id": {"type": "string"}, "role": {"enum": ["target", "drafter"]}, "variant": {"type": "string"}, "sku": {"type": "string"},
+     "contract": {"type": "string"}, "contract_rev": {"type": "integer", "minimum": 1},
+     "ncol": {"type": "integer", "minimum": 1}, "batch": {"type": "boolean"}, "maxctx": {"type": "integer", "minimum": 1},
+     "weights": {"type": "integer", "minimum": 0},
+     "files": {"type": "object", "additionalProperties": {"type": "string", "pattern": "[0-9a-f]{64}"}},
+     "lib": {"type": "string"}, "plan": {"type": "string"},
+     "platform": {"type": "string"}, "kind": {"type": "string"}, "mesh": {"type": "object"},
+     "determinism": {"type": "string"}, "act": {}, "kv": {"type": "string"},
+     "prefill": {"type": "integer", "minimum": 1}, "form": {"enum": ["chain", "seq"]},
+     "step_us": {"type": "number", "minimum": 0}, "step_us_kv": {"type": "array", "items": {"type": "array"}},
+     "requires": {"type": "object", "required": ["arch", "sms"],
+                  "properties": {"arch": {"type": "string"}, "cc": {"type": "string"}, "sms": {"type": "integer"}, "smem_block": {"type": "integer"},
+                                 "name": {"type": "string"}}},
+     "io": {"type": ["object", "null"], "properties": {"params": {"type": "array", "items": {"type": "string"}}, "media": {"type": "string"}}},
+     "provenance": {"type": "object", "properties": {"body": {"type": "string"}}},
+     "resident": {"type": "object"}
+    }
+   }
+  },
+  "spec": {"type": "array", "items": {"type": "object", "required": ["target", "drafter", "policy"],
+           "properties": {"policy": {"type": "object", "required": ["kind"], "properties": {"kind": {"type": "string"}}}}}},
+  "blob_raw": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}}
+ }
+}

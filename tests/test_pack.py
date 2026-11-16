@@ -642,3 +642,17 @@ def test_manifest_limits_desc_broken_and_name(tmp_path, key, mocklib):
     pack, _, _ = toy_pack(str(tmp_path / "c"), key, mocklib, mutate=noname)
     with pytest.raises(P.PackError, match="model.name"):
         P.verify(pack, trusted=(key.kid,))
+
+
+def test_manifest_schema_describes_the_packs_the_loader_reads(tmp_path, key, mocklib):
+    """spec/manifest.schema.json accepts the manifests the loader accepts (toy packs: decoder, spec pair) and catches a broken one."""
+    import json as J
+    import os as O
+    from goethe_engine import params
+    sch = J.load(open(O.path.join(params.SPEC, "manifest.schema.json")))
+    for spec in (False, True):
+        pack, _, _ = toy_pack(str(tmp_path / str(spec)), key, mocklib, spec=spec)
+        m = P.verify(pack, trusted=(key.kid,))
+        assert params.errors(sch, m, "m") == []
+    bad = dict(m, buckets=[dict(m["buckets"][0], files={"lib": "nothex"})])
+    assert any("must match" in e for e in params.errors(sch, bad, "m"))
