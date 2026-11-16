@@ -89,8 +89,16 @@ class Model:
     def generate(self, prompts, max_tokens=64, **params):
         """Per prompt (a token id list) the generated ids; greedy unless params say otherwise (spec/params/generate.schema.json)."""
         self._need("generate")
-        sp = self.sampling(max_tokens=max_tokens, **params)
-        return [o[0] for o in self.runner.generate([(list(p), sp) for p in prompts])]
+        sp, r = self.sampling(max_tokens=max_tokens, **params), self.runner
+        out = {}
+        for i, p in enumerate(prompts):
+            r.add_request(i, list(p), sp)
+        while r.has_work():
+            for o in r.step():
+                if o.finish_reason == "error":         # a failed step (device error, no valid token) is raised, never an empty result
+                    raise RuntimeError(f"request {o.rid}: {o.error or 'error'}")
+                out.setdefault((o.rid, o.index), []).extend(o.token_ids)
+        return [out.get((i, 0), []) for i in range(len(prompts))]
 
     def embed(self, items, normalize=True, **params):
         """float32 rows of token lists (spec/params/embed.schema.json): dimensions keeps the leading components (then normalizes),

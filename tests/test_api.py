@@ -88,3 +88,14 @@ def test_request_parameters_are_checked_against_the_task_and_the_pack(tmp_path, 
     with api.open(epack, ew, device=0, sku="mock", trusted=(key.kid,)) as m:
         assert m.embed([[1, 2, 3]], normalize=False, dimensions=2).tolist() == [[6, 3]]
         assert abs(float((m.embed([[1, 2, 3]], dimensions=2) ** 2).sum()) - 1) < 1e-6
+
+
+def test_a_failed_request_raises(tmp_path, key, mocklib):
+    """A step error (finish_reason error) is raised by generate, never returned as an empty token list."""
+    pack, w, _ = toy_pack(str(tmp_path), key, mocklib)
+    with api.open(pack, w, B=2, sku="mock", trusted=(key.kid,)) as m:
+        def boom(work):
+            raise RuntimeError("launch: out of memory")
+        m.backend.step = boom
+        with pytest.raises(RuntimeError, match="out of memory"):
+            m.generate([[1, 2, 3]], 4)
