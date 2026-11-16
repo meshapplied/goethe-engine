@@ -4,7 +4,8 @@ platform  a device family and its runtime (Platform: backend factory, device que
           the most devices a mesh may span): cuda (gc-c, abi/gc.h) now; rocm, vulkan, metal are registered stubs that refuse
 model type  how a model is served: decoder (Engine: prefill, decode, speculative rounds), embedding (EmbedRunner: one pooled encoder
           pass per sequence, no decode loop), encoder-decoder (Seq2SeqRunner: the encoder once per sequence into a cross KV pool, then
-          the Engine loop; whisper-style ASR, nemotron speech)
+          the Engine loop; whisper-style ASR, nemotron speech), media (MediaRunner: prompt chunks, media items encoded into rows by the
+          pack's media library, then the decode)
 mesh      devices and parallel axes (dp tp pp ep sp); the API takes a mesh everywhere, one device is the only size served now
 
 A new platform, model type or parallel axis is one entry here plus its module; nothing else names them."""
@@ -21,6 +22,9 @@ def _gc_c(pack, weights, *, mesh, model_type="decoder", **kw):
     if model_type == "embedding":
         from .embed import GcEmbed
         return GcEmbed(pack, weights, device=mesh.devices[0], **kw)
+    if model_type == "media":
+        from .media import GcMedia
+        return GcMedia(pack, weights, device=mesh.devices[0], **kw)
     if model_type == "encoder-decoder":
         from .seq2seq import GcSeq2Seq
         return GcSeq2Seq(pack, weights, device=mesh.devices[0], **kw)
@@ -60,8 +64,13 @@ def _seq2seq(backend, cfg, **kw):
     return Seq2SeqRunner(backend, cfg, **kw)
 
 
+def _media(backend, cfg, **kw):
+    from .media import MediaRunner
+    return MediaRunner(backend, cfg)
+
+
 PLATFORMS = {"cuda": Platform(_gc_c, P.device, P.device_free, _cuda_available), "rocm": None, "vulkan": None, "metal": None}  # None: planned
-MODEL_TYPES = {"decoder": _decoder, "encoder-decoder": _seq2seq, "embedding": _embedding}  # model.type -> runner factory (None: planned)
+MODEL_TYPES = {"decoder": _decoder, "encoder-decoder": _seq2seq, "embedding": _embedding, "media": _media}  # model.type -> runner factory (None: planned)
 
 
 @dataclass(frozen=True)
@@ -153,7 +162,8 @@ def model_type(m):
 def runner(backend, cfg, **kw):
     """The serving loop of the backend's model type (a backend without a manifest, the reference model, is a decoder)."""
     m = getattr(backend, "m", None)          # GcBackend: its manifest; the reference backend: a model object
-    t = "embedding" if hasattr(backend, "embed") else "encoder-decoder" if hasattr(backend, "encode") else \
+    t = "embedding" if hasattr(backend, "embed") else "media" if hasattr(backend, "encode_audio") else \
+        "encoder-decoder" if hasattr(backend, "encode") else \
         model_type(m if isinstance(m, dict) else None)
     if MODEL_TYPES[t] is None:
         raise _planned("model type", t, [k for k, v in MODEL_TYPES.items() if v])
