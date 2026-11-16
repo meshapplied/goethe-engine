@@ -3,7 +3,7 @@
 structure(paths, keys=None) is the canonical sha256 over (a) the metadata values of `keys` (GGUF KV keys, or config.json keys as
 dotted paths) and (b) the tensor table: name, shape and element type (GGUF) or dtype (safetensors), plus for a safetensors checkpoint
 its quantization config; the table is sorted, so tensor order, file order and data alignment do not matter. Weight bytes are never
-read: GGUF and safetensors headers only. `keys` is the list a pack was compiled with (what the compiler's capture read); None
+read: GGUF and safetensors headers only. `keys` is the list a pack was compiled with (what the pack builder's capture read); None
 hashes the tensor table alone.
 
   paths: a model directory (every *.safetensors in it, plus config.json and hf_quant_config.json) or a list of files

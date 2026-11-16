@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
+r"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
 
   b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len] or [off, len, "xz"]}})  payload
   offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by the sha256 of its raw bytes;
@@ -22,7 +22,7 @@ arches (a new GPU arch or quant format) without touching or re-signing the base.
 
 Pack 4 (b"GCPACK4\n", manifest abi 4.x, signed over sha256(b"gc-pack-4\n" + manifest bytes)): the same container with the blobs outside
 it, in a content-addressed store (Store: open(sha256) -> the stored bytes as a file and their entry; DirStore: a directory of <sha256>.xz
-or <sha256>, the private gated store's download cache; a network transport is another Store). Every blob a v4 bucket names has its raw
+or <sha256>, a download cache; a network transport is another Store). Every blob a v4 bucket names has its raw
 size pinned in the signed manifest; a store blob is checked exactly as an embedded one (pin, xz limits, hash). The magic fixes the major:
 a v4 file with an abi 3 manifest, or the reverse, is refused, so a signature never carries across.
 
@@ -620,7 +620,7 @@ def rev(b):
 
 def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
     """The bucket a handle that serves one sequence runs: among the buckets `select` returns for B 1 (one per contract, or just
-    `contract`), the one with the least predicted step (bucket field step_us, the compiler's S2 price); a bucket without a price is
+    `contract`), the one with the least predicted step (bucket field step_us, the pack builder's price); a bucket without a price is
     not ranked, and without any price the 1 column non-batch bucket if the pack has one, else None (the caller takes the batch
     ladder). Contract names stay opaque; a handle keeps the one contract of its bucket, so a bucket that is not batch invariant
     (batch_invariant false) is only ever chosen here, for a handle of one sequence."""
@@ -868,8 +868,8 @@ def pick_variant(m, files, role="target", allow_broken=False):
                                          "opens it for debugging)")
         return v
     raise PackError(f"{files}: not a model this pack was compiled for ({'; '.join(why) or 'no ' + role + ' buckets'}). Other weights "
-                    "of this architecture: build a variant for them (gc pack with the generated-QDesc path for a new format), then "
-                    "pass that pack or overlay")
+                    "of this architecture: build a variant for them, then pass that pack "
+                    "or overlay")
 
 
 def ctx_limit(m, ctx=None):
@@ -995,7 +995,7 @@ def materialize(st, b, out=None):
     return out
 
 
-def main(a):
+def parser():
     import argparse
     ap = argparse.ArgumentParser(prog="goethe-engine pack", formatter_class=argparse.RawDescriptionHelpFormatter, description=__doc__ + """
 verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}, and with
@@ -1022,7 +1022,11 @@ prints {"runs": true|false, "sku": the SKU it would run or null, "device": name,
     ap.add_argument("--numerics", default="invariant", choices=NK.CHOICES)
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
-    o = ap.parse_args(a)
+    return ap
+
+
+def main(a):
+    o = parser().parse_args(a)
 
     def files_of(d):
         from .index import model_sets

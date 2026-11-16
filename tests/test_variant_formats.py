@@ -38,7 +38,7 @@ def checkpoint(d, algo="NVFP4"):
 def test_gguf_and_checkpoint_variants_of_one_pack(tmp_path, key, mocklib):
     shards = checkpoint(str(tmp_path / "ck"))
 
-    def st_variant(m):          # variant "alt" is the checkpoint's (a gc pack --variants GGUF,ST pack)
+    def st_variant(m):          # variant "alt" is the checkpoint's (a pack built with a GGUF and a safetensors variant)
         m["variants"]["alt"]["structure"] = structure.describe(shards, ["rope_theta"])
     pack, w, _ = toy_pack(str(tmp_path), key, mocklib, alt=True, mutate=st_variant)
     m = P.verify(pack, trusted=(key.kid,))

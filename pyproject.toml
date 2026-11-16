@@ -17,7 +17,7 @@ ref = ["torch"]            # the CPU / torch reference backends and host drafter
 serve = ["transformers"]
 worker = ["protobuf>=4"]       # worker protocol v1 (spec/proto/worker.proto)
 grammar = ["xgrammar"]
-test = ["pytest", "torch"]
+test = ["pytest", "pytest-timeout", "pytest-xdist", "jsonschema", "torch"]
 
 [project.scripts]
 goethe-engine = "goethe_engine.cli:main"
@@ -31,3 +31,9 @@ goethe_engine = ["spec/*.json", "spec/params/*.json", "spec/proto/*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["gpu: needs a GPU box and a real pack"]
+
+[tool.ruff.lint]
+select = ["E9", "F"]   # syntax errors and pyflakes: real bugs only
+
+[tool.ruff.lint.per-file-ignores]
+"tests/conformance/test_conformance.py" = ["F811"]   # fixtures imported by name, then requested by argument

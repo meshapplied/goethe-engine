@@ -648,7 +648,7 @@ def test_manifest_limits_desc_broken_and_name(tmp_path, key, mocklib):
     be = GcBackend(pack, w, sku="mock", trusted=(key.kid,))
     assert be.max_len == 100 and be.limit[0] == 100
     be.close()
-    with pytest.raises(P.PackError, match=r"variant q4 \[gguf q4_0 \(toy\)\].*generated-QDesc"):
+    with pytest.raises(P.PackError, match=r"variant q4 \[gguf q4_0 \(toy\)\].*build a variant for them"):
         GcBackend(pack, dw, sku="mock", trusted=(key.kid,))
 
     def broken(m):

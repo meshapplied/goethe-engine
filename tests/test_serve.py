@@ -111,7 +111,7 @@ def test_concurrent_requests_batch_and_match_alone(srv):
     prompts = [f"prompt number {i}" for i in range(6)]
     body = lambda p: dict(prompt=p, max_tokens=10, temperature=0)
     alone = [call(base, "/v1/completions", body(p))[1]["choices"][0]["text"] for p in prompts]
-    peak, got = [0], [None] * 6
+    got = [None] * 6
     steps0 = s.engine.metrics()["steps"]
 
     def go(i):
