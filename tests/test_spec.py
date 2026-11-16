@@ -90,7 +90,7 @@ def test_recurrent_target_tree_verify_commits_the_state_of_the_accepted_node():
     for drafter in (TreeDrafter(DraftLM(m), "dynamic", topk=2, depth=3), TreeDrafter(DraftLM(m), "chain"),
                     NgramDrafter()):
         be = TorchBackend(m, 40, 2)
-        cm = Commits(be)
+        Commits(be)
         eng = Engine(be, Config(max_num_seqs=3, max_num_batched_tokens=9, spec_k=5, prefix_cache=False),
                      drafter=drafter)
         for i, p in enumerate(ref_prompts()):

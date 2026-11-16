@@ -3,8 +3,7 @@ import random
 import pytest
 import torch
 
-from goethe_engine import Config, Engine, KVGeometry, SamplingParams
-from goethe_engine.ref import RefModel, TorchBackend
+from goethe_engine import Config, Engine, KVGeometry
 from goethe_engine.spec import depths, path
 
 V = 53

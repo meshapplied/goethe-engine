@@ -2,8 +2,6 @@
 streamed, equal to the engine), embed, transcribe, parameter errors with codes, cancel, health, metrics, unload; the descriptor set is
 the compiled proto. Needs the protobuf runtime (the [worker] extra)."""
 import json
-import os
-import subprocess
 import threading
 
 import numpy as np
