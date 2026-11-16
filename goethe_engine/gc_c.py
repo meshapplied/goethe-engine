@@ -80,21 +80,39 @@ def arr(ctype, xs):
     return (ctype * len(xs))(*xs)
 
 
+def forced(m, dev, bid):
+    """(ladder, prefill bucket) that runs manifest bucket bid: a batch bucket with its ladder, a one-column stream bucket alone, a prefill
+    bucket beside the narrowest batch ladder of its sku, contract, role, maxctx and revision; refused when bid is not in this branch
+    or does not run on the device."""
+    by = {b["id"]: b for b in m["buckets"]}
+    P.need(bid in by, f"bucket {bid} is not in the branch these weights select ({sorted(by)})")
+    b = by[bid]
+    if dev is not None:
+        why = P.fits(dev, b["requires"], m)
+        P.need(not why, f"bucket {bid} does not run on {dev.get('name')}: {why}")
+    if b.get("prefill"):
+        base = [x for x in m["buckets"] if x["batch"] and all(x[k] == b[k] for k in ("sku", "contract", "role", "maxctx")) and P.rev(x) == P.rev(b)]
+        P.need(base, f"prefill bucket {bid} has no batch ladder of its contract beside it")
+        return P.ladder(m, min(base, key=lambda x: x["ncol"])), b
+    return (P.ladder(m, b) if b["batch"] else [b]), None
+
+
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="invariant", act="auto", kv="auto", store=None, plen=None, price=None, allow_broken=False):
-        """store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
+                 numerics="invariant", act="auto", kv="auto", store=None, plen=None, price=None, allow_broken=False, bucket=None):
+        """bucket: open exactly this manifest bucket id (verification: a batch bucket with its ladder, a stream bucket alone, a prefill
+        bucket beside the narrowest batch ladder of its contract) instead of selecting. store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
             self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen,
-                       price, allow_broken)
+                       price, allow_broken, bucket)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None, allow_broken=False):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None, allow_broken=False, bucket=None):
         lim = P.ctx_limit(self.stage.manifest, ctx)       # a model limit refuses a longer context before anything loads
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
@@ -106,6 +124,12 @@ class GcBackend:
                 b, db, pol = P.spec_pair(m, sku=sku, dev=dev, contract=contract, ctx=ctx)
                 got.update(ids=[b["id"], db["id"]], pol=pol, lad=[b], pf=None)
                 return b, [b, db], b
+            if bucket is not None:
+                lad, pf = forced(m, dev, bucket)
+                P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, lad[0]["sku"]), lad[0]["id"])
+                load = lad + ([pf] if pf else [])
+                got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
+                return (pf or lad[-1]), load, lad[-1]
             # one sequence: the pack's single stream bucket when it has one (a token a launch, its own numerics contract);
             # else, and for B > 1, the smallest batch bucket
             want = P.wanted(*req, single=B == 1)
