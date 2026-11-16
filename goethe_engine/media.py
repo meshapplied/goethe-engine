@@ -255,7 +255,7 @@ class MediaRunner:
         P.need(k == len(media), f"{len(media)} media item(s), the prompt has {k} marker(s) ({self.be.marker!r})")
         n = sum(len(x) for _, x in chunks)
         lim = self.be.bucket["maxctx"]
-        P.need(n + max_tokens <= lim, f"prompt and media take {n} positions, with max_new_tokens {max_tokens} more than the context {lim} "
+        P.need(not self.be.can_decode or n + max_tokens <= lim, f"prompt and media take {n} positions, with max_new_tokens {max_tokens} more than the context {lim} "
                                      "(shorter audio or fewer new tokens)")
         return self.be.decode(chunks, max_tokens)
 
