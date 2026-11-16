@@ -1002,7 +1002,7 @@ def main(a):
 verify prints {"ok": true, "manifest_sha256", "keyid", "abi", "arch", "runtime": {"kind", "version"}, "buckets", "variants": [ids]}, and with
 --partial "weights": the names of the model files of --model-dir the branch matched (the --weights of serve).
 Without --partial every blob of every bucket is extracted and hash-checked; with --partial only the manifest signature and the blobs of the
-branch --model-dir chooses (a variant by structure, --sku, the numerics flags). --sig defaults to FILE.sig.
+branch --model-dir chooses (a variant by structure, --sku else every SKU, the numerics flags). --sig defaults to FILE.sig.
 need reads a PREFIX file (the first bytes of a pack: 16 bytes, the header, the manifest) and prints {"manifest_sha256", "prefix": {off, len},
 "ranges": [{off, len, sha256}]}: the byte ranges of exactly the blobs the branch needs; the manifest's signature is checked by `verify`
 once the ranges are fetched, and the caller compares manifest_sha256 with the index entry's.
@@ -1028,12 +1028,15 @@ ABI major not 3, runtime not run here, --arch differs, no variant has the model'
         sets = model_sets(d)
         need(sets, f"{d}: no model files (*.safetensors, *.gguf)")
         for fs in sets:
-            try:
-                bs = branch(m, fs, sku=o.sku, numerics=o.numerics, act=o.act, kv=o.kv)[1]
+            bs = []
+            for s in [o.sku] if o.sku else sorted({b["sku"] for b in m["buckets"]}):   # no --sku: every SKU's branch (no device here)
+                try:
+                    bs += branch(m, fs, sku=s, numerics=o.numerics, act=o.act, kv=o.kv)[1]
+                except PackError as e:
+                    last = e
+            if bs:
                 chosen[:] = [os.path.basename(f) for f in fs]
                 return bs
-            except PackError as e:
-                last = e
         raise last
     chosen = []
     try:

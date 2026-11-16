@@ -323,6 +323,29 @@ def test_verify_partial_checks_the_manifest_signature_and_the_branch(tmp_path, k
         P.main(["verify", pack, "--partial", "--model-dir", str(d), "--sku", "mock"])
 
 
+def test_verify_and_need_without_sku_take_every_sku_of_the_branch(tmp_path, key, mocklib, monkeypatch, capsys):
+    monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
+
+    def two_skus(m):
+        m["buckets"] += [dict(b, id=b["id"] + "_2", sku="mock2") for b in m["buckets"] if b["variant"] == "q4"]
+        m["hw"]["mock2"] = m["hw"]["mock"]
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, mutate=two_skus)
+    d = tmp_path / "m"
+    d.mkdir()
+    os.link(w, d / "w.gguf")
+    P.main(["verify", pack, "--partial", "--model-dir", str(d)])
+    assert json.loads(capsys.readouterr().out)["weights"] == ["w.gguf"]
+    raw = open(pack, "rb").read()
+    n = int.from_bytes(raw[8:16], "little")
+    hdr = json.loads(raw[16:16 + n])
+    prefix = tmp_path / "prefix"
+    prefix.write_bytes(raw[:16 + n + hdr["manifest"][0] + hdr["manifest"][1]])
+    P.main(["need", str(prefix), "--model-dir", str(d)])
+    every = {r["sha256"] for r in json.loads(capsys.readouterr().out)["ranges"]}
+    P.main(["need", str(prefix), "--model-dir", str(d), "--sku", "mock"])
+    assert {r["sha256"] for r in json.loads(capsys.readouterr().out)["ranges"]} <= every
+
+
 def test_pinned_key_is_the_release_key():
     pem = ("-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcvBeilUyHdQbvn9eHVjUZkn0Og4n\n"
            "QvHAoaZr1KzcHGsBptYLZktabraS2V1K6eC6lDlagNe/6mOmPCcYLkK4kg==\n-----END PUBLIC KEY-----\n")
