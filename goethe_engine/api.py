@@ -9,6 +9,7 @@ capabilities(pack) reads the manifest only (no blob, no device). A new model is 
 import io
 import json
 import os
+import sys
 
 from . import pack as P, params as P_, registry as R
 from .errors import UnsupportedParameter
@@ -60,6 +61,11 @@ class Model:
             from .scheduler import Config
             be, c = self.backend, dict(config or {})
             c["max_num_seqs"] = min(c.get("max_num_seqs") or be.max_seqs, be.max_seqs)
+            lim = getattr(be, "max_len", None)
+            if lim and (c.get("max_model_len") or 0) > lim:   # e.g. a stream bucket keeps room for its own rows: the handle's limit, said once
+                print(f"goethe-engine: max_model_len {c['max_model_len']} is above this handle's {lim}; using {lim}",
+                      file=sys.stderr, flush=True)
+                c["max_model_len"] = lim
             self.cfg = replace(Config(max_model_len=getattr(be, "max_len", None) or 4096, prefix_cache=getattr(be, "prefix_cache", None)),
                                **{k: v for k, v in c.items() if v is not None})
         self.runner = R.runner(self.backend, self.cfg, **({"eos_ids": eos_ids} if self.type == "decoder" else {}))

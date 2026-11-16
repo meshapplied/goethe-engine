@@ -6,15 +6,16 @@ metadata keys, pack.check_weights), never hashed: GC_OPEN_NO_CHECK tells the run
 manifest (pack_backend.caps_of_bucket), never from symbols."""
 import ctypes as C
 import os
+import sys
 
 import numpy as np
 
 from . import pack as P
-from .backend import KVGeometry
+from .backend import KVGeometry, Work as W
 from .pack_backend import caps_of_bucket, numerics_of
 
 ABI_MAJOR, ABI_MINOR = 1, 0   # 1.1 adds state_pages (a 1.0 library ignores the open field and reports none)
-OK, E_CAPACITY = 0, -7
+OK, E_DEVICE, E_CAPACITY = 0, -4, -7
 OPEN_SPEC, OPEN_NO_CHECK = 1, 2
 L_PAGED, L_DEVICE_ARGMAX, L_SPEC, L_BOUNDED = 1, 2, 4, 8
 W_GREEDY, W_SPEC, W_FEATS = 1, 2, 4
@@ -104,16 +105,43 @@ class GcBackend:
         """bucket: open exactly this manifest bucket id (verification: a batch bucket with its ladder, a stream bucket alone, a prefill
         bucket beside the narrowest batch ladder of its contract) instead of selecting. store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
+        self.note, self.launch_ws, failed = None, 0, []
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen,
-                       price, allow_broken, bucket)
+            while True:
+                self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen,
+                           price, allow_broken, bucket)
+                if self.spec:
+                    break
+                top = self.ladder[-1]["ncol"]
+                try:
+                    self._warm()
+                except P.OutOfMemory as e:
+                    # the ladder's first launches need device memory the manifest's resident does not count (local memory, workspace):
+                    # the next narrower ladder (never a forced bucket: a gate opens exactly one)
+                    nar = [x["ncol"] for x in self.m["buckets"] if x["batch"] and x["role"] == "target" and x["sku"] == self.bucket["sku"] and x["ncol"] < top]
+                    if bucket is not None or not nar:
+                        raise
+                    self._say(f"the {top}-column ladder cannot launch ({e})")
+                    self.L.gc_close(self.h)
+                    self.h, B = None, max(nar)
+                    failed.append(top)
+                    continue
+                if failed and not self.launch_ws and self.warm_bytes:
+                    # the launch memory measured on this narrower ladder: the wider one once more, its KV pool leaving room for it
+                    self.launch_ws = self.warm_bytes
+                    self._say(f"launch memory measured {self.launch_ws / 1e9:.2f} GB on the {top}-column ladder; retrying the {max(failed)}-column one with room for it")
+                    self.L.gc_close(self.h)
+                    self.h, B = None, max(failed)
+                    continue
+                break
         except BaseException:
             self.close()
             raise
 
     def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None, allow_broken=False, bucket=None):
         lim = P.ctx_limit(self.stage.manifest, ctx)       # a model limit refuses a longer context before anything loads
+        self.device = device
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
         dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
@@ -126,7 +154,7 @@ class GcBackend:
                 return b, [b, db], b
             if bucket is not None:
                 lad, pf = forced(m, dev, bucket)
-                P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, lad[0]["sku"]), lad[0]["id"])
+                P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, lad[0]["sku"]), lad[0]["id"])
                 load = lad + ([pf] if pf else [])
                 got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
                 return (pf or lad[-1]), load, lad[-1]
@@ -143,17 +171,17 @@ class GcBackend:
                 return b, P.ladder(m, b), P.prefill(m, b, plen)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
             # the requested batch, then the narrower batch buckets: the widest whose weights, slots, pool and scratch fit is opened
             widths = [B] + sorted({x["ncol"] for x in m["buckets"] if x["batch"] and x["role"] == "target" and 1 < x["ncol"] < B}, reverse=True)
-            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, P.overhead(m, bl[0]["sku"]), bl[0]["id"]), widths)
+            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, bl[0]["sku"]), bl[0]["id"]), widths)
             load = lad + ([pf] if pf else [])
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
 
         br = P.open_branch(self.stage, ws, pick, drafter_files=dws, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
         m, b, lad, pf, ids, pol = br.m, br.bucket, got["lad"], got["pf"], got["ids"], got["pol"]
-        self.m, self.bucket = m, b
+        self.m, self.bucket, self.ladder, self.pf = m, b, lad, pf
         pol_s = (policy or self._policy(pol)) if self.spec else None
         if not self.spec:   # weights, slots and the smallest pool must fit the device; no pool_blocks: the largest that fits
-            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, b["sku"]), b["id"])
+            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, b["sku"]), b["id"])
         libpath = br.lib
         self.L = bind(libpath)
         paths = ws + ([None] + dws if dws else [])     # groups: the target's files, a NULL, a drafter's (the runtime finds tensors by name)
@@ -193,7 +221,43 @@ class GcBackend:
 
     def _ck(self, rc):
         if rc < 0:
-            raise RuntimeError(f"gc call failed ({rc}): {(self.L.gc_last_error(self.h) or b'').decode()}")
+            why = (self.L.gc_last_error(self.h) or b'').decode()
+            if rc == E_DEVICE and "out of memory" in why:
+                raise P.OutOfMemory(f"gc call failed ({rc}): {why}")
+            raise RuntimeError(f"gc call failed ({rc}): {why}")
+
+    def _say(self, note):
+        self.note = note
+        print(f"goethe-engine: {note}", file=sys.stderr, flush=True)
+
+    def _warm(self):
+        """One step of every loaded bucket at the first and at the last positions of the context (k one-token sequences per ladder width
+        k; a 2-token prompt through a loaded prefill chain), so a launch that cannot get its device memory (local memory, workspace: not
+        in the manifest's resident; a long-position step variant) fails at open, not on a request. warm_bytes: the memory they took.
+        Only an out-of-memory refusal counts at the last positions (a runtime may refuse a fresh sequence there for other reasons)."""
+        f0, n, L = P.device_free(self.device), min(self.max_seqs, self.geometry.num_blocks), self.layout.max_ctx
+        bs, nb = self.geometry.block_size, self.geometry.num_blocks
+        full = list(range(min(nb, -(-L // bs))))              # one context's block table, shared: the rows are scratch
+        blocks = (lambda i: full) if self.paged else (lambda i: [i])
+        for pos in (0, L - 3):
+            steps = [[W(i + 1, [0], pos, blocks(i), 1) for i in range(min(k, n))] for k in sorted({x["ncol"] for x in self.ladder})]
+            if self.pf:
+                steps.append([W(1, [0, 0], pos, blocks(0), 1)])
+            for ws in steps:
+                try:
+                    self.step(ws)
+                except RuntimeError:
+                    if not pos:
+                        raise
+                finally:
+                    for w in ws:
+                        try:
+                            self.release(w.sid)
+                        except (RuntimeError, P.OutOfMemory):
+                            pass
+        f1 = P.device_free(self.device)
+        self.warm_bytes = f0 - f1 if f0 is not None and f1 is not None else None
+        self.stats["steps"] = 0
 
     def step(self, work):
         lo, n = self.layout, len(work)

@@ -1,4 +1,4 @@
-"""Numerics contract keywords of every command line (mirror of goethe-compiler compiler/numerics/keywords.py).
+"""Numerics contract keywords of every command line.
 
 invariant     batch-invariant (BI), the shipped default                    -> exact | deterministic | fast axis: deterministic
 invariant-hp  batch-invariant with 16-bit activations (BIH)                -> deterministic, act a16 unless one is asked
