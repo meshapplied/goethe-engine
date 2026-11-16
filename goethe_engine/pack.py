@@ -551,8 +551,7 @@ def pick_sku(m, dev, sku=None):
     arch = "sm_" + dev.get("cc", "?").replace(".", "")
     need(ok, f"device {dev['name']} cc {dev.get('cc')} ({dev['sms']} SMs, smem per block {dev.get('smem_block')}) runs no variant "
          f"of this pack: " + "; ".join(f"{s} ({req[s]['arch']}, {req[s]['sms']} SMs): {why[s]}" for s in sorted(req)) +
-         f". Fallback: serve this model with llama.cpp; or have a variant built for {arch}: on a machine with nvcc for {arch}, "
-         f"`gc pack KEY --hw RECORD --runtime gc-c --overlay PACK` (RECORD: calib/hwcal.sh on this device) and pass --overlay")
+         f". Fallback: serve this model with llama.cpp; or have a variant built for {arch} and pass it with --overlay")
     exact = sorted(s for s in ok if req[s]["name"] == dev["name"] and req[s]["sms"] == dev["sms"])
     if exact:
         return exact[0]
