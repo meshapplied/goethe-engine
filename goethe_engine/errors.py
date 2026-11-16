@@ -4,6 +4,10 @@
 class EngineError(Exception):
     code = "error"
 
+    def __init__(self, msg="", param=None):
+        super().__init__(msg)
+        self.param = param                 # the request parameter at fault (parameter errors)
+
 
 class Refused(EngineError):
     """The pack, its weights or the device cannot serve the request; the message names the reason."""

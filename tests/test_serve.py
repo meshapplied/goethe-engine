@@ -170,3 +170,16 @@ def test_stop_ids_come_from_generation_config_then_config(tmp_path):
     assert model_stop_ids(str(tmp_path)) == [7]
     (tmp_path / "config.json").write_text(json.dumps({"eos_token_id": None}))
     assert model_stop_ids(str(tmp_path)) == []
+
+
+def test_parameter_refusals_have_one_shape(srv):
+    """Every parameter refusal: HTTP 400 {"error": {type invalid_request_error, code (spec/errors.json), param, message}}."""
+    import json as J
+    import os as O
+    codes = J.load(open(O.path.join(O.path.dirname(__file__), "..", "goethe_engine", "spec", "errors.json")))["codes"]
+    for body, code, param in ((dict(top_p=2.0), "invalid_parameter", "top_p"), (dict(logprobs=True), "unsupported_parameter", "logprobs"),
+                              (dict(presence_penalty=0.5), "unsupported_parameter", "presence_penalty"), (dict(stop=[""]), "invalid_parameter", "stop")):
+        st, r = call(srv[0], "/v1/completions", dict(dict(prompt="hi", max_tokens=2), **body))
+        e = r["error"]
+        assert st == 400 and e["type"] == "invalid_request_error" and e["code"] == code and e["param"] == param and e["message"], body
+        assert e["code"] in codes

@@ -1,0 +1,54 @@
+// Worker protocol v1: one goethe-engine worker per device, over a UNIX stream socket. Every frame is a 4-byte little-endian length,
+// then one serialized Request (client to worker) or Reply (worker to client). Request ids are the client's; a Reply carries the id of
+// the request it answers; a streamed generate answers with several Reply frames, the last one with done set. The first request on a
+// connection must be hello: the worker answers welcome with the highest protocol version both sides speak, else an error (refused).
+// Parameters travel as JSON objects validated by the task's schema (spec/params) against the model's io.params. Errors carry a code
+// of spec/errors.json.
+syntax = "proto3";
+package goethe.worker.v1;
+
+message Hello { uint32 min_protocol = 1; uint32 max_protocol = 2; string client = 3; }
+message Device { string platform = 1; string name = 2; string cc = 3; uint32 sms = 4; uint64 free_bytes = 5; }
+message Model { string model_id = 1; string task = 2; string capabilities_json = 3; }
+message Welcome { uint32 protocol = 1; string engine_version = 2; Device device = 3; repeated Model models = 4; }
+
+message Load {
+  string model_id = 1;
+  repeated string pack = 2;        // base pack, then overlays
+  repeated string weights = 3;     // files or checkpoint directories
+  repeated string drafter = 4;
+  string options_json = 5;         // open options: B, ctx, plen, numerics, act, kv, sku, trusted [key ids], allow_broken
+}
+message Unload { string model_id = 1; }
+message Warm { string model_id = 1; }
+message Health {}
+message HealthReply { bool ok = 1; repeated string model_ids = 2; string detail = 3; }
+message Metrics {}
+message MetricsReply { string json = 1; }
+
+message Tokens { repeated int32 ids = 1; }
+message Generate { string model_id = 1; Tokens prompt = 2; string params_json = 3; bool stream = 4; }
+message Embed { string model_id = 1; repeated Tokens items = 2; string params_json = 3; }
+message Transcribe { string model_id = 1; repeated float pcm = 2; string prompt = 3; string params_json = 4; }
+message Cancel { uint64 target = 1; }
+
+message GenerateChunk { repeated int32 ids = 1; bool done = 2; string finish_reason = 3; }
+message EmbedReply { uint32 dim = 1; repeated float rows = 2; }
+message TranscribeReply { repeated int32 ids = 1; }
+message Ok {}
+message Error { string code = 1; string message = 2; string param = 3; }
+
+message Request {
+  uint64 id = 1;
+  oneof body {
+    Hello hello = 2; Load load = 3; Unload unload = 4; Warm warm = 5; Health health = 6; Metrics metrics = 7;
+    Generate generate = 8; Embed embed = 9; Transcribe transcribe = 10; Cancel cancel = 11;
+  }
+}
+message Reply {
+  uint64 id = 1;
+  oneof body {
+    Welcome welcome = 2; Model loaded = 3; Ok ok = 4; HealthReply health = 5; MetricsReply metrics = 6;
+    GenerateChunk chunk = 7; EmbedReply embed = 8; TranscribeReply transcribe = 9; Error error = 10;
+  }
+}

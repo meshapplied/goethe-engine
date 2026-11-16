@@ -1,10 +1,23 @@
 {
  "schema": "goethe-errors-1",
+ "http_shape": {
+  "status": 400,
+  "body": {
+   "error": {
+    "type": "invalid_request_error",
+    "code": "<code>",
+    "param": "<parameter name or null>",
+    "message": "<text>"
+   }
+  }
+ },
  "codes": {
   "refused": "the pack, its weights or the device cannot serve the request (signature, structure, arch, fit, limits, broken variant); the message names the reason",
   "oom": "device memory: the open or a step does not fit; the message carries the fit numbers",
   "unsupported_parameter": "a request parameter the task does not define, or one this pack does not declare in io.params",
   "invalid_parameter": "a declared parameter with a value outside its schema (type, range, enum)",
-  "no_contract": "a numerics request the pack has no measured contract for"
+  "no_contract": "a numerics request the pack has no measured contract for",
+  "invalid_request": "a request body that is not a JSON object, or a request the engine cannot accept (e.g. longer than the context)",
+  "unsupported_task": "an endpoint or task this model does not serve (an embedding model asked to generate)"
  }
 }

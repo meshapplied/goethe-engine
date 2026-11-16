@@ -26,9 +26,14 @@ UNSUPPORTED = ("tools", "tool_choice", "functions", "function_call", "logprobs",
 
 
 class ApiError(Exception):
-    def __init__(self, status, msg, kind="invalid_request_error"):
+    """An HTTP error in the one shape every engine front door uses: {"error": {type, code (spec/errors.json), param, message}}."""
+
+    def __init__(self, status, msg, kind="invalid_request_error", code=None, param=None):
         super().__init__(msg)
-        self.status, self.kind = status, kind
+        self.status, self.kind, self.code, self.param = status, kind, code, param
+
+    def body(self):
+        return {"error": {"message": str(self), "type": self.kind, "param": self.param, "code": self.code}}
 
 
 class Choice:
@@ -86,7 +91,7 @@ class Server:
             self.engine.add_request(rid, prompt, params)
         except ValueError as e:
             del self.pending[rid]
-            raise ApiError(400, str(e))
+            raise ApiError(400, str(e), code=getattr(e, "code", "invalid_request"), param=getattr(e, "param", None))
         self.wake.set()
         return rid, q
 
@@ -101,19 +106,19 @@ def parse_stop(v):
         return ()
     v = [v] if isinstance(v, str) else v
     if not isinstance(v, list) or len(v) > 4 or not all(isinstance(s, str) and s for s in v):
-        raise ApiError(400, "stop must be a non-empty string or up to 4 of them")
+        raise ApiError(400, "stop must be a non-empty string or up to 4 of them", code="invalid_parameter", param="stop")
     return tuple(v)
 
 
 def sampling(body, srv, plen):
     for k in UNSUPPORTED:
         if body.get(k) not in (None, False):
-            raise ApiError(400, f"{k} is not supported")
+            raise ApiError(400, f"{k} is not supported", code="unsupported_parameter", param=k)
     for k in ("frequency_penalty", "presence_penalty"):
         if body.get(k) not in (None, 0, 0.0):
-            raise ApiError(400, f"{k} is not supported")
+            raise ApiError(400, f"{k} is not supported", code="unsupported_parameter", param=k)
     if (body.get("response_format") or {}).get("type", "text") != "text":
-        raise ApiError(400, "response_format is not supported")
+        raise ApiError(400, "response_format is not supported", code="unsupported_parameter", param="response_format")
     mt = body.get("max_completion_tokens", body.get("max_tokens"))
     req = dict(temperature=body.get("temperature", 1.0), top_p=body.get("top_p"), top_k=body.get("top_k"), seed=body.get("seed"),
                max_tokens=srv.ctx if mt is None else mt, n=body.get("n"))
@@ -128,7 +133,7 @@ def checked(task, req, srv):
     try:
         return params.check(task, req, getattr(getattr(srv.engine, "be", None) or getattr(srv.engine, "backend", None), "bucket", None))
     except EngineError as e:
-        raise ApiError(400, f"{e.code}: {e}")
+        raise ApiError(400, str(e), code=e.code, param=e.param)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -148,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _error(self, e):
-        self._json(e.status, {"error": {"message": str(e), "type": e.kind, "param": None, "code": None}})
+        self._json(e.status, e.body())
 
     def _sse_start(self):
         self.send_response(200)
@@ -190,16 +195,16 @@ class Handler(BaseHTTPRequestHandler):
             kind = "embedding" if self.srv.embedding else "encoder-decoder" if self.srv.seq2seq else "decoder"
             want = {"/v1/embeddings": "embedding", "/v1/audio/transcriptions": "encoder-decoder"}.get(path, "decoder")
             if kind != want:
-                raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model")
+                raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model", code="unsupported_task")
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
-                raise ApiError(413, "body too large")
+                raise ApiError(413, "body too large", code="invalid_request")
             try:
                 body = json.loads(self.rfile.read(n))
             except ValueError:
-                raise ApiError(400, "body is not JSON")
+                raise ApiError(400, "body is not JSON", code="invalid_request")
             if not isinstance(body, dict):
-                raise ApiError(400, "body must be an object")
+                raise ApiError(400, "body must be an object", code="invalid_request")
             if self.srv.dead:
                 raise ApiError(503, f"engine stopped: {self.srv.dead}", "server_error")
             if self.srv.embedding:
@@ -216,18 +221,19 @@ class Handler(BaseHTTPRequestHandler):
     def _embeddings(self, body):
         s, inp = self.srv, body.get("input")
         if body.get("encoding_format", "float") not in ("float", "base64"):
-            raise ApiError(400, "encoding_format must be float or base64")
+            raise ApiError(400, "encoding_format must be float or base64", code="invalid_parameter", param="encoding_format")
         if isinstance(inp, str) or (isinstance(inp, list) and inp and all(isinstance(t, int) for t in inp)):
             inp = [inp]
         if not isinstance(inp, list) or not inp or not all(isinstance(x, str) or (isinstance(x, list) and x and all(
                 isinstance(t, int) for t in x)) for x in inp):
-            raise ApiError(400, "input must be a string, a list of strings, a list of token ids or a list of such lists")
+            raise ApiError(400, "input must be a string, a list of strings, a list of token ids or a list of such lists", code="invalid_parameter",
+                           param="input")
         items = [s.tok.embed_input(x) if isinstance(x, str) else x for x in inp]
         r = checked("embed", dict(normalize=body.get("normalize", True) is not False, dimensions=body.get("dimensions")), s)
         try:
             res = s.engine.submit(items, norm=r["normalize"] and "dimensions" not in r).get()
         except P_.PackError as e:
-            raise ApiError(400, str(e))
+            raise ApiError(400, str(e), code=e.code)
         if isinstance(res, BaseException):
             raise ApiError(500, f"{type(res).__name__}: {res}", "server_error")
         if "dimensions" in r:
@@ -256,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
             s.engine.add_request(rid, prompt, params, frames=frames)
         except (ValueError, TypeError, RuntimeError) as e:
             s.pending.pop(rid if "rid" in locals() else None, None)
-            raise ApiError(400, str(e))
+            raise ApiError(400, str(e), code=getattr(e, "code", "invalid_request"), param=getattr(e, "param", None))
         s.wake.set()
         ids = []
         while True:
@@ -276,14 +282,14 @@ class Handler(BaseHTTPRequestHandler):
             if chat:
                 ms = body.get("messages")
                 if not isinstance(ms, list) or not ms:
-                    raise ApiError(400, "messages must be a non-empty list")
+                    raise ApiError(400, "messages must be a non-empty list", code="invalid_parameter", param="messages")
                 msgs = []
                 for m in ms:
                     c = m.get("content")
                     if isinstance(c, list):
                         c = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
                     if not isinstance(c, str) or not isinstance(m.get("role"), str):
-                        raise ApiError(400, "each message needs a role and text content")
+                        raise ApiError(400, "each message needs a role and text content", code="invalid_parameter", param="messages")
                     msgs.append(dict(role=m["role"], content=c))
                 return tok.chat(msgs)
             p = body.get("prompt")
@@ -294,10 +300,10 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(p, list) and p and all(isinstance(t, int) for t in p):
                 return p
         except (KeyError, AttributeError, TypeError) as e:
-            raise ApiError(400, f"bad request: {e}")
+            raise ApiError(400, f"bad request: {e}", code="invalid_request")
         except ValueError as e:
-            raise ApiError(400, str(e))
-        raise ApiError(400, "prompt must be a string, a one-element list of one, or a list of token ids")
+            raise ApiError(400, str(e), code="invalid_parameter", param="prompt")
+        raise ApiError(400, "prompt must be a string, a one-element list of one, or a list of token ids", code="invalid_parameter", param="prompt")
 
     def _complete(self, body, chat):
         s = self.srv
@@ -367,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             s.cancel(rid)
             if stream:   # headers are out: an error event, then end the stream
-                self._sse({"error": {"message": str(e), "type": e.kind}})
+                self._sse(e.body())
                 self._sse(b"[DONE]")
                 self.wfile.write(b"0\r\n\r\n")
                 self.close_connection = True

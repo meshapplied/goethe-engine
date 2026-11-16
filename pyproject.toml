@@ -15,6 +15,7 @@ dependencies = ["numpy"]
 [project.optional-dependencies]
 ref = ["torch"]            # the CPU / torch reference backends and host drafters; gc-c packs run on numpy buffers
 serve = ["transformers"]
+worker = ["protobuf>=4"]       # worker protocol v1 (spec/proto/worker.proto)
 grammar = ["xgrammar"]
 test = ["pytest", "torch"]
 
@@ -25,7 +26,7 @@ goethe-engine = "goethe_engine.cli:main"
 packages = ["goethe_engine"]
 
 [tool.setuptools.package-data]
-goethe_engine = ["spec/*.json", "spec/params/*.json"]
+goethe_engine = ["spec/*.json", "spec/params/*.json", "spec/proto/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

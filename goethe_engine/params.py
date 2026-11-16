@@ -76,10 +76,11 @@ def check(task, req, bucket=None):
     req = {k: v for k, v in (req or {}).items() if v is not None}
     for k in req:
         if k not in sch["properties"]:
-            raise UnsupportedParameter(f"{task} has no parameter {k!r} (parameters: {sorted(sch['properties'])})")
+            raise UnsupportedParameter(f"{task} has no parameter {k!r} (parameters: {sorted(sch['properties'])})", k)
         if k not in have:
-            raise UnsupportedParameter(f"{k!r}: this pack does not support it for {task} (io.params: {sorted(have)})")
-    bad = errors({k: v for k, v in sch.items() if k != "default_declared"}, req, task)
-    if bad:
-        raise InvalidParameter("; ".join(bad))
+            raise UnsupportedParameter(f"{k!r}: this pack does not support it for {task} (io.params: {sorted(have)})", k)
+    for k, v in req.items():
+        bad = errors(sch["properties"][k], v, k)
+        if bad:
+            raise InvalidParameter("; ".join(bad), k)
     return req
