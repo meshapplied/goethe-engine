@@ -102,14 +102,17 @@ def verify(raw, sig, last_serial=0, now=None, trusted=None):
 
 def model_sets(model_dir):
     """The file sets of model_dir that can be one model: a checkpoint's shards (all *.safetensors), else each GGUF (a sharded one
-    -0000k-of-0000n.gguf together). Header-only readers take these."""
+    -0000k-of-0000n.gguf together), then all GGUFs together in both orders (a media model: projector and backbone; later files' metadata
+    wins in a structure table). Header-only readers take these."""
     st = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
     if st:
         return [st]
     sets = {}
     for p in sorted(glob.glob(os.path.join(model_dir, "*.gguf"))):
         sets.setdefault(re.sub(r"-\d+-of-\d+\.gguf$", ".gguf", p), []).append(p)
-    return list(sets.values())
+    out = list(sets.values())
+    every = [p for fs in out for p in fs]
+    return out + [every, every[::-1]] if len(out) > 1 else out
 
 
 def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):

@@ -143,3 +143,16 @@ def test_model_files_are_optional_informational_and_never_used_to_match(key, tmp
     (tmp_path / "index.sig").write_bytes(key.sign((tmp_path / "index.json").read_bytes()))
     assert I.main(["match", "--index", str(tmp_path / "index.json"), "--sig", str(tmp_path / "index.sig"), "--arch", "sm_120a", "--model-dir", ref], (key.kid,)) == 0
     assert json.loads(capsys.readouterr().out)["model"]["files"] == files
+
+
+def test_model_sets_try_each_gguf_then_all_together(tmp_path):
+    """A media model's projector and backbone are two GGUFs that only together have the variant's structure."""
+    from goethe_engine.index import model_sets
+    for n in ("m-00001-of-00002.gguf", "m-00002-of-00002.gguf"):
+        (tmp_path / n).write_bytes(b"")
+    assert model_sets(str(tmp_path)) == [[str(tmp_path / "m-00001-of-00002.gguf"), str(tmp_path / "m-00002-of-00002.gguf")]]
+    (tmp_path / "mmproj.gguf").write_bytes(b"")
+    s = model_sets(str(tmp_path))
+    assert len(s) == 4 and s[2] == s[0] + s[1] and s[3] == s[2][::-1]
+    (tmp_path / "w.safetensors").write_bytes(b"")
+    assert model_sets(str(tmp_path)) == [[str(tmp_path / "w.safetensors")]]
