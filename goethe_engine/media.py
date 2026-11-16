@@ -64,31 +64,32 @@ def bind(path):
 
 
 class GcMedia:
-    """The media encode bucket of a pack: its library opened on the weight files in the order the bucket's io.weights names their
-    roles (default: [media projector, text model])."""
+    """The media encode bucket of a pack: its library opened on the variant's weight files in model.weights order (gcm_open: the
+    media projector, then the text model)."""
 
-    def __init__(self, pack, weights, *, device=-1, sku=None, trusted=None, store=None, **_):
+    def __init__(self, pack, weights, *, device=-1, sku=None, trusted=None, store=None, numerics="invariant", **_):
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open([weights] if isinstance(weights, str) else list(weights), device, sku)
+            self._open([weights] if isinstance(weights, str) else list(weights), device, sku, numerics)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, ws, device, sku):
-        m0 = self.stage.manifest
-        m = P.restrict(P.for_variant(m0, P.pick_variant(m0, ws)))
-        m = self.m = dict(m, buckets=media_buckets(m))
-        P.need(m["buckets"], "no media encode bucket (kind encode with io.media) in this pack")
-        dev = None if sku else P.device(None if device < 0 else device)
-        b = self.bucket = P.select(m, sku=sku, dev=dev, verify=True, want=lambda x: True, kind="encode")
-        P.check_weights(m, ws)
-        io = self.io = b["io"]
-        P.need(len(ws) == len(io.get("weights", ["mmproj", "text"])), f"bucket {b['id']}: weights {io.get('weights', ['mmproj', 'text'])}, "
-                                                                     f"{len(ws)} files given")
-        self.stage.ensure([b])
-        L = self.L = bind(os.path.join(P.materialize(self.stage, b), b["lib"]))
+    def _open(self, ws, device, sku, numerics):
+        want = P.wanted(numerics, single=True)
+
+        def pick(m, dev):
+            b = P.select(m, sku=sku, dev=dev, want=lambda x: want(x) and bool((x.get("io") or {}).get("media")), kind="encode")
+            return b, [b], b
+        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device)
+        self.m, b = dict(br.m, buckets=media_buckets(br.m)), br.bucket
+        self.bucket, io = b, b["io"]
+        self.io = io
+        need = [br.m["model"]["weights"][i]["file"] for i in br.m["variants"][b["variant"]]["weights"]]
+        P.need(len(ws) == len(need) == 2, f"bucket {b['id']}: gcm_open takes the variant's files in model.weights order {need} "
+                                          f"(projector, text model); {len(ws)} given")
+        L = self.L = bind(br.lib)
         v = L.gcm_abi_version()
         P.need(v >> 16 == 1, f"{b['lib']}: media ABI {v >> 16}.{v & 0xFFFF}, this engine speaks 1.x")
         h = C.c_void_p()

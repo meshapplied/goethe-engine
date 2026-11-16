@@ -395,16 +395,19 @@ def build(args):
             raise SystemExit("serve needs --pack FILE and --weights PATH... (or --ref for the CPU reference model)")
         if len(args.weights) > 2:
             raise SystemExit("--weights takes the target model (a GGUF file, or a checkpoint directory) and optionally a drafter file (speculative pair)")
-        import glob
-        tw = sorted(glob.glob(os.path.join(args.weights[0], "*.safetensors"))) if os.path.isdir(args.weights[0]) else args.weights[0]
-        be = registry.open_backend([args.pack] + list(args.overlay or []), tw, mesh=registry.Mesh.single(args.device), store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act, kv=args.kv, drafter_weights=args.weights[1] if len(args.weights) > 1 else None)
+        from . import api
+        mo = api.Model([args.pack] + list(args.overlay or []), args.weights[0], drafter=args.weights[1] if len(args.weights) > 1 else None,
+                       device=args.device, store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act,
+                       kv=args.kv, config=dict(max_num_seqs=args.max_running_requests, max_model_len=args.context_length,
+                                               kv_dtype="f16" if args.kv == "auto" else args.kv))
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")
         tok = HFTokenizer(tdir)
-        ctx = args.context_length or be.max_len
-        if hasattr(be, "embed"):
-            return registry.runner(be, None), tok, ctx
+        if mo.type == "decoder":
+            mo.runner.eos = set(tok.eos_ids)        # the pack opens (and is verified) before the tokenizer is read
+        ctx = args.context_length or mo.backend.max_len
+        return mo.runner, tok, ctx
     seqs = min(args.max_running_requests or be.max_seqs, be.max_seqs)
     eng = registry.runner(be, Config(max_num_seqs=seqs, max_model_len=ctx, kv_dtype="f16" if args.kv == "auto" else args.kv, prefix_cache=getattr(be, "prefix_cache", True)),
                  eos_ids=tok.eos_ids)

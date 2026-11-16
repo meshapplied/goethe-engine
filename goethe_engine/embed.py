@@ -67,16 +67,15 @@ class GcEmbed:
 
     def _open(self, weights, device, contract, sku, numerics):
         ws = [weights] if isinstance(weights, str) else list(weights)
-        m0 = self.stage.manifest
-        m = P.restrict(P.for_variant(m0, P.pick_variant(m0, ws)))
-        m = self.m = dict(m, buckets=encode_buckets(m))
-        P.need(m["buckets"], "no encode bucket in this pack (model.type embedding needs one)")
-        dev = None if sku else P.device(None if device < 0 else device)
         want = P.wanted(numerics, single=True)
-        b = self.bucket = P.select(m, sku=sku, dev=dev, contract=contract, verify=True, want=want, kind="encode")
-        P.check_weights(m, ws)
-        self.stage.ensure([b])
-        lib = os.path.join(P.materialize(self.stage, b), b["lib"])
+
+        def pick(m, dev):
+            b = P.select(m, sku=sku, dev=dev, contract=contract, want=want, kind="encode")
+            return b, [b], b
+        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device)
+        self.m = dict(br.m, buckets=encode_buckets(br.m))
+        b = self.bucket = br.bucket
+        lib = br.lib
         L = self.L = C.CDLL(lib)
         for n, res, args in (("gc_abi_version", C.c_uint32, []), ("gc_open", C.c_int, [P_(OpenParams), P_(C.c_void_p)]),
                              ("gc_layout_get", C.c_int, [C.c_void_p, P_(Layout12)]),

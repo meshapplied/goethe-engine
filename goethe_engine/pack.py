@@ -599,7 +599,7 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
             and b["id"] not in skip and ok(b)
             and not b.get("variant_of") and b["ncol"] >= B and (ctx is None or b["maxctx"] >= ctx)
             and (axes(b)[1] == "encode") == (kind == "encode")
-            and (verify or role != "target" or b["batch"] or b["ncol"] == 1)]   # a spec verify serves no batch
+            and (kind == "encode" or verify or role != "target" or b["batch"] or b["ncol"] == 1)]   # a spec verify serves no batch
     need(cand, f"no {role} bucket for sku {sku}, contract {c}, B {B}, ctx {ctx} (skipped, unknown to this loader: "
          f"{skip or 'none'}; have "
          f"{sorted((b['sku'], b['contract'], b['ncol'], b['maxctx']) for b in m['buckets'] if b['role'] == role)})")
@@ -871,6 +871,28 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     bs = [b for b in mv["buckets"] if b["sku"] == sku and want(b)]
     need(bs, f"no bucket of variant {v} for sku {sku} with numerics={numerics} act={act} kv={kv}")
     return v, bs
+
+
+class Branch:
+    """What every backend opens: the manifest restricted to the weights' variant(s) on this platform, the device record, the chosen
+    bucket, the buckets whose blobs are read (ensured) and the materialized library path of the last of them."""
+
+    def __init__(self, m, dev, bucket, load, lib):
+        self.m, self.dev, self.bucket, self.load, self.lib = m, dev, bucket, load, lib
+
+
+def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1):
+    """The one open sequence of every model type: the weights pick their variant by structure (header reads), the manifest is
+    restricted to it, pick(m, dev) -> (bucket, [buckets to load], lib bucket) chooses on the device (dev None when sku names the
+    SKU), the weights are checked against the variant, only the loaded buckets' blobs are read, and the lib bucket's files are
+    materialized."""
+    m0 = st.manifest
+    m = restrict(for_variant(m0, pick_variant(m0, files), pick_variant(m0, drafter_files, "drafter") if drafter_files else None))
+    dev = None if sku else device(None if ordinal < 0 else ordinal)
+    b, load, top = pick(m, dev)
+    check_weights(m, files, drafter_files)
+    st.ensure(load)
+    return Branch(m, dev, b, load, os.path.join(materialize(st, top), top["lib"]))
 
 
 def materialize(st, b, out=None):

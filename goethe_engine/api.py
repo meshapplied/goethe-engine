@@ -21,8 +21,9 @@ def manifest(pack):
 
 
 def capabilities(pack):
-    """{type, kind, bucket kinds, media kinds, contracts, ladder columns, prefill forms {W: form}, spec policy kinds, drafter roles}."""
-    m = manifest(pack)
+    """{type, kind, bucket kinds, media kinds, contracts, ladder columns, prefill forms {W: form}, spec policy kinds, drafter roles} of a
+    pack file (of the base file of [base, overlays...])."""
+    m = manifest(pack[0] if isinstance(pack, (list, tuple)) else pack)
     t = R.model_type(m)
     bs = m["buckets"]
     return dict(type=t, kind=KIND[t], kinds=sorted({P.axes(b)[1] for b in bs}),
@@ -41,19 +42,25 @@ def files(weights):
 
 
 class Model:
-    """A pack opened on one device for its task kind. B, ctx, plen, numerics, drafter: decoder handles only."""
+    """A pack (a file, or [base, overlays...]) opened on one device for its task kind. B, ctx, plen, numerics, act, kv, drafter: decoder
+    handles only. config: scheduler Config fields over the defaults the backend implies (its max_len, prefix cache, max_seqs cap)."""
 
-    def __init__(self, pack, weights, *, drafter=None, B=1, ctx=None, plen=None, numerics="invariant", device=-1, sku=None,
-                 trusted=None, store=None, cfg=None, eos_ids=(), **kw):
+    def __init__(self, pack, weights, *, drafter=None, B=1, ctx=None, plen=None, numerics="invariant", act="auto", kv="auto", device=-1,
+                 sku=None, trusted=None, store=None, config=None, eos_ids=(), **kw):
         self.type = R.pack_type(pack)
         self.kind = KIND[self.type]
         if self.type in ("decoder", "encoder-decoder"):
-            kw.update(B=B, ctx=ctx, plen=plen, numerics=numerics, drafter_weights=drafter and files(drafter))
-        self.backend = R.open_backend(pack, files(weights), mesh=R.Mesh.single(device), sku=sku, trusted=trusted, store=store, **kw)
-        self.cfg = cfg
-        if self.type in ("decoder", "encoder-decoder") and cfg is None:   # the media path stays torch free: a pinned body binds its own
-            from .scheduler import Config                                  # cuBLAS, and torch preloads the wheels' copies
-            self.cfg = Config(max_model_len=getattr(self.backend, "max_len", None) or 4096)
+            kw.update(B=B, ctx=ctx, plen=plen, act=act, kv=kv, drafter_weights=drafter and files(drafter))
+        self.backend = R.open_backend(pack, files(weights), mesh=R.Mesh.single(device), sku=sku, trusted=trusted, store=store,
+                                      numerics=numerics, **kw)
+        self.cfg = None
+        if self.type in ("decoder", "encoder-decoder"):    # the media path stays torch free: a pinned body binds its own cuBLAS,
+            from dataclasses import replace                 # and torch preloads the wheels' copies
+            from .scheduler import Config
+            be, c = self.backend, dict(config or {})
+            c["max_num_seqs"] = min(c.get("max_num_seqs") or be.max_seqs, be.max_seqs)
+            self.cfg = replace(Config(max_model_len=getattr(be, "max_len", None) or 4096, prefix_cache=getattr(be, "prefix_cache", None)),
+                               **{k: v for k, v in c.items() if v is not None})
         self.runner = R.runner(self.backend, self.cfg, **({"eos_ids": eos_ids} if self.type == "decoder" else {}))
 
     def _need(self, kind):

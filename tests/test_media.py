@@ -30,8 +30,10 @@ def media_pack(tmp_path, key, lib, prov=PROV, decode=True):
 
     def mut(m):
         m["variants"]["q4"]["structure"] = structure.describe([mm, str(tmp_path / "w.gguf")], ["general.architecture"])
+        m["model"]["weights"].append(dict(file="mm.gguf", bytes=os.path.getsize(mm), sha256="0" * 64))
+        m["variants"]["q4"]["weights"] = [len(m["model"]["weights"]) - 1, 0]
         b = dict(m["buckets"][1], id="target.mock.K1.1m.256", kind="encode", ncol=1, batch=False, provenance=prov,
-                 io=dict(media="audio", decode=decode, weights=["mmproj", "text"], **{"in": dict(pcm="f32", rate=16000)},
+                 io=dict(media="audio", decode=decode, **{"in": dict(pcm="f32", rate=16000)},
                          out=dict(rows="f32", n_embd=4)))
         m["buckets"] = [b]
         m["model"]["type"] = "media"
