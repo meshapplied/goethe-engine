@@ -226,17 +226,17 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(500, f"{type(res).__name__}: {res}", "server_error")
         rows = []
         for i, r in enumerate(res):
-            e = base64.b64encode(r.numpy().astype("<f4").tobytes()).decode() if body.get("encoding_format") == "base64" else r.tolist()
+            e = base64.b64encode(r.astype("<f4").tobytes()).decode() if body.get("encoding_format") == "base64" else r.tolist()
             rows.append(dict(object="embedding", index=i, embedding=e))
         n = sum(len(t) for t in items)
         self._json(200, dict(object="list", data=rows, model=s.name, usage=dict(prompt_tokens=n, total_tokens=n)))
 
     # --- transcriptions (encoder-decoder)
     def _transcribe(self, body):
-        import torch
+        import numpy as np
         s = self.srv
         try:
-            frames = torch.tensor(body.get("frames"), dtype=torch.float32)
+            frames = np.asarray(body.get("frames"), dtype=np.float32)
             prompt = body.get("prompt")
             if not (isinstance(prompt, list) and prompt and all(isinstance(t, int) for t in prompt)):
                 raise ValueError("prompt must be the decoder's start token ids")

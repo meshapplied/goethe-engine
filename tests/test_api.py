@@ -39,3 +39,19 @@ def test_transcribe_kind(tmp_path, key, mockgcm):  # noqa: F811
     assert api.capabilities(pack)["media"] == ["audio"]
     with api.open(pack, ws, device=0, sku="mock", trusted=(key.kid,)) as m:
         assert m.kind == "transcribe" and m.transcribe([np.ones(4, np.float32)], "<m>", 2) == [14, 1000]
+
+
+def test_gc_c_paths_never_import_torch(tmp_path, key, mocklib, mockgce):  # noqa: F811
+    """torch is the reference backends' optional extra: generate and embed on gc-c packs run on numpy buffers (torch would also preload
+    its wheels' cuBLAS ahead of a pinned body's)."""
+    import os
+    import subprocess
+    import sys
+    pack, w, _ = toy_pack(str(tmp_path / "d"), key, mocklib)
+    epack, ew, _ = encode_pack(tmp_path / "e", key, mockgce)
+    code = (f"import sys; from goethe_engine import api\n"
+            f"m = api.open({pack!r}, {w!r}, B=2, sku='mock', trusted=({key.kid!r},)); m.generate([[1, 2, 3]], 4); m.close()\n"
+            f"m = api.open({epack!r}, {ew!r}, device=0, sku='mock', trusted=({key.kid!r},)); m.embed([[1, 2]]); m.close()\n"
+            "assert 'torch' not in sys.modules, 'torch imported'")
+    root = os.path.join(os.path.dirname(__file__), "..")
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=root, env=dict(os.environ, PYTHONPATH=root))

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-import torch
+import numpy as np
 
 M64 = (1 << 64) - 1
 
@@ -51,47 +51,54 @@ def uniform(seed, idx):
     return (mix(seed, idx) >> 11) / float(1 << 53)
 
 
+def host(x):
+    """A numpy view of logits / masks / probabilities from any backend (numpy, or a torch tensor of the reference backends)."""
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+
+
+def _sorted_p(x, t):
+    """(order, probabilities in that order): the row divided by t (float32), sorted descending (stable), softmax in float64."""
+    z = x / np.float32(t)
+    order = np.argsort(-z, kind="stable")
+    zs = z[order].astype(np.float64)
+    e = np.exp(zs - zs[0])
+    return order, e / e.sum()
+
+
 def sample(logits, params, seeds, idxs, masks):
     """Token per row, -1 for a row without a finite choice. A row depends only on its logits, params, seed and token index."""
-    x = logits.float().clone()
-    bad = torch.isnan(x).any(1)
+    x = np.array(host(logits), dtype=np.float32)
+    bad = np.isnan(x).any(1)
     for r, m in enumerate(masks):
         if m is not None:
-            x[r] = x[r].masked_fill(~m.to(x.device), float("-inf"))
-    bad |= ~torch.isfinite(x).any(1)
-    out = x.argmax(1)
-    hot = [r for r, p in enumerate(params) if p.temperature > 0]
-    if hot:
-        V = x.shape[1]
-        ix = torch.tensor(hot, device=x.device)
-        t = torch.tensor([params[r].temperature for r in hot], dtype=torch.float32, device=x.device)
-        z, order = torch.sort(x[ix] / t[:, None], dim=1, descending=True, stable=True)
-        p = torch.softmax(z.double(), dim=1)
-        rank = torch.arange(V, device=x.device)[None]
-        k = torch.tensor([params[r].top_k or V for r in hot], device=x.device)[:, None]
-        tp = torch.tensor([params[r].top_p for r in hot], dtype=torch.float64, device=x.device)[:, None]
-        keep = (rank < k) & (p.cumsum(1) - p < tp)
-        c = (p * keep).cumsum(1)
-        u = torch.tensor([uniform(seeds[r], idxs[r]) for r in hot], dtype=torch.float64, device=x.device)
-        j = (c < (u * c[:, -1])[:, None]).sum(1).minimum(keep.sum(1) - 1).clamp(min=0)
-        out[ix] = order.gather(1, j[:, None])[:, 0]
+            x[r][~host(m).astype(bool)] = -np.inf
+    bad |= ~np.isfinite(x).any(1)
+    out = np.where(bad, 0, np.nan_to_num(x, nan=-np.inf).argmax(1)) if len(x) else np.zeros(0, np.int64)
+    for r, p in enumerate(params):
+        if p.temperature > 0 and not bad[r]:
+            order, q = _sorted_p(x[r], p.temperature)
+            keep = (np.arange(len(q)) < (p.top_k or len(q))) & (np.cumsum(q) - q < p.top_p)
+            c = np.cumsum(q * keep)
+            j = max(min(int((c < uniform(seeds[r], idxs[r]) * c[-1]).sum()), int(keep.sum()) - 1), 0)
+            out[r] = order[j]
     out[bad] = -1
-    return out.tolist()
+    return [int(t) for t in out]
 
 
 def dist(logits, p, mask=None):
     """float64 probabilities over the vocabulary that sample() draws a temperature > 0 row from (top-k, top-p, mask)."""
-    x = logits.float()
+    x = np.array(host(logits), dtype=np.float32)
     if mask is not None:
-        x = x.masked_fill(~mask.to(x.device), float("-inf"))
-    z, order = torch.sort(x / p.temperature, descending=True, stable=True)
-    q = torch.softmax(z.double(), 0)
-    rank = torch.arange(len(q), device=x.device)
-    q = q * ((rank < (p.top_k or len(q))) & (q.cumsum(0) - q < p.top_p))
-    return torch.zeros_like(q).scatter_(0, order, q / q.sum())
+        x[~host(mask).astype(bool)] = -np.inf
+    order, q = _sorted_p(x, p.temperature)
+    q = q * ((np.arange(len(q)) < (p.top_k or len(q))) & (np.cumsum(q) - q < p.top_p))
+    out = np.zeros_like(q)
+    out[order] = q / q.sum()
+    return out
 
 
 def draw(q, u):
     """Inverse CDF of probabilities q (vocabulary order) at u in [0, 1)."""
-    c = q.cumsum(0)
-    return int(min(int((c < u * c[-1]).sum()), int((q > 0).nonzero()[-1, 0])))
+    q = host(q)
+    c = np.cumsum(q)
+    return int(min(int((c < u * c[-1]).sum()), int(np.nonzero(q > 0)[0][-1])))

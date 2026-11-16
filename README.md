@@ -12,7 +12,8 @@ is enough. A blob may be stored xz compressed; its raw size is pinned in the sig
 
 ## Install
 
-    pip install goethe_engine-<version>-py3-none-any.whl          # from a GitHub release; torch is a dependency
+    pip install goethe_engine-<version>-py3-none-any.whl          # from a GitHub release; numpy only (gc-c packs)
+    pip install 'goethe_engine-<version>-py3-none-any.whl[ref]'   # adds torch: the CPU reference model and host drafters
     pip install 'goethe_engine-<version>-py3-none-any.whl[serve]' # adds transformers for tokenizers and chat templates
 
 ## CLI

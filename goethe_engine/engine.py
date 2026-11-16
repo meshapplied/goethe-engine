@@ -4,7 +4,7 @@ import random
 from collections import deque
 from dataclasses import dataclass, field, replace
 
-import torch
+import numpy as np
 
 from .backend import Work
 from .kv import KVManager
@@ -60,7 +60,7 @@ class Engine:
             off, at = 0, {}
             for k, n in self.caps["taps"].items():
                 at[k], off = range(off, off + n), off + n
-            self.cols = torch.tensor([c for k in need for c in at[k]])
+            self.cols = np.array([c for k in need for c in at[k]])
         self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages, bounded)
         self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size)
         self.inbox, self.live, self.counter = deque(), {}, 0
@@ -230,7 +230,7 @@ class Engine:
 
     def _feed(self, s, pos, rows):
         if rows is not None and hasattr(self.drafter, "feed"):
-            self.drafter.feed(s, pos, rows if self.cols is None else rows[:, self.cols.to(rows.device)])
+            self.drafter.feed(s, pos, rows if self.cols is None else rows[:, self.cols])
 
     def _post(self, items, res, feats):
         """Acceptance: walk each item's tree from the anchor, one node per round across the batch. A node's token is
@@ -267,7 +267,7 @@ class Engine:
                 ex = [k for k, e in enumerate(active) if not (strict(e[0].seq) and e[5][e[3]])]
                 toks = [None] * len(active)
                 if ex:
-                    idx = torch.tensor([active[k][1] + active[k][3] for k in ex], device=res.device)
+                    idx = [active[k][1] + active[k][3] for k in ex]
                     got = sample(res[idx], [ss[k].params for k in ex], [ss[k].seed for k in ex],
                                  [ss[k].nout for k in ex], [ss[k].grammar.mask() if ss[k].grammar else None for k in ex])
                     for k, t in zip(ex, got):

@@ -11,11 +11,10 @@ import os
 import queue
 import threading
 
-import torch
+import numpy as np
 
 from . import pack as P
 from .gc_c import OK, E_CAPACITY, OPEN_NO_CHECK, OpenParams, StepIn, Work, arr
-from .ref import RefModel, rms
 
 L_EMBED = 1 << 4
 S_HOST_LOGITS, S_NORMALIZE = 1, 2
@@ -38,13 +37,14 @@ class EmbedOut(C.Structure):
 
 def normalize(x):
     """L2 rows as llama.cpp common_embd_normalize(embd_norm 2): float products summed in double, scaled by float(1 / norm)."""
-    out = torch.empty_like(x)
-    for i, r in enumerate(x.float().numpy()):
+    x = np.asarray(x, dtype=np.float32)
+    out = np.empty_like(x)
+    for i, r in enumerate(x):
         s = 0.0
         for v in (r * r).tolist():          # float32 products, summed in order in double
             s += v
         s = math.sqrt(s)
-        out[i] = x[i] * torch.tensor(1.0 / s if s > 0 else 0.0, dtype=torch.float32)
+        out[i] = x[i] * np.float32(1.0 / s if s > 0 else 0.0)
     return out
 
 
@@ -108,7 +108,7 @@ class GcEmbed:
     def embed(self, items, norm=True):
         """float32 [len(items), dim]: the pooled row of each token list (L2 normalized when norm)."""
         if not items:
-            return torch.empty(0, self.dim)
+            return np.empty((0, self.dim), np.float32)
         keep = [(C.c_int32 * len(t))(*t) for t in items]
         ws = [Work(C.sizeof(Work), 0, i, 0, len(t), k, None, None, 0, 1) for i, (t, k) in enumerate(zip(items, keep))]
         wp = (P_(Work) * len(ws))(*[C.pointer(w) for w in ws])
@@ -116,7 +116,7 @@ class GcEmbed:
         buf = (C.c_float * (len(items) * self.dim))()
         o = EmbedOut(C.sizeof(EmbedOut), 0, buf, len(buf))
         self._ck(self.L.gc_embed(self.h, C.byref(si), C.byref(o)))
-        return torch.frombuffer(bytearray(buf), dtype=torch.float32).view(len(items), self.dim).clone()
+        return np.frombuffer(buf, dtype=np.float32).reshape(len(items), self.dim).copy()
 
     def close(self):
         if self.h:
@@ -134,11 +134,14 @@ class RefEmbed:
     norm, pooled; one sequence at a time, so a row never depends on the batch."""
 
     def __init__(self, model=None, pool="mean", max_cols=64, max_seqs=8, max_len=64):
+        from .ref import RefModel                  # the reference models are torch (the optional extra)
         self.M, self.pool = model or RefModel(), pool
         self.dim, self.max_cols, self.max_seqs, self.max_len = self.M.d, max_cols, max_seqs, max_len
         self.numerics = dict(contract="ref", determinism="exact")
 
     def rows(self, t):
+        import torch
+        from .ref import rms
         M, T = self.M, len(t)
         x = M.emb[torch.tensor(t)]
         for w in M.layers:
@@ -158,8 +161,8 @@ class RefEmbed:
         out = []
         for t in items:
             r = self.rows(t)
-            out.append(r.mean(0) if self.pool == "mean" else r[0] if self.pool == "cls" else r[-1])
-        x = torch.stack(out).float() if out else torch.empty(0, self.dim)
+            out.append((r.mean(0) if self.pool == "mean" else r[0] if self.pool == "cls" else r[-1]).float().numpy())
+        x = np.stack(out) if out else np.empty((0, self.dim), np.float32)
         return normalize(x) if norm else x
 
     def close(self):
@@ -201,7 +204,7 @@ class EmbedRunner:
                 rows[i] = r
             self.stats["launches"] += 1
             self.stats["rows"] += len(b)
-        return torch.stack(rows) if rows else torch.empty(0, self.be.dim)
+        return np.stack(rows) if rows else np.empty((0, self.be.dim), np.float32)
 
     def submit(self, items, norm=True):
         """Queued for the runner thread, packed with other callers' requests; returns a queue that receives the rows (or an error)."""

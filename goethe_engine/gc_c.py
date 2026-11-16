@@ -7,7 +7,7 @@ manifest (pack_backend.caps_of_bucket), never from symbols."""
 import ctypes as C
 import os
 
-import torch
+import numpy as np
 
 from . import pack as P
 from .backend import KVGeometry
@@ -187,12 +187,12 @@ class GcBackend:
             out.tokens, out.tokens_cap, out.counts = tok, rows, counts
         else:
             rows = sum(w.want for w in work)
-            lg = torch.empty(rows, self.vocab_size, dtype=torch.float32)
-            out.logits, out.logits_cap = lg.data_ptr(), lg.numel()
+            lg = np.empty((rows, self.vocab_size), np.float32)
+            out.logits, out.logits_cap = lg.ctypes.data, lg.size
         nf = sum(len(w.tokens) for w in work if w.feats)
         if nf:
-            ft = torch.empty(nf, self.feat_width, dtype=torch.float32)
-            out.feats, out.feats_cap = ft.data_ptr(), ft.numel()
+            ft = np.empty((nf, self.feat_width), np.float32)
+            out.feats, out.feats_cap = ft.ctypes.data, ft.size
         self._ck(self.L.gc_step(self.h, C.byref(StepIn(C.sizeof(StepIn), 0 if greedy else S_HOST_LOGITS, pw, n, 0)),
                                 C.byref(out)))
         self.stats["steps"] += 1

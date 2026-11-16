@@ -7,6 +7,7 @@ import subprocess
 import threading
 import urllib.request
 
+import numpy as np
 import pytest
 import torch
 
@@ -39,39 +40,39 @@ def test_launches_respect_rows_and_sequences(ref):
 def test_rows_do_not_depend_on_the_batch(ref):
     """Bitwise: each sequence alone, in arrival order packed by rows, and shuffled into other launches."""
     r, items = EmbedRunner(ref), seqs(9)
-    alone = torch.stack([r.embed([t])[0] for t in items])
+    alone = np.stack([r.embed([t])[0] for t in items])
     packed = r.embed(items)
     perm = list(reversed(range(len(items))))
     shuffled = r.embed([items[i] for i in perm])
-    assert torch.equal(alone, packed) and torch.equal(packed[perm], shuffled)
-    assert torch.allclose(packed.norm(dim=1), torch.ones(len(items)), atol=1e-6)
+    assert np.array_equal(alone, packed) and np.array_equal(packed[perm], shuffled)
+    assert np.allclose(np.linalg.norm(packed, axis=1), 1, atol=1e-6)
     raw = r.embed(items, norm=False)
-    assert torch.equal(normalize(raw), packed) and not torch.equal(raw, packed)
+    assert np.array_equal(normalize(raw), packed) and not np.array_equal(raw, packed)
 
 
 def test_pool_kinds_differ():
     m = RefModel(vocab=64, seed=0)
     t = [[3, 9, 27, 17, 51]]
     rows = {p: RefEmbed(m, pool=p).embed(t, norm=False)[0] for p in ("mean", "cls", "last")}
-    assert not torch.equal(rows["mean"], rows["cls"]) and not torch.equal(rows["cls"], rows["last"])
+    assert not np.array_equal(rows["mean"], rows["cls"]) and not np.array_equal(rows["cls"], rows["last"])
 
 
 def test_normalize_is_llama_cpp_common_embd_normalize():
-    x = torch.tensor([[3.0, 4.0, 0.0], [1e-3, -2.5, 7.25], [0.0, 0.0, 0.0]])
+    x = np.array([[3.0, 4.0, 0.0], [1e-3, -2.5, 7.25], [0.0, 0.0, 0.0]], np.float32)
     y = normalize(x)
-    assert torch.equal(y[0], torch.tensor([0.6, 0.8, 0.0])) and torch.equal(y[2], x[2])
+    assert np.array_equal(y[0], np.array([0.6, 0.8, 0.0], np.float32)) and np.array_equal(y[2], x[2])
     s = 0.0
     for v in x[1].tolist():
-        s += float(torch.tensor(v, dtype=torch.float32) * torch.tensor(v, dtype=torch.float32))
-    assert torch.equal(y[1], x[1] * torch.tensor(1.0 / s ** 0.5, dtype=torch.float32))
+        s += float(np.float32(v) * np.float32(v))
+    assert np.array_equal(y[1], x[1] * np.float32(1.0 / s ** 0.5))
 
 
 def test_runner_queue_packs_concurrent_callers(ref):
     r, items = EmbedRunner(ref), seqs(6, seed=1)
     want = r.embed(items)
     qs = [r.submit([t]) for t in items]
-    got = torch.cat([q.get(timeout=30) for q in qs])
-    assert torch.equal(got, want)
+    got = np.concatenate([q.get(timeout=30) for q in qs])
+    assert np.array_equal(got, want)
 
 
 @pytest.fixture(scope="session")
@@ -120,8 +121,8 @@ def test_gc_embed_through_the_registry(tmp_path, key, mockgce):
         items = [[1, 2, 3], [7], [4, 4, 4, 4, 9]]
         raw = r.embed(items, norm=False)
         assert raw.tolist() == [[6, 3, 1, 3], [7, 1, 7, 7], [25, 5, 4, 9]]
-        assert torch.allclose(r.embed(items), normalize(raw), atol=1e-7)
-        assert torch.equal(torch.cat([r.embed([t]) for t in items]), r.embed(items))
+        assert np.allclose(r.embed(items), normalize(raw), atol=1e-7)
+        assert np.array_equal(np.concatenate([r.embed([t]) for t in items]), r.embed(items))
     finally:
         be.close()
 

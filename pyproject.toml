@@ -10,12 +10,13 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = ["torch"]
+dependencies = ["numpy"]
 
 [project.optional-dependencies]
+ref = ["torch"]            # the CPU / torch reference backends and host drafters; gc-c packs run on numpy buffers
 serve = ["transformers"]
 grammar = ["xgrammar"]
-test = ["pytest"]
+test = ["pytest", "torch"]
 
 [project.scripts]
 goethe-engine = "goethe_engine.cli:main"

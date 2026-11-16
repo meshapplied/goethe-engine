@@ -12,9 +12,9 @@ EAGLE-1), dynamic expand + rerank (EAGLE-2 / 3), sampled children (SpecInfer); d
 the backend. check() / compatible() decide what a backend's capabilities run."""
 from dataclasses import dataclass
 
-import torch
+import numpy as np
 
-from .sampling import draw, mix, uniform
+from .sampling import draw, host, mix, uniform
 
 SALT_ACC, SALT_RES, SALT_DRAFT = 1 << 40, 1 << 41, 1 << 42  # uniform streams: acceptance coins, residual, drafter
 
@@ -88,15 +88,16 @@ def path(parents, i):
 def mss(p, kids, seed, i):
     """Multi-step speculative sampling at one node (SpecInfer Algorithm 2 VerifyStochastic): p the target distribution,
     kids [(token, q or None: one-hot)] in draft order. Returns (token, index of the accepted kid or None)."""
+    p = np.asarray(host(p), dtype=np.float64)
     for r, (x, q) in enumerate(kids):
         qx = 1.0 if q is None else float(q[x])
         if qx > 0 and uniform(mix(seed, SALT_ACC + r), i) * qx < float(p[x]):
             return x, r
-        res = p.clone()
+        res = np.array(p, dtype=np.float64)
         if q is None:
             res[x] = 0
         else:
-            res = (p - q.to(p)).clamp(min=0)
+            res = np.maximum(p - host(q).astype(np.float64), 0)
         if res.sum() > 0:
             p = res / res.sum()
     return draw(p, uniform(mix(seed, SALT_RES), i)), None
@@ -149,6 +150,7 @@ class TreeDrafter:
 
     def _pick(self, s, lp, n, at):
         """n children of a node whose next token sits at absolute index at: (token, q, log-prob) each."""
+        import torch   # host drafters are torch models (ref.DraftLM, EagleHead, MedusaHeads)
         if self.t == 0:
             top = torch.sort(lp, descending=True, stable=True).indices[:n].tolist()
             return [(x, None, float(lp[x])) for x in top]
@@ -172,6 +174,7 @@ class TreeDrafter:
                     continue
                 p = node[c[:-1]]
                 if p not in lps:
+                    import torch
                     lps[p] = torch.sort(m.dist(s, self._path(toks, par, p)), descending=True, stable=True).indices
                 toks.append(int(lps[p][c[-1]]))
                 par.append(p)
