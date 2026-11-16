@@ -74,6 +74,8 @@ class Server:
         self.engine, self.tok, self.name, self.ctx, self.key = engine, tok, name, ctx, api_key
         self.embedding = hasattr(engine, "submit") and hasattr(engine, "embed")
         self.seq2seq = hasattr(engine, "frames")
+        self.media = hasattr(engine, "text") and hasattr(engine, "transcribe")      # MediaRunner: a media model (audio into a decoder)
+        self.lock, self.instruction = threading.Lock(), None
         self.pending, self.wake, self.stop, self.dead = {}, threading.Event(), False, None
         self.created = int(time.time())
         self.thread = threading.Thread(target=self._loop, daemon=True, name="engine")
@@ -81,7 +83,7 @@ class Server:
     def _loop(self):
         try:
             while not self.stop:
-                if self.embedding or not self.engine.has_work():   # an embedding runner runs on its own thread
+                if self.embedding or self.media or not self.engine.has_work():   # embedding / media runners: no engine loop
                     self.wake.wait(0.05)
                     self.wake.clear()
                     continue
@@ -208,10 +210,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(401, "invalid api key", "authentication_error")
             if path not in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/audio/transcriptions"):
                 raise ApiError(404, f"no route {path}", "not_found_error")
-            kind = "embedding" if self.srv.embedding else "encoder-decoder" if self.srv.seq2seq else "decoder"
-            want = {"/v1/embeddings": "embedding", "/v1/audio/transcriptions": "encoder-decoder"}.get(path, "decoder")
-            if kind != want:
+            kind = "embedding" if self.srv.embedding else "encoder-decoder" if self.srv.seq2seq else "media" if self.srv.media else "decoder"
+            want = {"/v1/embeddings": ("embedding",), "/v1/audio/transcriptions": ("encoder-decoder", "media")}.get(path, ("decoder",))
+            if kind not in want:
                 raise ApiError(400, f"{path}: this model is {'an' if kind[0] in 'ae' else 'a'} {kind} model", code="unsupported_task")
+            if self.srv.media:
+                return self._transcribe_media(raw)
             try:
                 body = json.loads(raw)
             except ValueError:
@@ -264,6 +268,61 @@ class Handler(BaseHTTPRequestHandler):
             rows.append(dict(object="embedding", index=i, embedding=e))
         n = sum(len(t) for t in items)
         self._json(200, dict(object="list", data=rows, model=s.name, usage=dict(prompt_tokens=n, total_tokens=n)))
+
+    # --- transcriptions (media model): OpenAI multipart
+    def _transcribe_media(self, raw):
+        """POST /v1/audio/transcriptions, multipart/form-data: file (WAV in the core path; other containers through ffmpeg when it is on
+        PATH), model, prompt (the instruction: only when the pack declares it), response_format json | text, temperature 0 only,
+        language (only when declared). The prompt is the text model's chat template over the media marker and the instruction."""
+        import email.parser
+        s = self.srv
+        ct = self.headers.get("Content-Type", "")
+        if not ct.startswith("multipart/form-data"):
+            raise ApiError(400, "body must be multipart/form-data (file, model, ...)", code="invalid_request")
+        msg = email.parser.BytesParser().parsebytes(b"Content-Type: " + ct.encode() + b"\r\n\r\n" + raw)
+        if not msg.is_multipart():
+            raise ApiError(400, "multipart body without parts", code="invalid_request")
+        fields, upload = {}, None
+        for part in msg.get_payload():
+            name = part.get_param("name", header="content-disposition")
+            if name == "file":
+                upload = part.get_payload(decode=True)
+            elif name:
+                fields[name] = (part.get_payload(decode=True) or b"").decode("utf-8", "replace")
+        if not upload:
+            raise ApiError(400, "file is required", code="invalid_parameter", param="file")
+        for k in fields:
+            if k not in ("model", "prompt", "response_format", "temperature", "language"):
+                raise ApiError(400, f"{k} is not supported", code="unsupported_parameter", param=k)
+        if fields.get("temperature") not in (None, "", "0", "0.0"):
+            raise ApiError(400, "temperature: transcription is greedy (temperature 0 only)", code="unsupported_parameter", param="temperature")
+        fmt = fields.get("response_format", "json")
+        if fmt not in ("json", "text"):
+            raise ApiError(400, "response_format must be json or text", code="invalid_parameter", param="response_format")
+        bucket = s.engine.be.bucket
+        req = {k: fields[k] for k in ("language",) if fields.get(k)}
+        if fields.get("prompt"):
+            req["instruction"] = fields["prompt"]
+        r = checked("transcribe", req, s)
+        instr = r.get("instruction", (bucket.get("io") or {}).get("instruction", s.instruction or ""))
+        pcm = decode_audio(upload, s.engine.be.rate)
+        max_new = (bucket.get("io") or {}).get("max_new_tokens") or max(1, bucket["maxctx"] // 4)
+        try:
+            with s.lock:
+                prompt = s.engine.text.render(s.engine.be.marker + instr)
+                ids = s.engine.transcribe([pcm], prompt, max_new)
+                text = s.engine.text.detokenize(ids)
+        except P_.PackError as e:
+            raise ApiError(400, str(e), code=e.code)
+        if fmt == "text":
+            b = text.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+            return
+        self._json(200, dict(text=text))
 
     # --- transcriptions (encoder-decoder)
     def _transcribe(self, body):
@@ -401,6 +460,28 @@ class Handler(BaseHTTPRequestHandler):
             s.pending.pop(rid, None)
 
 
+def decode_audio(data, rate):
+    """float32 mono PCM at rate: a WAV at that rate in the core path (stdlib); anything else (another rate, mp3, flac, ogg) through
+    ffmpeg when it is on PATH, else refused (code unsupported_media, HTTP 415)."""
+    import shutil
+    import subprocess
+    import numpy as np
+    from .media import read_wav
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        try:
+            return read_wav(data, rate)
+        except P_.PackError as e:
+            if "Hz" not in str(e) or not shutil.which("ffmpeg"):
+                raise ApiError(415 if "Hz" in str(e) else 400, str(e), code="unsupported_media", param="file")
+    if not shutil.which("ffmpeg"):
+        raise ApiError(415, f"the upload is not a {rate} Hz WAV and ffmpeg is not on PATH to convert it", code="unsupported_media", param="file")
+    r = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", "pipe:0", "-f", "f32le", "-ac", "1", "-ar", str(rate), "pipe:1"],
+                       input=data, capture_output=True, timeout=600)
+    if r.returncode or not r.stdout:
+        raise ApiError(415, f"ffmpeg could not decode the upload: {r.stderr.decode(errors='replace')[-200:]}", code="unsupported_media", param="file")
+    return np.frombuffer(r.stdout, np.float32).copy()
+
+
 def build(args):
     """(engine, tokenizer, ctx) from the CLI args: a pack backend, or the CPU reference model with --ref."""
     from . import registry
@@ -427,13 +508,17 @@ def build(args):
     else:
         if not (args.pack and args.weights):
             raise SystemExit("serve needs --pack FILE and --weights PATH... (or --ref for the CPU reference model)")
-        if len(args.weights) > 2:
+        if len(args.weights) > 2 and registry.pack_type(args.pack) != "media":
             raise SystemExit("--weights takes the target model (a GGUF file, or a checkpoint directory) and optionally a drafter file (speculative pair)")
         from . import api
-        mo = api.Model([args.pack] + list(args.overlay or []), args.weights[0], drafter=args.weights[1] if len(args.weights) > 1 else None,
+        media = registry.pack_type(args.pack) == "media"         # a media model's weights are its projector and its text model
+        mo = api.Model([args.pack] + list(args.overlay or []), args.weights if media else args.weights[0],
+                       drafter=args.weights[1] if len(args.weights) > 1 and not media else None,
                        device=args.device, store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act,
                        kv=args.kv, config=dict(max_num_seqs=args.max_running_requests, max_model_len=args.context_length,
                                                kv_dtype="f16" if args.kv == "auto" else args.kv))
+        if mo.type == "media":                   # the library tokenizes; the text model GGUF carries the template and the pieces
+            return mo.runner, None, args.context_length or mo.backend.bucket["maxctx"]
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
         if not os.path.exists(os.path.join(tdir, "tokenizer.json")) and not args.tokenizer:
             raise SystemExit("no tokenizer: pass --tokenizer DIR (a Hugging Face tokenizer directory)")
@@ -457,7 +542,9 @@ def parser():
     ap.add_argument("--served-model-name")
     ap.add_argument("--api-key")
     ap.add_argument("--pack", metavar="FILE", help="signed kernel pack (.gcpack, signature in FILE.sig)")
-    ap.add_argument("--weights", nargs="+", metavar="PATH", help="target weights, then a drafter's for a speculative pair")
+    ap.add_argument("--weights", nargs="+", metavar="PATH", help="target weights, then a drafter's for a speculative pair (a media model: "
+                                                                 "its projector, then its text model)")
+    ap.add_argument("--instruction", help="media models: the transcription instruction when the pack's bucket declares none (io.instruction)")
     ap.add_argument("--tokenizer", metavar="DIR", help="Hugging Face tokenizer dir (default: the weights' dir)")
     ap.add_argument("--numerics", choices=NK.CHOICES, default="invariant",
                     help="reference: bitwise llama.cpp, one stream; invariant: independent of the batch (invariant-hp: 16-bit "
@@ -475,6 +562,7 @@ def parser():
 def make_server(args):
     eng, tok, ctx = build(args)
     s = Server(eng, tok, args.served_model_name or "goethe-engine", ctx, args.api_key)
+    s.instruction = getattr(args, "instruction", None)
     s.thread.start()
     h = type("H", (Handler,), {"srv": s})
     httpd = ThreadingHTTPServer((args.host, args.port), h)

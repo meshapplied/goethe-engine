@@ -100,6 +100,7 @@ class GcMedia:
         self._ck(L.gcm_provenance(self.h, buf, len(buf)))
         self.bound = json.loads(buf.value.decode())
         check_provenance(b, self.bound)
+        self.files = ws
         self.n_embd = L.gcm_n_embd(self.h)
         want = (io.get("out") or {}).get("n_embd")
         P.need(want in (None, self.n_embd), f"bucket {b['id']}: io.out.n_embd {want}, the library reports {self.n_embd}")
@@ -166,9 +167,12 @@ class GcMedia:
 
 
 def read_wav(path, rate=None):
-    """float32 mono samples of a PCM16 / PCM32 / float32 WAV (channels averaged); refuses a rate other than `rate`."""
-    with open(path, "rb") as f:
-        raw = f.read()
+    """float32 mono samples of a PCM16 / PCM32 / float32 WAV file or bytes (channels averaged); refuses a rate other than `rate`."""
+    if isinstance(path, (bytes, bytearray)):
+        raw, path = bytes(path), "upload"
+    else:
+        with open(path, "rb") as f:
+            raw = f.read()
     P.need(raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", f"{path}: not a RIFF WAVE file")
     i, fmt, data = 12, None, None
     while i + 8 <= len(raw):
@@ -187,11 +191,56 @@ def read_wav(path, rate=None):
     return x.reshape(-1, ch).mean(1) if ch > 1 else x
 
 
+class TextModel:
+    """What turns a request into the library's prompt and its ids into text, read from the text model GGUF's tokenizer keys: the chat
+    template (tokenizer.chat_template, rendered with one user message, the generation prompt and reasoning off), the token pieces
+    (tokenizer.ggml.tokens; control tokens skipped) and the piece encoding (tokenizer.ggml.model: gpt2 byte-level, else sentencepiece)."""
+
+    def __init__(self, path):
+        from . import structure
+        kv, _ = structure.gguf_header(path)
+        self.template, self.kind = kv.get("tokenizer.chat_template"), kv.get("tokenizer.ggml.model")
+        self.pieces, self.types = kv.get("tokenizer.ggml.tokens") or [], kv.get("tokenizer.ggml.token_type") or []
+        b = kv.get("tokenizer.ggml.bos_token_id")
+        self.bos = self.pieces[b] if b is not None and b < len(self.pieces) else ""
+
+    def render(self, content):
+        import jinja2
+        P.need(self.template, "the text model has no tokenizer.chat_template: pass a templated prompt")
+        t = jinja2.Environment(loader=jinja2.BaseLoader(), keep_trailing_newline=True).from_string(self.template)
+        return t.render(messages=[dict(role="user", content=content)], add_generation_prompt=True, enable_thinking=False,
+                        bos_token=self.bos)
+
+    def detokenize(self, ids):
+        keep = [self.pieces[i] for i in ids if 0 <= i < len(self.pieces) and (i >= len(self.types) or self.types[i] != 3)]
+        if self.kind == "gpt2":                       # byte-level BPE: each character stands for one byte
+            bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+            cs, n = bs[:], 0
+            for c in range(256):
+                if c not in bs:
+                    bs.append(c)
+                    cs.append(256 + n)
+                    n += 1
+            dec = {chr(c): b for b, c in zip(bs, cs)}
+            return bytes(dec.get(ch, 32) for ch in "".join(keep)).decode("utf-8", "replace")
+        out = bytearray()
+        for p in keep:                                 # sentencepiece: U+2581 is a space, <0xXX> a byte
+            out += bytes([int(p[3:5], 16)]) if len(p) == 6 and p.startswith("<0x") and p.endswith(">") else p.replace("\u2581", " ").encode()
+        return out.decode("utf-8", "replace")
+
+
 class MediaRunner:
     """transcribe: the prompt's chunks, each media marker's item encoded into rows, then the decode."""
 
     def __init__(self, backend, cfg=None, **_):
-        self.be = backend
+        self.be, self._text = backend, None
+
+    @property
+    def text(self):
+        """The text model's tokenizer view (the variant's last weight file), loaded on first use."""
+        if self._text is None:
+            self._text = TextModel(self.be.files[-1])
+        return self._text
 
     def transcribe(self, media, prompt, max_tokens=2048):
         """Generated ids of prompt (chat-templated, one backend.marker per item of media, a list of PCM arrays) at temperature 0."""
@@ -204,6 +253,10 @@ class MediaRunner:
             chunks.append((kind, self.be.encode_audio(media[k])))
             k += 1
         P.need(k == len(media), f"{len(media)} media item(s), the prompt has {k} marker(s) ({self.be.marker!r})")
+        n = sum(len(x) for _, x in chunks)
+        lim = self.be.bucket["maxctx"]
+        P.need(n + max_tokens <= lim, f"prompt and media take {n} positions, with max_new_tokens {max_tokens} more than the context {lim} "
+                                     "(shorter audio or fewer new tokens)")
         return self.be.decode(chunks, max_tokens)
 
     def numerics(self):

@@ -53,12 +53,19 @@ def _str(b):
 
 
 def gguf(path, tensors, kv=None, align=32):
-    """A GGUF v3 file with zero data: tensors [(name, dims, ggml type id)], kv {key: str}."""
+    """A GGUF v3 file with zero data: tensors [(name, dims, ggml type id)], kv {key: str | int | [str] | [int]}."""
     import struct
     kv = kv or {"general.architecture": "toy"}
     out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv))
+    def val(v):                       # str, int (uint32), or a list of str / int
+        if isinstance(v, str):
+            return struct.pack("<I", 8) + _str(v.encode())
+        if isinstance(v, int):
+            return struct.pack("<II", 4, v)
+        et = 8 if v and isinstance(v[0], str) else 5
+        return struct.pack("<IIQ", 9, et, len(v)) + b"".join(_str(x.encode()) if et == 8 else struct.pack("<i", x) for x in v)
     for k, v in kv.items():
-        out += _str(k.encode()) + struct.pack("<I", 8) + _str(v.encode())
+        out += _str(k.encode()) + val(v)
     off = 0
     for n, d, t in tensors:
         out += _str(n.encode()) + struct.pack("<I", len(d)) + b"".join(struct.pack("<Q", x) for x in d) + struct.pack("<IQ", t, off)

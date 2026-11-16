@@ -112,3 +112,81 @@ def test_media_path_never_imports_torch(tmp_path, key, mockgcm):
             "m.transcribe([__import__('numpy').ones(4, 'float32')], '<m>', 2); m.close(); assert 'torch' not in sys.modules, 'torch imported'")
     root = os.path.join(os.path.dirname(__file__), "..")
     subprocess.run([sys.executable, "-c", code], check=True, cwd=root, env=dict(os.environ, PYTHONPATH=root))
+
+
+def mm_parts(fields, upload=None, ctype="audio/wav"):
+    """A multipart/form-data body and its content type."""
+    b = "goethebnd"
+    out = b""
+    for k, v in fields.items():
+        out += f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    if upload is not None:
+        out += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="a"\r\nContent-Type: {ctype}\r\n\r\n'.encode() + upload + b"\r\n"
+    return out + f"--{b}--\r\n".encode(), f"multipart/form-data; boundary={b}"
+
+
+def test_openai_transcriptions_route(tmp_path, key, mockgcm, monkeypatch):
+    """POST /v1/audio/transcriptions (multipart) on a media pack: WAV decoded in the core path, the prompt rendered from the text model's
+    chat template, ids detokenized from its pieces; non-WAV without ffmpeg refused by name (415); temperature / undeclared params /
+    bad multipart / audio past the context refused in the one error shape."""
+    import json as J
+    import threading
+    import urllib.request
+    from goethe_engine import serve
+    from toypack import gguf
+    (tmp_path / "m").mkdir()
+    pack, ws = media_pack(tmp_path / "m", key, mockgcm)
+    pieces = [chr(65 + i % 26) for i in range(1100)]          # id -> one letter; ids 1000.. are the mock's tail
+    gguf(ws[1], [("a.weight", [64, 8], 2), ("b.weight", [64], 0)], {"general.architecture": "toy", "tokenizer.ggml.model": "llama",
+         "tokenizer.ggml.tokens": pieces, "tokenizer.chat_template": "{% for m in messages %}[{{ m.content }}]{% endfor %}"})
+    monkeypatch.setenv("GOETHE_ENGINE_ALLOW_UNSIGNED", "1")    # the text GGUF changed after signing would not matter; structure did not
+    args = serve.parser().parse_args(["--pack", pack, "--weights", *ws, "--port", "0", "--instruction", "hi"])
+    from goethe_engine import pack as P
+    monkeypatch.setattr(P, "device", lambda i=None: dict(platform="cuda", name="toy", cc="12.0", sms=170, smem_block=1, cuda="12.8",
+                                                          arch_ok=P.cuda_arch_ok))
+    httpd, s = serve.make_server(args)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def post(fields, upload=None, ctype="audio/wav", raw=None):
+        body, ct = (raw, "multipart/form-data; boundary=x") if raw is not None else mm_parts(fields, upload, ctype)
+        rq = urllib.request.Request(base + "/v1/audio/transcriptions", data=body, headers={"Content-Type": ct})
+        try:
+            r = urllib.request.urlopen(rq, timeout=30)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+    try:
+        w = str(tmp_path / "a.wav")
+        wav(w, [0, 16384, 16384, 16384] * 4)
+        st, b = post(dict(model="x"), open(w, "rb").read())
+        r = J.loads(b)
+        # prompt "[<m>hi]" -> text chunks "[" and "hi]", one audio chunk of 4 rows; mock decode ids -> pieces
+        assert st == 200 and isinstance(r["text"], str) and len(r["text"]) > 0
+        st, b = post(dict(model="x", response_format="text"), open(w, "rb").read())
+        assert st == 200 and b.decode() == r["text"]
+        for fields, code, param in ((dict(temperature="0.7"), "unsupported_parameter", "temperature"),
+                                    (dict(language="en"), "unsupported_parameter", "language"),
+                                    (dict(response_format="srt"), "invalid_parameter", "response_format"),
+                                    (dict(speed="2"), "unsupported_parameter", "speed")):
+            st, b = post(fields, open(w, "rb").read())
+            e = J.loads(b)["error"]
+            assert st == 400 and e["code"] == code and e["param"] == param, (fields, e)
+        monkeypatch.setenv("PATH", "/nonexistent")
+        st, b = post({}, b"ID3 not a wav", "audio/mpeg")
+        assert st == 415 and J.loads(b)["error"]["code"] == "unsupported_media"
+        st, b = post({}, raw=b"garbage")
+        assert st == 400 and J.loads(b)["error"]["code"] in ("invalid_request", "invalid_parameter")
+    finally:
+        httpd.shutdown()
+        s.stop = True
+
+
+def test_audio_past_the_context_is_refused(tmp_path, key, mockgcm):
+    from goethe_engine import api
+    (tmp_path / "m").mkdir()
+    pack, ws = media_pack(tmp_path / "m", key, mockgcm)
+    with api.open(pack, ws, device=0, sku="mock", trusted=(key.kid,)) as m:
+        assert m.transcribe([np.ones(400, np.float32)], "<m>", 8)                         # 100 rows + 8 <= 256
+        with pytest.raises(P.PackError, match="more than the context 256"):
+            m.transcribe([np.ones(1200, np.float32)], "<m>", 8)                            # 300 rows
