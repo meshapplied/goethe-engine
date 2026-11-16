@@ -608,3 +608,37 @@ def test_numerics_keywords_resolve_and_old_names_warn(capsys):
     with pytest.raises(ValueError):
         NK.resolve("bogus")
     assert callable(P.wanted("reference")) and callable(P.wanted("invariant-hp")) and callable(P.wanted("exact"))
+
+
+def test_manifest_limits_desc_broken_and_name(tmp_path, key, mocklib):
+    """model.limits refuses a longer context with its why and caps the handle; a variant marked broken refuses unless allow_broken;
+    a no-match refusal names each variant's desc and where other weights go; model.name is required from abi minor 1."""
+    from goethe_engine.gc_c import GcBackend
+
+    def mut(m):
+        m["abi"] = "3.1.0"
+        m["model"].update(name="toy", limits=[dict(maxctx=100, why="sparse FA not yet implemented: ctx > 100")])
+        m["variants"]["q4"]["desc"] = dict(format="gguf", quant="q4_0", registry_key="toy")
+    pack, w, dw = toy_pack(str(tmp_path / "a"), key, mocklib, mutate=mut)
+    with pytest.raises(P.PackError, match="context 200 > 100: sparse FA not yet implemented"):
+        GcBackend(pack, w, sku="mock", trusted=(key.kid,), ctx=200)
+    be = GcBackend(pack, w, sku="mock", trusted=(key.kid,))
+    assert be.max_len == 100 and be.limit[0] == 100
+    be.close()
+    with pytest.raises(P.PackError, match=r"variant q4 \[gguf q4_0 \(toy\)\].*generated-QDesc"):
+        GcBackend(pack, dw, sku="mock", trusted=(key.kid,))
+
+    def broken(m):
+        mut(m)
+        m["variants"]["q4"]["desc"]["broken"] = "binding fix pending"
+    pack, w, _ = toy_pack(str(tmp_path / "b"), key, mocklib, mutate=broken)
+    with pytest.raises(P.PackError, match="marked broken: binding fix pending"):
+        GcBackend(pack, w, sku="mock", trusted=(key.kid,))
+    GcBackend(pack, w, sku="mock", trusted=(key.kid,), allow_broken=True).close()
+
+    def noname(m):
+        mut(m)
+        del m["model"]["name"]
+    pack, _, _ = toy_pack(str(tmp_path / "c"), key, mocklib, mutate=noname)
+    with pytest.raises(P.PackError, match="model.name"):
+        P.verify(pack, trusted=(key.kid,))

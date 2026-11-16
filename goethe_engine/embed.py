@@ -56,23 +56,23 @@ def encode_buckets(m):
 class GcEmbed:
     """An encode bucket of a gc-c pack: gc_open on that one bucket, gc_embed per launch."""
 
-    def __init__(self, pack, weights, *, device=-1, contract=None, sku=None, trusted=None, store=None, numerics="invariant", price=None, **_):
+    def __init__(self, pack, weights, *, device=-1, contract=None, sku=None, trusted=None, store=None, numerics="invariant", price=None, allow_broken=False, **_):
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open(weights, device, contract, sku, numerics, price)
+            self._open(weights, device, contract, sku, numerics, price, allow_broken)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, device, contract, sku, numerics, price=None):
+    def _open(self, weights, device, contract, sku, numerics, price=None, allow_broken=False):
         ws = [weights] if isinstance(weights, str) else list(weights)
         want = P.wanted(numerics, single=True)
 
         def pick(m, dev):
             b = P.select(m, sku=sku, dev=dev, contract=contract, want=want, kind="encode")
             return b, [b], b
-        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device, price=price)
+        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
         self.m = dict(br.m, buckets=encode_buckets(br.m))
         b = self.bucket = br.bucket
         lib = br.lib
@@ -99,6 +99,8 @@ class GcEmbed:
         P.need(lo.flags & L_EMBED, f"bucket {b['id']}: the library does not report GC_L_EMBED")
         self.layout, self.dim, self.pool = lo, lo.embd_dim, POOLS.get(lo.embd_pool, "none")
         self.max_cols, self.max_seqs, self.max_len = lo.max_cols, lo.max_seqs, lo.max_ctx
+        lim = P.ctx_limit(self.m)
+        self.max_len = min(self.max_len, lim[0]) if lim else self.max_len
         self.numerics = dict(contract=b["contract"], determinism=b.get("determinism"))
 
     def _ck(self, rc):

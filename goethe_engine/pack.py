@@ -90,6 +90,11 @@ def validate(m, loader_abi=ABI):
     ws = m["model"].get("weights")
     need(isinstance(ws, list) and ws and all(isinstance(w, dict) and isinstance(w.get("file"), str) for w in ws),
          "model.weights: the list of weight files the gates ran on")
+    need(pv[1] < 1 or isinstance(m["model"].get("name"), str) and m["model"]["name"],
+         f"pack abi {m['abi']}: model.name (the model's identity) is required from minor 1 (3.1, 4.1)")
+    lim = m["model"].get("limits", [])
+    need(isinstance(lim, list) and all(isinstance(x, dict) and isinstance(x.get("maxctx"), int) and isinstance(x.get("why"), str) for x in lim),
+         "model.limits: [{maxctx, why}]")
     vs = m.get("variants")
     need(isinstance(vs, dict) and vs, "manifest lacks variants")
     for vid, v in vs.items():
@@ -818,17 +823,39 @@ def P_has(m, b):
     return prefill(m, b) is not None
 
 
-def pick_variant(m, files, role="target"):
-    """The id of the variant of role whose structure the model files have (header-only reads); refuses naming why each variant differs."""
+def desc(v):
+    """A variant's description for messages (manifest variants[id].desc {format, quant, registry_key, broken?}): 'format quant (key)'."""
+    d = v.get("desc") or {}
+    return " ".join(str(d[k]) for k in ("format", "quant") if d.get(k)) + (f" ({d['registry_key']})" if d.get("registry_key") else "")
+
+
+def pick_variant(m, files, role="target", allow_broken=False):
+    """The id of the variant of role whose structure the model files have (header-only reads). Refuses naming why each variant
+    differs (with its desc) and where other weights go; a matched variant whose desc marks it broken is refused with that text
+    unless allow_broken."""
     ids = sorted({b["variant"] for b in m["buckets"] if b["role"] == role})
     why = []
     for v in ids:
         try:
             structure.check(m["variants"][v]["structure"], files)
-            return v
         except structure.StructureError as e:
-            why.append(f"variant {v}: {e}")
-    raise PackError(f"{files}: not a model this pack was compiled for ({'; '.join(why) or 'no ' + role + ' buckets'})")
+            why.append(f"variant {v} [{desc(m['variants'][v]) or 'no desc'}]: {e}")
+            continue
+        broken = (m["variants"][v].get("desc") or {}).get("broken")
+        need(not broken or allow_broken, f"variant {v} [{desc(m['variants'][v])}] is marked broken: {broken} (refused; allow_broken "
+                                         "opens it for debugging)")
+        return v
+    raise PackError(f"{files}: not a model this pack was compiled for ({'; '.join(why) or 'no ' + role + ' buckets'}). Other weights "
+                    "of this architecture: build a variant for them (gc pack with the generated-QDesc path for a new format), then "
+                    "pass that pack or overlay")
+
+
+def ctx_limit(m, ctx=None):
+    """(maxctx, why) of the model's tightest limit (model.limits), or None; refuses a requested ctx beyond it with its why text."""
+    lim = min(m["model"].get("limits") or [], key=lambda x: x["maxctx"], default=None)
+    if lim and ctx is not None:
+        need(ctx <= lim["maxctx"], f"context {ctx} > {lim['maxctx']}: {lim['why']} (refused)")
+    return (lim["maxctx"], lim["why"]) if lim else None
 
 
 def for_variant(m, target, drafter=None):
@@ -881,13 +908,14 @@ class Branch:
         self.m, self.dev, self.bucket, self.load, self.lib = m, dev, bucket, load, lib
 
 
-def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1, price=None):
+def open_branch(st, files, pick, *, drafter_files=None, sku=None, ordinal=-1, price=None, allow_broken=False):
     """The one open sequence of every model type: the weights pick their variant by structure (header reads), the manifest is
     restricted to it, pick(m, dev) -> (bucket, [buckets to load], lib bucket) chooses on the device (dev None when sku names the
     SKU), the weights are checked against the variant, only the loaded buckets' blobs are read, and the lib bucket's files are
     materialized. price(sku, dev) -> predicted cost: pick_sku's ranking among fitting SKUs (the probe-lite hook; None: SM count)."""
     m0 = st.manifest
-    m = restrict(for_variant(m0, pick_variant(m0, files), pick_variant(m0, drafter_files, "drafter") if drafter_files else None))
+    m = restrict(for_variant(m0, pick_variant(m0, files, allow_broken=allow_broken),
+                             pick_variant(m0, drafter_files, "drafter", allow_broken) if drafter_files else None))
     dev = None if sku else dict(device(None if ordinal < 0 else ordinal), **({"price": price} if price else {}))
     b, load, top = pick(m, dev)
     check_weights(m, files, drafter_files)

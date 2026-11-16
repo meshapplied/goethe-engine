@@ -67,22 +67,22 @@ class GcMedia:
     """The media encode bucket of a pack: its library opened on the variant's weight files in model.weights order (gcm_open: the
     media projector, then the text model)."""
 
-    def __init__(self, pack, weights, *, device=-1, sku=None, trusted=None, store=None, numerics="invariant", price=None, **_):
+    def __init__(self, pack, weights, *, device=-1, sku=None, trusted=None, store=None, numerics="invariant", price=None, allow_broken=False, **_):
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
-            self._open([weights] if isinstance(weights, str) else list(weights), device, sku, numerics, price)
+            self._open([weights] if isinstance(weights, str) else list(weights), device, sku, numerics, price, allow_broken)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, ws, device, sku, numerics, price=None):
+    def _open(self, ws, device, sku, numerics, price=None, allow_broken=False):
         want = P.wanted(numerics, single=True)
 
         def pick(m, dev):
             b = P.select(m, sku=sku, dev=dev, want=lambda x: want(x) and bool((x.get("io") or {}).get("media")), kind="encode")
             return b, [b], b
-        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device, price=price)
+        br = P.open_branch(self.stage, ws, pick, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
         self.m, b = dict(br.m, buckets=media_buckets(br.m)), br.bucket
         self.bucket, io = b, b["io"]
         self.io = io

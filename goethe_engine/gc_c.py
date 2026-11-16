@@ -83,18 +83,19 @@ def arr(ctype, xs):
 class GcBackend:
     def __init__(self, pack, weights, *, B=8, ctx=None, contract=None, sku=None, pool_blocks=None,
                  drafter_weights=None, policy=None, trusted=None, device=-1, state_pages=4,
-                 numerics="invariant", act="auto", kv="auto", store=None, plen=None, price=None):
+                 numerics="invariant", act="auto", kv="auto", store=None, plen=None, price=None, allow_broken=False):
         """store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
             self._open(weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, (numerics, act, kv), plen,
-                       price)
+                       price, allow_broken)
         except BaseException:
             self.close()
             raise
 
-    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None):
+    def _open(self, weights, B, ctx, contract, sku, pool_blocks, drafter_weights, policy, device, state_pages, req, plen=None, price=None, allow_broken=False):
+        lim = P.ctx_limit(self.stage.manifest, ctx)       # a model limit refuses a longer context before anything loads
         self.spec = drafter_weights is not None
         ws = [weights] if isinstance(weights, str) else list(weights)
         dws = None if drafter_weights is None else [drafter_weights] if isinstance(drafter_weights, str) else list(drafter_weights)
@@ -121,7 +122,7 @@ class GcBackend:
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
 
-        br = P.open_branch(self.stage, ws, pick, drafter_files=dws, sku=sku, ordinal=device, price=price)
+        br = P.open_branch(self.stage, ws, pick, drafter_files=dws, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
         m, b, lad, pf, ids, pol = br.m, br.bucket, got["lad"], got["pf"], got["ids"], got["pol"]
         self.m, self.bucket = m, b
         pol_s = (policy or self._policy(pol)) if self.spec else None
@@ -153,6 +154,8 @@ class GcBackend:
         if lo.flags & L_SPEC:
             self.spec_width = lo.spec_width
             self.max_len = lo.max_ctx - 2 * lo.spec_width - 2
+        if lim:
+            self.max_len, self.limit = min(self.max_len, lim[0]), lim   # the engine refuses longer sequences (max_model_len)
         self.caps = caps_of_bucket(b, dict(kind=pol["kind"]) if self.spec else None)
         self.numerics = numerics_of(m, b)
         self.stats = dict(steps=0)
