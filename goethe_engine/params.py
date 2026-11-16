@@ -29,7 +29,7 @@ def declared(task, bucket=None):
 
 def errors(sch, v, path):
     """Violations of a JSON Schema subset (type, enum, minimum, exclusiveMinimum, maximum, minLength, maxItems, pattern, anyOf, items,
-    properties, required, additionalProperties false or a schema) as text."""
+    uniqueItems, properties, required, additionalProperties false or a schema) as text."""
     out, t = [], sch.get("type")
     kinds = {"number": (int, float), "integer": (int,), "string": (str,), "boolean": (bool,), "array": (list,), "object": (dict,),
              "null": (type(None),)}
@@ -51,6 +51,8 @@ def errors(sch, v, path):
     if isinstance(v, list):
         if "maxItems" in sch and len(v) > sch["maxItems"]:
             out.append(f"{path}: at most {sch['maxItems']} items")
+        if sch.get("uniqueItems") and len({json.dumps(x, sort_keys=True) for x in v}) < len(v):
+            out.append(f"{path}: items must be unique")
         for i, x in enumerate(v):
             out += errors(sch.get("items", {}), x, f"{path}[{i}]")
     if "pattern" in sch and isinstance(v, str) and not re.fullmatch(sch["pattern"], v):
