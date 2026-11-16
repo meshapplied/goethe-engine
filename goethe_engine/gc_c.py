@@ -105,7 +105,7 @@ class GcBackend:
         """bucket: open exactly this manifest bucket id (verification: a batch bucket with its ladder, a stream bucket alone, a prefill
         bucket beside the narrowest batch ladder of its contract) instead of selecting. store: the pack 4 blob store (P.open_store). plen: the prompt length the handle serves (picks among priced prefill buckets). state_pages: snapshot pages a page pack (no paged KV) or a bounded paged pack gets for its prefix cache."""
         self.h = self.stage = None
-        self.note = None
+        self.note, self.launch_ws, failed = None, 0, []
         self.stage = P.stage(pack, trusted=trusted, defer=True, store=store)
         try:
             while True:
@@ -113,19 +113,28 @@ class GcBackend:
                            price, allow_broken, bucket)
                 if self.spec:
                     break
+                top = self.ladder[-1]["ncol"]
                 try:
                     self._warm()
-                    break
                 except P.OutOfMemory as e:
-                    # a ladder whose launch cannot get its device memory: the next narrower ladder (never a forced bucket: a gate opens exactly one)
-                    top = self.ladder[-1]["ncol"]
+                    # the ladder's first launches need device memory the manifest's resident does not count (local memory, workspace):
+                    # the next narrower ladder (never a forced bucket: a gate opens exactly one)
                     nar = [x["ncol"] for x in self.m["buckets"] if x["batch"] and x["role"] == "target" and x["sku"] == self.bucket["sku"] and x["ncol"] < top]
                     if bucket is not None or not nar:
                         raise
-                    self.note = f"the {top}-column ladder cannot launch ({e}); opened the {max(nar)}-column one"
-                    print(f"goethe-engine: {self.note}", file=sys.stderr, flush=True)
+                    self._say(f"the {top}-column ladder cannot launch ({e})")
                     self.L.gc_close(self.h)
                     self.h, B = None, max(nar)
+                    failed.append(top)
+                    continue
+                if failed and not self.launch_ws and self.warm_bytes:
+                    # the launch memory measured on this narrower ladder: the wider one once more, its KV pool leaving room for it
+                    self.launch_ws = self.warm_bytes
+                    self._say(f"launch memory measured {self.launch_ws / 1e9:.2f} GB on the {top}-column ladder; retrying the {max(failed)}-column one with room for it")
+                    self.L.gc_close(self.h)
+                    self.h, B = None, max(failed)
+                    continue
+                break
         except BaseException:
             self.close()
             raise
@@ -145,7 +154,7 @@ class GcBackend:
                 return b, [b, db], b
             if bucket is not None:
                 lad, pf = forced(m, dev, bucket)
-                P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, lad[0]["sku"]), lad[0]["id"])
+                P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, lad[0]["sku"]), lad[0]["id"])
                 load = lad + ([pf] if pf else [])
                 got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
                 return (pf or lad[-1]), load, lad[-1]
@@ -162,7 +171,7 @@ class GcBackend:
                 return b, P.ladder(m, b), P.prefill(m, b, plen)   # prefill: a prompt chunk of W tokens a launch (ignored on a paged pack)
             # the requested batch, then the narrower batch buckets: the widest whose weights, slots, pool and scratch fit is opened
             widths = [B] + sorted({x["ncol"] for x in m["buckets"] if x["batch"] and x["role"] == "target" and 1 < x["ncol"] < B}, reverse=True)
-            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, P.overhead(m, bl[0]["sku"]), bl[0]["id"]), widths)
+            b, lad, pf = P.open_fit(at, m, ctx, lambda bl: P.fit(bl, state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, bl[0]["sku"]), bl[0]["id"]), widths)
             load = lad + ([pf] if pf else [])
             got.update(ids=[x["id"] for x in load], pol=None, lad=lad, pf=pf)
             return b, load, lad[-1]
@@ -172,7 +181,7 @@ class GcBackend:
         self.m, self.bucket, self.ladder, self.pf = m, b, lad, pf
         pol_s = (policy or self._policy(pol)) if self.spec else None
         if not self.spec:   # weights, slots and the smallest pool must fit the device; no pool_blocks: the largest that fits
-            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, P.overhead(m, b["sku"]), b["id"])
+            pool_blocks, self.resident = P.fit(lad + ([pf] if pf else []), state_pages, free, pool_blocks, self.launch_ws + P.overhead(m, b["sku"]), b["id"])
         libpath = br.lib
         self.L = bind(libpath)
         paths = ws + ([None] + dws if dws else [])     # groups: the target's files, a NULL, a drafter's (the runtime finds tensors by name)
@@ -216,6 +225,10 @@ class GcBackend:
             if rc == E_DEVICE and "out of memory" in why:
                 raise P.OutOfMemory(f"gc call failed ({rc}): {why}")
             raise RuntimeError(f"gc call failed ({rc}): {why}")
+
+    def _say(self, note):
+        self.note = note
+        print(f"goethe-engine: {note}", file=sys.stderr, flush=True)
 
     def _warm(self):
         """One step of every loaded bucket (k one-token sequences per ladder width k; a 2-token prompt through a loaded prefill chain), so a
