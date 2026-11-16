@@ -1,4 +1,5 @@
-"""Detached signatures, verify only: ECDSA P-256 / SHA-256 through the openssl CLI, key pinned by key id.
+"""Detached signatures: ECDSA P-256 / SHA-256 through the openssl CLI, key pinned by key id. Verification is the product path;
+sign_digest signs with a local private key (test keys, a publisher's own key), the one signer every harness uses.
 
 Signature file (JSON): {"schema": "gc-sig-1", "alg": "ecdsa-p256-sha256", "keyid": sha256(DER public key) hex,
 "pub": PEM public key, "sig": base64 DER signature over the exact bytes of the signed file}.
@@ -43,6 +44,15 @@ def key_id(pub_pem):
     if b"prime256v1" not in t and b"P-256" not in t:
         raise SignatureError("public key is not P-256")
     return hashlib.sha256(r.stdout).hexdigest()
+
+
+def sign_digest(hexdigest, priv_path):
+    """Signature file bytes (gc-sig-1) over the sha256 digest hexdigest with the P-256 private key at priv_path."""
+    pub = _openssl("ec", "-in", priv_path, "-pubout").stdout
+    r = _openssl("pkeyutl", "-sign", "-inkey", priv_path, "-pkeyopt", "digest:sha256", data=bytes.fromhex(hexdigest))
+    if r.returncode or not r.stdout or not pub:
+        raise SignatureError(f"signing with {priv_path} failed: {r.stderr.decode(errors='replace').strip()}")
+    return json.dumps(dict(schema=SCHEMA, alg=ALG, keyid=key_id(pub), pub=pub.decode(), sig=base64.b64encode(r.stdout).decode())).encode()
 
 
 def verify(data, sig, trusted=None, digest=None):

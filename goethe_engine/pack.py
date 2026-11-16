@@ -427,6 +427,17 @@ def _open_signed(path, sig, domain, trusted):
         raise
 
 
+def sign_pack(path, priv_path, out=None):
+    """Write out (default PATH.sig): the signature over sha256(domain + manifest bytes) of the pack at path (its magic fixes the domain);
+    returns the signer's key id."""
+    with open(path, "rb") as f:
+        v, _, _, raw, _ = read_container_v(f, os.path.getsize(path))
+    sig = sign.sign_digest(hashlib.sha256((DOMAIN4 if v == 4 else DOMAIN) + raw).hexdigest(), priv_path)
+    with open(out or path + ".sig", "wb") as f:
+        f.write(sig)
+    return json.loads(sig)["keyid"]
+
+
 def stage(pack, sig=None, loader_abi=ABI, trusted=None, arch=None, defer=False, overlays=(), store=None):
     """Verify a .gcpack: the signature (sig: path of the detached signature, default PACK.sig) over sha256(DOMAIN + manifest bytes), then
     the manifest. Blobs are extracted (hash-checked) all at once, or with defer=True only when Staged.ensure asks. overlays: overlay files

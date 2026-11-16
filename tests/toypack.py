@@ -28,14 +28,11 @@ class Key:
 
     def sign_digest(self, hexdigest):
         """A gc-sig-1 signature file whose ECDSA signature is over the given sha256 digest (what a pack's manifest is signed by)."""
-        sig = run("openssl", "pkeyutl", "-sign", "-inkey", self.priv, "-pkeyopt", "digest:sha256", input=bytes.fromhex(hexdigest)).stdout
-        return json.dumps(dict(schema=sign.SCHEMA, alg=sign.ALG, keyid=self.kid, pub=self.pem, sig=base64.b64encode(sig).decode())).encode()
+        return sign.sign_digest(hexdigest, self.priv)
 
     def sign_pack(self, path):
-        """PATH.sig for a v3 pack: the signature over sha256(b"gc-pack-3\\n" + manifest bytes)."""
-        with open(path, "rb") as f:
-            _, _, raw, _ = P.read_container(f, os.path.getsize(path))
-        open(path + ".sig", "wb").write(self.sign_digest(hashlib.sha256(P.DOMAIN + raw).hexdigest()))
+        """PATH.sig: the engine's signer (pack.sign_pack)."""
+        P.sign_pack(path, self.priv)
 
 
 def gcpack(path, manifest, blobs):
