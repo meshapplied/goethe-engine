@@ -328,10 +328,16 @@ class PlanEmbed:
 
 
 class PlanBackend:
-    """A decoder from a gc-plan pack, as a page backend (paged=False: an engine block is one sequence's llama.cpp stream and
-    recurrent slot). Prefill and decode buckets share one KV width n_kv: a bucket serves any positions whose cells fit it (cells
-    past the position are masked). A token run splits exactly into the prefill chunk lengths, largest first, the last tokens
-    one at a time through the decode bucket (padding would advance recurrent state). One sequence so far (max_seqs 1)."""
+    """A decoder from a gc-plan pack, as a page backend (paged=False: an engine block is one sequence; the backend keeps its own map
+    of sequences to llama.cpp streams and recurrent slots). Prefill and decode buckets share one KV width n_kv: a bucket serves any
+    positions whose cells fit it (cells past the position are masked). A bucket's graph fixes its streams: prefill buckets run
+    stream 0, a B-sequence decode bucket streams [0, B). So live sequences are kept packed in streams [0, n) (a finished one's
+    hole takes the last), the top stream is spare: a prefill runs in stream 0 with its occupant parked in the spare; a step that
+    decodes every live sequence runs the decode bucket of exactly that width, any other decode runs one sequence at a time the
+    same way. A token run splits exactly into the prefill chunk lengths, largest first, the last tokens through the one-sequence
+    decode bucket (padding would advance recurrent state). Buckets come in KV widths n_kv (llama.cpp's cells per stream, padded
+    to 256): a launch takes the width llama.cpp would, pad(last position + 1), so short contexts read few cells and the numerics
+    are llama.cpp's own."""
     paged, state_pages, prefix_cache, bounded = False, 0, False, False
 
     def __init__(self, pack, weights, *, device=-1, trusted=None, store=None, sku=None, price=None, allow_broken=False, **_):
@@ -339,44 +345,103 @@ class PlanBackend:
         self.stage, self.m, bs, self.rt = _open(pack, weights, ("prefill", "decode"), trusted=trusted, store=store, sku=sku,
                                                 device=device, price=price, allow_broken=allow_broken)
         io = {b["id"]: b["io"] for b in bs}
-        P.need(len({x["n_kv"] for x in io.values()}) == 1, "buckets of more than one KV width")
-        self.dec = next((b["id"] for b in bs if b["kind"] == "decode" and b["ncol"] == 1), None)
-        P.need(self.dec is not None, "the pack has no one-sequence decode bucket")
-        self.pre = sorted(((b["prefill"], b["id"]) for b in bs if b["kind"] == "prefill"), reverse=True) + [(1, self.dec)]
+        self.decs = {(b["ncol"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "decode"}   # (sequences, n_kv) -> bucket
+        self.pres = {(b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill"}
+        self.widths = sorted({w for _, w in self.decs})
+        P.need(all((1, w) in self.decs for w in self.widths), "every KV width needs a one-sequence decode bucket")
+        self.dec = self.decs[(1, self.widths[-1])]
+        self.chunks = sorted({t for t, _ in self.pres}, reverse=True)
         self.bucket = next(b for b in bs if b["id"] == self.dec)
-        self.n_kv, self.kv_size = io[self.dec]["n_kv"], io[self.dec]["kv_size"]
-        self.vocab_size, self.max_len, self.max_seqs = io[self.dec]["out"]["vocab"], self.n_kv, 1
+        self.n_kv, self.kv_size = self.widths[-1], io[self.dec]["kv_size"]
+        self.nseq = self.rt.plans[self.dec]["nseq"]
+        self.spare = self.nseq - 1
+        self.vocab_size, self.max_len = io[self.dec]["out"]["vocab"], self.n_kv
+        self.max_seqs = max(1, min(max(n for n, _ in self.decs), self.nseq - 1))
+        self.live = []                       # sids, index = stream
         from .backend import KVGeometry
-        self.geometry = KVGeometry(block_size=self.max_len, num_blocks=1, layers=1, kv_heads=1, head_dim=1)
+        self.geometry = KVGeometry(block_size=self.max_len, num_blocks=self.max_seqs, layers=1, kv_heads=1, head_dim=1)
         rec = any(re.match(r"cache_[rs]_l", k) for k in self.rt.plans[self.dec].get("caches", {}))
         self.caps = {"recurrent": "chain"} if rec else {}
         self.numerics = dict(contract=self.bucket["contract"], determinism=self.bucket.get("determinism"))
+
+    def _stream(self, sid):
+        if sid not in self.live:
+            P.need(len(self.live) < self.max_seqs, f"more than {self.max_seqs} live sequences")
+            self.live.append(sid)
+            self.rt.zero_slot(len(self.live) - 1)     # a new sequence starts from zero recurrent state
+        return self.live.index(sid)
+
+    def _width(self, end):
+        """the KV width llama.cpp reads when the last cell used is end - 1: end padded to 256, the pack's nearest at or above"""
+        w = next((x for x in self.widths if x >= -(-end // 256) * 256), None)
+        P.need(w is not None, f"position {end} past the pack's {self.widths[-1]}")
+        return w
 
     def _run(self, toks, pos):
         """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
         i, row = 0, None
         while i < len(toks):
-            T, pid = next(x for x in self.pre if x[0] <= len(toks) - i)
-            p = list(range(pos + i, pos + i + T))
-            st = Step(toks[i:i + T], [0] * T, p, p, [0] * T, self.kv_size, self.n_kv, [T - 1] if pid != self.dec else [0])
+            q = pos + i
+            T = next((t for t in self.chunks if t <= len(toks) - i and (t, self._width(q + t)) in self.pres), 1)
+            W = self._width(q + T)
+            pid = self.pres[(T, W)] if T > 1 else self.decs[(1, W)]
+            p = list(range(q, q + T))
+            st = Step(toks[i:i + T], [0] * T, p, p, [0] * T, self.kv_size, W, [T - 1] if T > 1 else [0])
             row = self.rt.step(pid, st)[-1]
             i += T
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
+    def _alone(self, w):
+        """one sequence's run in stream 0, its stream's occupant parked in the spare"""
+        k = self._stream(w.sid)
+        if k:
+            self.rt.copy_slot(0, self.spare)
+            self.rt.copy_slot(k, 0)
+        row = self._run(list(w.tokens), w.pos)
+        if k:
+            self.rt.copy_slot(0, k)
+            self.rt.copy_slot(self.spare, 0)
+        return row
+
     def step(self, work):
-        rows = []
         for w in work:
-            P.need(w.want == 1 and not w.spec and not w.feats and w.parents is None, "gc-plan decoders return the last row only so far")
+            P.need(w.want in (0, 1) and not w.spec and not w.feats and w.parents is None,
+                   "gc-plan decoders return the last row (or none, a prompt chunk before its last) so far")
             P.need(w.pos + len(w.tokens) <= self.max_len, f"position {w.pos + len(w.tokens)} past the pack's {self.max_len}")
-            rows.append(self._run(list(w.tokens), w.pos))
-        return np.stack(rows)
+        rows = {}
+        dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
+        for w in work:
+            if w not in dec:
+                rows[w.sid] = self._alone(w)
+        n = len(self.live)
+        W = self._width(max((w.pos for w in dec), default=0) + 1)
+        if dec and {w.sid for w in dec} == set(self.live) and (n, W) in self.decs:     # every live sequence, one batch
+            by = {w.sid: w for w in dec}
+            ws = [by[s] for s in self.live]
+            st = Step([w.tokens[0] for w in ws], list(range(n)), [w.pos for w in ws], [w.pos for w in ws], list(range(n)),
+                      self.kv_size, W, list(range(n)))
+            out = np.frombuffer(self.rt.step(self.decs[(n, W)], st)[-1], np.float32).reshape(n, -1)
+            for i, s in enumerate(self.live):
+                rows[s] = out[i, :self.vocab_size]
+        else:
+            for w in dec:
+                rows[w.sid] = self._alone(w)
+        keep = [rows[w.sid] for w in work if w.want]
+        return np.stack(keep) if keep else np.empty((0, self.vocab_size), np.float32)
 
     def copy_blocks(self, pairs):
         for src, dst in pairs:
             self.rt.copy_slot(src, dst)
 
     def release(self, sid):
-        self.rt.zero_slot(0)                 # the next sequence starts from zero recurrent state; stale KV cells stay masked
+        """the sequence's stream is freed: the last live sequence moves into the hole (streams stay packed)"""
+        if sid not in self.live:
+            return
+        k, last = self.live.index(sid), len(self.live) - 1
+        if k != last:
+            self.rt.copy_slot(last, k)
+            self.live[k] = self.live[last]
+        self.live.pop()
 
     def close(self):
         if self.rt:
