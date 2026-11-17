@@ -11,6 +11,7 @@ and cls pooling, per-row constants the compiler measured (io.inputs.fills), outp
 import ctypes as C
 import json
 import os
+import re
 import struct
 
 import numpy as np
@@ -236,6 +237,22 @@ class Runtime:
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
         return [h.raw for h in outs]
 
+    def _rows(self):            # (device address of sequence block 0, block bytes) of every cache (kv and recurrent state)
+        p = next(iter(self.plans))
+        base = self.bases[p]
+        for b, off, n in self.plans[p].get("caches", {}).values():
+            yield base[b] + off, n // self.plans[p]["nseq"]
+
+    def copy_slot(self, src, dst):
+        for a, row in self._rows():
+            self.ck(self.cu.cuMemcpyDtoDAsync_v2(C.c_uint64(a + dst * row), C.c_uint64(a + src * row), C.c_size_t(row), self.st), "copy slot")
+        self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
+
+    def zero_slot(self, s):
+        for a, row in self._rows():
+            self.ck(self.cu.cuMemsetD8Async(C.c_uint64(a + s * row), C.c_ubyte(0), C.c_size_t(row), self.st), "zero slot")
+        self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
+
     def close(self):
         if getattr(self, "ctx", None):
             for ge, _ in self.graphs.values():
@@ -249,7 +266,7 @@ class Runtime:
             self.ctx = None
 
 
-def _open(pack, weights, kind, *, trusted, store, sku, device, price, allow_broken):
+def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_broken):
     """(stage, manifest, [buckets of kind], Runtime): a gc-plan pack staged and verified, the buckets of that kind of the variant the
     weights match, their plans on the device"""
     stage = P.stage(pack, trusted=trusted, defer=True, store=store)
@@ -257,8 +274,8 @@ def _open(pack, weights, kind, *, trusted, store, sku, device, price, allow_brok
     sel = {}
 
     def pick(m, dev):
-        bs = [b for b in m["buckets"] if P.axes(b)[1] == kind]
-        P.need(bs, f"the pack has no {kind} bucket")
+        bs = [b for b in m["buckets"] if P.axes(b)[1] in kinds]
+        P.need(bs, f"the pack has no {'/'.join(kinds)} bucket")
         sel["all"] = bs
         return bs[0], bs, bs[0]
     br = P.open_branch(stage, ws, pick, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
@@ -277,7 +294,7 @@ class PlanEmbed:
     def __init__(self, pack, weights, *, device=-1, trusted=None, store=None, sku=None, price=None, allow_broken=False,
                  numerics="invariant", **_):
         self.rt = self.stage = None
-        self.stage, self.m, bs, self.rt = _open(pack, weights, "encode", trusted=trusted, store=store, sku=sku, device=device,
+        self.stage, self.m, bs, self.rt = _open(pack, weights, ("encode",), trusted=trusted, store=store, sku=sku, device=device,
                                                 price=price, allow_broken=allow_broken)
         self.ladder = sorted((b["maxctx"], b["id"]) for b in bs)
         self.bucket = dict(bs[0], maxctx=self.ladder[-1][0])
@@ -298,6 +315,68 @@ class PlanEmbed:
             v = np.frombuffer(self.rt.step(pid, step)[0], np.float32)[:self.dim]
             out[i] = v / max(float(np.linalg.norm(v)), 1e-12) if norm else v
         return out
+
+    def close(self):
+        if self.rt:
+            self.rt.close()
+            self.rt = None
+        if self.stage:
+            self.stage.close()
+            self.stage = None
+
+    __del__ = close
+
+
+class PlanBackend:
+    """A decoder from a gc-plan pack, as a page backend (paged=False: an engine block is one sequence's llama.cpp stream and
+    recurrent slot). Prefill and decode buckets share one KV width n_kv: a bucket serves any positions whose cells fit it (cells
+    past the position are masked). A token run splits exactly into the prefill chunk lengths, largest first, the last tokens
+    one at a time through the decode bucket (padding would advance recurrent state). One sequence so far (max_seqs 1)."""
+    paged, state_pages, prefix_cache, bounded = False, 0, False, False
+
+    def __init__(self, pack, weights, *, device=-1, trusted=None, store=None, sku=None, price=None, allow_broken=False, **_):
+        self.rt = self.stage = None
+        self.stage, self.m, bs, self.rt = _open(pack, weights, ("prefill", "decode"), trusted=trusted, store=store, sku=sku,
+                                                device=device, price=price, allow_broken=allow_broken)
+        io = {b["id"]: b["io"] for b in bs}
+        P.need(len({x["n_kv"] for x in io.values()}) == 1, "buckets of more than one KV width")
+        self.dec = next((b["id"] for b in bs if b["kind"] == "decode" and b["ncol"] == 1), None)
+        P.need(self.dec is not None, "the pack has no one-sequence decode bucket")
+        self.pre = sorted(((b["prefill"], b["id"]) for b in bs if b["kind"] == "prefill"), reverse=True) + [(1, self.dec)]
+        self.bucket = next(b for b in bs if b["id"] == self.dec)
+        self.n_kv, self.kv_size = io[self.dec]["n_kv"], io[self.dec]["kv_size"]
+        self.vocab_size, self.max_len, self.max_seqs = io[self.dec]["out"]["vocab"], self.n_kv, 1
+        from .backend import KVGeometry
+        self.geometry = KVGeometry(block_size=self.max_len, num_blocks=1, layers=1, kv_heads=1, head_dim=1)
+        rec = any(re.match(r"cache_[rs]_l", k) for k in self.rt.plans[self.dec].get("caches", {}))
+        self.caps = {"recurrent": "chain"} if rec else {}
+        self.numerics = dict(contract=self.bucket["contract"], determinism=self.bucket.get("determinism"))
+
+    def _run(self, toks, pos):
+        """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
+        i, row = 0, None
+        while i < len(toks):
+            T, pid = next(x for x in self.pre if x[0] <= len(toks) - i)
+            p = list(range(pos + i, pos + i + T))
+            st = Step(toks[i:i + T], [0] * T, p, p, [0] * T, self.kv_size, self.n_kv, [T - 1] if pid != self.dec else [0])
+            row = self.rt.step(pid, st)[-1]
+            i += T
+        return np.frombuffer(row, np.float32)[:self.vocab_size]
+
+    def step(self, work):
+        rows = []
+        for w in work:
+            P.need(w.want == 1 and not w.spec and not w.feats and w.parents is None, "gc-plan decoders return the last row only so far")
+            P.need(w.pos + len(w.tokens) <= self.max_len, f"position {w.pos + len(w.tokens)} past the pack's {self.max_len}")
+            rows.append(self._run(list(w.tokens), w.pos))
+        return np.stack(rows)
+
+    def copy_blocks(self, pairs):
+        for src, dst in pairs:
+            self.rt.copy_slot(src, dst)
+
+    def release(self, sid):
+        self.rt.zero_slot(0)                 # the next sequence starts from zero recurrent state; stale KV cells stay masked
 
     def close(self):
         if self.rt:
