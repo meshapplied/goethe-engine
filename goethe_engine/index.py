@@ -7,7 +7,7 @@ index.json (signed by index.sig, sign.py scheme, detached over the exact bytes):
                           "structure": [{"variant": str, "sha256": hex, "keys": [str]}],        # one per variant in the pack (structure.py)
                           "files": [{"name": str, "bytes": int, "sha256": hex}]},               # optional, informational: the model files the pack was
                                                                                                 #   verified on (what a client downloads); never used to match
-                "arch": "sm_120a", "abi_major": 3, "runtime": {"kind": str, "version": int}, "tier": str,
+                "arch": "sm_120a", "abi_major": 3 | 4, "runtime": {"kind": str, "version": int}, "tier": str,   # 4: blobs from the store
                 "file": "<model>.gcpack",                             # the asset name (ASCII slug), one file per model
                 "manifest_sha256": hex,                               # sha256 of the pack's manifest bytes: what `sig` signs (with the
                 "sig": {gc-sig-1 object},                             #   domain prefix of pack.py) and what a range fetch is checked against
@@ -26,7 +26,8 @@ from . import __version__, pack, sign, structure
 SCHEMA, VERSION = "gc-pack-index", 3
 HEX = re.compile(r"^[0-9a-f]{64}$")
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.gcpack$")
-RT_PREF = {"gc-c": 0}   # when several entries match: ranked by runtime, then tier, then manifest hash
+RT_PREF = {"gc-c": 0, "gc-plan": 1}   # when several entries match: ranked by runtime, then tier, then manifest hash
+MAJORS = (3, 4)         # the pack majors this loader reads (pack.py: the container's magic fixes it)
 
 
 class IndexError_(Exception):
@@ -65,7 +66,7 @@ def validate_entry(e, i):
                                                      and isinstance(x.get("bytes"), int) and x["bytes"] >= 0 and HEX.match(str(x.get("sha256")))
                                                      for x in fl)), f"{w}: model.files is a list of {{name, bytes, sha256}}")
     need(isinstance(e.get("arch"), str) and re.fullmatch(r"sm_\d+[a-z]?", e["arch"]), f"{w}: arch is not sm_XX")
-    need(e.get("abi_major") == 3, f"{w}: abi_major")
+    need(e.get("abi_major") in MAJORS, f"{w}: abi_major")
     r = e.get("runtime")
     need(isinstance(r, dict) and isinstance(r.get("kind"), str) and isinstance(r.get("version"), int), f"{w}: runtime")
     need(isinstance(e.get("tier"), str) and re.fullmatch(r"[a-z0-9_-]+", e["tier"]), f"{w}: tier")
@@ -118,10 +119,10 @@ def model_sets(model_dir):
 def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):
     """The entries for this arch, ABI, runtime and engine version one of whose variant structures a file set of model_dir has
     (header-only), best first (see RT_PREF); each carries "variant": the matching variant id."""
-    ev, la = vtuple(engine_version, "engine version"), pack.semver(pack.ABI)[0]
+    ev = vtuple(engine_version, "engine version")
     memo, sets, hit = {}, model_sets(model_dir), []
     for e in ix["entries"]:
-        if not (e["arch"] == arch and e["abi_major"] == la and e["runtime"]["version"] in pack.RUNTIMES.get(e["runtime"]["kind"], ())
+        if not (e["arch"] == arch and e["abi_major"] in MAJORS and e["runtime"]["version"] in pack.RUNTIMES.get(e["runtime"]["kind"], ())
                 and vtuple(e["min_engine"], "min_engine") <= ev and (tier is None or e["tier"] == tier)):
             continue
         found = None
