@@ -40,8 +40,8 @@ class _Copy2D(C.Structure):         # CUDA_MEMCPY2D
 
 
 def base(name):
-    """'CUDA0#self_kq_mask#0' -> 'self_kq_mask'"""
-    return name.split("#")[1] if "#" in name else name
+    """'CUDA0#self_kq_mask#0' -> 'self_kq_mask'; a view of an input is that input's kind ('rs_s_copy (view)')"""
+    return (name.split("#")[1] if "#" in name else name).removesuffix(" (view)")
 
 
 class Step:
@@ -55,6 +55,11 @@ class Step:
 
 def generate(name, n, step, hp):
     """bytes of the plan input `name` (n bytes in the plan) for this step; hp: the bucket's io.inputs (n_pos, causal, n_swa, fills)"""
+    if "(view)" in name:                     # a slice of its base input at the element offset the compiler measured
+        o = hp.get("views", {}).get(f"{name}@{n}")
+        P.need(o is not None, f"plan input {name}: a view the pack does not place")
+        full = generate(name.replace(" (view)", ""), n + 4 * o, step, hp)
+        return full[4 * o:4 * o + n]
     k, T = base(name), len(step.tokens)
     if k in hp.get("fills", {}):
         return np.full(T, hp["fills"][k], np.float32).tobytes()

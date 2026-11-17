@@ -45,6 +45,13 @@ def test_pooling_and_fills():
     assert (rows == 2.5).all()
 
 
+def test_view_input_is_a_slice_of_its_base():
+    st = G.Step([5] * 4, [0, 1, 2, 3], range(4), range(4), [0] * 4, 4, 4, range(4))     # four sequences, one token each
+    hp = {"views": {"CUDA0#rs_s_copy (view)#0@12": 1}}
+    v = np.frombuffer(G.generate("CUDA0#rs_s_copy (view)#0", 12, st, hp), np.int32)
+    assert v.tolist() == [1, 2, 3]
+
+
 def test_unknown_input_refused():
     st = G.Step([0], [0], [0], [0], [0], 1, 1, [0])
     try:
