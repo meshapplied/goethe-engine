@@ -52,6 +52,27 @@ def test_view_input_is_a_slice_of_its_base():
     assert v.tolist() == [1, 2, 3]
 
 
+def test_lerp_plan_interpolates_widths():
+    import struct
+    fake = lambda v: struct.pack("<Q", G.FAKE0 + v).hex()
+    fd = lambda d: struct.pack("<3I", *G._fastdiv(d)).hex()
+    host = struct.pack("<Q", 0x7FFF00001000).hex()
+    act = lambda w, h: {"launch": "k", "g": [w // 256, 1, 1], "args": [fake(4 * w) + host[:0], fd(w // 128), struct.pack("<i", w).hex(), h],
+                        "ptrs": [[0, 0, 4 * w]]}
+    p0 = {"io": {"n_kv": 512}, "actions": [act(512, host)], "buffers": [{"role": "compute", "size": 1024 * 512}]}
+    p1 = {"io": {"n_kv": 2048}, "actions": [act(2048, struct.pack("<Q", 0x7FFD00002000).hex())],
+          "buffers": [{"role": "compute", "size": 1024 * 2048}]}
+    p = G.lerp_plan(p0, p1, (1536 - 512, 2048 - 512))
+    want = act(1536, host)
+    assert p["io"]["n_kv"] == 1536 and p["buffers"][0]["size"] == 1024 * 1536 and p["actions"][0] == want
+    try:
+        G.lerp_plan({"io": {"n_kv": 1}}, {"io": {"n_kv": 2}}, (1, 3))
+    except P.PackError:
+        pass
+    else:
+        raise AssertionError("a non-integer step must be refused")
+
+
 def test_unknown_input_refused():
     st = G.Step([0], [0], [0], [0], [0], 1, 1, [0])
     try:

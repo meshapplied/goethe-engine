@@ -101,11 +101,83 @@ def generate(name, n, step, hp):
     raise P.PackError(f"plan input {k}: not a kind this engine generates")
 
 
+FAKE0, FAKE_SPAN = 0xFA00000000000000, 1 << 56
+
+
+def _host(v):                    # a host address recorded inside a plan (process ASLR): never read on the device
+    return isinstance(v, int) and not isinstance(v, bool) and (1 << 40) < v < FAKE0
+
+
+def _lerp_int(v0, v1, t):
+    num = (v1 - v0) * t[0]
+    P.need(num % t[1] == 0, f"affine bucket: {v0} -> {v1} not affine at integer steps")
+    return v0 + num // t[1]
+
+
+def _fastdiv(d):                 # ggml's init_fastdiv_values: (mp, L, d)
+    L = 0
+    while L < 32 and (1 << L) < d:
+        L += 1
+    return ((1 << 32) * ((1 << L) - d) // d + 1) & 0xFFFFFFFF, L, d
+
+
+def _lerp_arg(a0, a1, t, loose):
+    """a launch argument at an interpolated width: device pointers as 64-bit words, fastdiv triples from their divisor, host
+    addresses kept, the rest 32-bit affine; loose (a CUTLASS block): only its device pointers move"""
+    b0, b1 = bytes.fromhex(a0), bytes.fromhex(a1)
+    P.need(len(b0) == len(b1), "affine bucket: argument sizes differ")
+    if b0 == b1:
+        return a0
+    if len(b0) == 12:
+        u0, u1 = struct.unpack("<3I", b0), struct.unpack("<3I", b1)
+        if _fastdiv(u0[2]) == u0 and _fastdiv(u1[2]) == u1:
+            return struct.pack("<3I", *_fastdiv(_lerp_int(u0[2], u1[2], t))).hex()
+    out, o = bytearray(b0), 0
+    while o < len(b0):
+        if o + 8 <= len(b0) and o % 8 == 0:
+            p0, p1 = struct.unpack_from("<Q", b0, o)[0], struct.unpack_from("<Q", b1, o)[0]
+            if FAKE0 <= p0 < FAKE0 + FAKE_SPAN and FAKE0 <= p1 < FAKE0 + FAKE_SPAN:
+                struct.pack_into("<Q", out, o, _lerp_int(p0, p1, t))
+                o += 8
+                continue
+            if _host(p0) and _host(p1):
+                o += 8
+                continue
+        if o + 4 <= len(b0):
+            v0, v1 = struct.unpack_from("<I", b0, o)[0], struct.unpack_from("<I", b1, o)[0]
+            if v0 != v1 and not loose:
+                struct.pack_into("<I", out, o, _lerp_int(v0, v1, t) & 0xFFFFFFFF)
+            o += 4
+        else:
+            P.need(b0[o] == b1[o], "affine bucket: a differing byte outside a word")
+            o += 1
+    return out.hex()
+
+
+def lerp_plan(x0, x1, t):
+    """a plan at width w from the plans at w0 and w1 (t = (w - w0, w1 - w0)): every differing quantity affine in the width"""
+    if isinstance(x0, dict) and "launch" in x0 and "args" in x0:
+        loose = x0["launch"].startswith("_ZN7cutlass")
+        return {**{k: lerp_plan(x0[k], x1[k], t) for k in x0 if k != "args"},
+                "args": [_lerp_arg(a, b, t, loose) for a, b in zip(x0["args"], x1["args"])]}
+    if isinstance(x0, dict):
+        P.need(x0.keys() == x1.keys(), "affine bucket: plans differ in fields")
+        return {k: lerp_plan(x0[k], x1[k], t) for k in x0}
+    if isinstance(x0, list):
+        P.need(len(x0) == len(x1), "affine bucket: plans differ in length")
+        return [lerp_plan(a, b, t) for a, b in zip(x0, x1)]
+    if x0 == x1 or (_host(x0) and _host(x1)):
+        return x0
+    P.need(isinstance(x0, int) and isinstance(x1, int) and not isinstance(x0, bool), f"affine bucket: {x0!r} vs {x1!r}")
+    return _lerp_int(x0, x1, t)
+
+
 class Runtime:
     """the device side of a gc-plan pack: one context, the plans' buffers, their cubins, the weights, a CUDA graph per bucket"""
 
-    def __init__(self, plans, blob, files, device=0):
-        """plans: {bucket id: plan dict}; blob(rel, bucket id) -> bytes of that bucket file; files: the model's weight files"""
+    def __init__(self, plans, blob, files, device=0, share=None):
+        """plans: {bucket id: plan dict}; blob(rel, bucket id) -> bytes of that bucket file; files: the model's weight files; share:
+        {bucket id: bucket id} whose scratch it reuses (the widths of an affine bucket: the widest one's buffers hold every width's)"""
         cu = self.cu = C.CDLL("libcuda.so.1")
         self.ck(cu.cuInit(0), "cuInit")
         dev, self.ctx = C.c_int(), C.c_void_p()
@@ -122,10 +194,17 @@ class Runtime:
         self.shared, self.allocs, self.bases = [], [], {}
         for r, n in shared_layout:          # zeroed, weights too: ggml zeroes a quantized tensor's row padding at load
             self.shared.append(self._alloc(n, zero=True))
-        for pid, p in plans.items():
+        share = share or {}
+        for pid, p in sorted(plans.items(), key=lambda kv: kv[0] in share):     # the owners first
             P.need([(b["role"], b["size"]) for b in p["buffers"] if b["role"] != "compute"] == shared_layout,
                    f"bucket {pid}: weights or caches laid out differently from the other buckets")
             it = iter(self.shared)
+            if pid in share:
+                own = plans[share[pid]]["buffers"]
+                P.need(len(own) == len(p["buffers"]) and all(b["size"] <= c["size"] for b, c in zip(p["buffers"], own)),
+                       f"bucket {pid}: scratch larger than its affine bucket's widest")
+                self.bases[pid] = list(self.bases[share[pid]])
+                continue
             self.bases[pid] = [next(it) if b["role"] != "compute" else self._alloc(b["size"], zero=True) for b in p["buffers"]]
         self.plans, self.fn, self.graphs, mods = plans, {}, {}, {}
         for pid, p in plans.items():
@@ -303,10 +382,25 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
     br = P.open_branch(stage, ws, pick, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
     bs = [b for b in sel["all"] if b["variant"] == br.bucket["variant"]]
     path = lambda b, rel: os.path.join(stage.dir, "blobs", b["files"][rel])
-    plans = {b["id"]: json.load(open(path(b, b["lib"]))) for b in bs}
-    byid = {b["id"]: b for b in bs}
-    rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device)
-    return stage, br.m, bs, rt
+    plans, byid, share, out = {}, {}, {}, []
+    for b in bs:
+        p0 = json.load(open(path(b, b["lib"])))
+        a = b.get("affine")
+        if not a:
+            plans[b["id"]], byid[b["id"]] = p0, b
+            out.append(b)
+            continue
+        p1, (w0, w1) = json.load(open(path(b, a["lib1"]))), (a["n_kv0"], a["n_kv1"])     # every width between, step 256
+        top = f"{b['id']}@{w1}"
+        for w in range(w0, w1 + 1, 256):
+            pid = f"{b['id']}@{w}"
+            plans[pid] = p0 if w == w0 else p1 if w == w1 else lerp_plan(p0, p1, (w - w0, w1 - w0))
+            byid[pid] = b
+            out.append({**b, "id": pid, "io": plans[pid]["io"]})
+            if w != w1:
+                share[pid] = top
+    rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device, share)
+    return stage, br.m, out, rt
 
 
 class PlanEmbed:
