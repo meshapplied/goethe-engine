@@ -136,6 +136,11 @@ class Runtime:
                 self.fn[k] = f
         self.mods = mods
         self._weights(first["weights"], files, self.bases[next(iter(plans))])
+        for pid, p in plans.items():           # init actions (e.g. a weight relaid for another kernel): once, after the weights
+            keep = []
+            for a in p.get("init", ()):
+                self._issue(a, keep, self.bases[pid])
+            self.ck(cu.cuStreamSynchronize(self.st), "init")
 
     def _alloc(self, n, zero):
         a = C.c_uint64()
@@ -170,10 +175,15 @@ class Runtime:
         addr = lambda w: base[w[0]] + w[1]
         if "launch" in a:
             args = []
-            for raw, ptrs in zip(a["args"], a["ptrs"]):
+            tm = {}
+            for i, o, t in a.get("tmaps", ()):
+                tm.setdefault(i, []).append((o, t))
+            for i, (raw, ptrs) in enumerate(zip(a["args"], a["ptrs"])):
                 raw = bytearray.fromhex(raw)
                 for o, buf, off in ptrs:
                     struct.pack_into("<Q", raw, o, base[buf] + off)
+                for o, t in tm.get(i, ()):     # a TMA descriptor in the argument: encoded by this driver at the real address
+                    raw[o:o + 128] = self._tmap(t, base[t["gaddr"][0]] + t["gaddr"][1])
                 args.append(C.create_string_buffer(bytes(raw), len(raw)))
             pp = (C.c_void_p * len(args))(*[C.cast(x, C.c_void_p) for x in args])
             keep += [args, pp]
@@ -205,6 +215,13 @@ class Runtime:
                     "copy")
         elif "gemm" in a:
             raise P.PackError("a plan calls cuBLAS: not a gc-plan pack")
+
+    def _tmap(self, t, gaddr):
+        m, r = (C.c_ubyte * 128)(), t["rank"]
+        u64, u32 = C.c_uint64 * r, C.c_uint32 * r
+        self.ck(self.cu.cuTensorMapEncodeTiled(m, t["dt"], r, C.c_void_p(gaddr), u64(*t["dims"]), (C.c_uint64 * max(r - 1, 1))(*t["strides"]),
+                                               u32(*t["box"]), u32(*t["es"]), t["il"], t["sw"], t["l2"], t["oob"]), "tensor map")
+        return bytes(m)
 
     def _graph(self, pid):
         if pid not in self.graphs:
@@ -347,12 +364,13 @@ class PlanBackend:
         io = {b["id"]: b["io"] for b in bs}
         self.decs = {(b["ncol"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "decode"}   # (sequences, n_kv) -> bucket
         self.pres = {(b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill"}
-        self.widths = sorted({w for _, w in self.decs})
-        P.need(all((1, w) in self.decs for w in self.widths), "every KV width needs a one-sequence decode bucket")
-        self.dec = self.decs[(1, self.widths[-1])]
+        self.widths = sorted({w for _, w in self.decs} | {w for _, w in self.pres})
+        P.need(any(n == 1 for n, _ in self.decs), "the pack has no one-sequence decode bucket")
+        self.dec = self.decs[max(k for k in self.decs if k[0] == 1)]
         self.chunks = sorted({t for t, _ in self.pres}, reverse=True)
         self.bucket = next(b for b in bs if b["id"] == self.dec)
         self.n_kv, self.kv_size = self.widths[-1], io[self.dec]["kv_size"]
+        P.need(all(x["kv_size"] == self.kv_size for x in io.values()), "buckets recorded at different capacities")
         self.nseq = self.rt.plans[self.dec]["nseq"]
         self.spare = self.nseq - 1
         self.vocab_size, self.max_len = io[self.dec]["out"]["vocab"], self.n_kv
@@ -371,20 +389,21 @@ class PlanBackend:
             self.rt.zero_slot(len(self.live) - 1)     # a new sequence starts from zero recurrent state
         return self.live.index(sid)
 
-    def _width(self, end):
-        """the KV width llama.cpp reads when the last cell used is end - 1: end padded to 256, the pack's nearest at or above"""
-        w = next((x for x in self.widths if x >= -(-end // 256) * 256), None)
-        P.need(w is not None, f"position {end} past the pack's {self.widths[-1]}")
-        return w
+    @staticmethod
+    def _pick(table, n, end):
+        """the bucket of table {(n, n_kv): id} for n whose KV width is the one llama.cpp reads when the last cell used is end - 1
+        (end padded to 256), else the narrowest wider one (cells past the position are masked); None: no width holds it"""
+        ws = sorted(w for k, w in table if k == n and w >= -(-end // 256) * 256)
+        return (table[(n, ws[0])], ws[0]) if ws else (None, None)
 
     def _run(self, toks, pos):
         """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
         i, row = 0, None
         while i < len(toks):
             q = pos + i
-            T = next((t for t in self.chunks if t <= len(toks) - i and (t, self._width(q + t)) in self.pres), 1)
-            W = self._width(q + T)
-            pid = self.pres[(T, W)] if T > 1 else self.decs[(1, W)]
+            T = next((t for t in self.chunks if t <= len(toks) - i and self._pick(self.pres, t, q + t)[0]), 1)
+            pid, W = self._pick(self.pres, T, q + T) if T > 1 else self._pick(self.decs, 1, q + 1)
+            P.need(pid is not None, f"position {q + T} past the pack's KV widths")
             p = list(range(q, q + T))
             st = Step(toks[i:i + T], [0] * T, p, p, [0] * T, self.kv_size, W, [T - 1] if T > 1 else [0])
             row = self.rt.step(pid, st)[-1]
@@ -414,13 +433,13 @@ class PlanBackend:
             if w not in dec:
                 rows[w.sid] = self._alone(w)
         n = len(self.live)
-        W = self._width(max((w.pos for w in dec), default=0) + 1)
-        if dec and {w.sid for w in dec} == set(self.live) and (n, W) in self.decs:     # every live sequence, one batch
+        pid, W = self._pick(self.decs, n, max((w.pos for w in dec), default=0) + 1)
+        if dec and {w.sid for w in dec} == set(self.live) and pid:     # every live sequence, one batch
             by = {w.sid: w for w in dec}
             ws = [by[s] for s in self.live]
             st = Step([w.tokens[0] for w in ws], list(range(n)), [w.pos for w in ws], [w.pos for w in ws], list(range(n)),
                       self.kv_size, W, list(range(n)))
-            out = np.frombuffer(self.rt.step(self.decs[(n, W)], st)[-1], np.float32).reshape(n, -1)
+            out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(n, -1)
             for i, s in enumerate(self.live):
                 rows[s] = out[i, :self.vocab_size]
         else:
