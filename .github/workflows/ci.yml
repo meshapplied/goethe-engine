@@ -17,13 +17,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: pip install ruff==0.17.5
-      - run: ruff check .
+          version: "0.12.19"
+          enable-cache: false
+      - run: uvx ruff@0.17.5 check .
       - run: .github/leak-guard.sh
 
   test:
@@ -36,23 +34,21 @@ jobs:
       OMP_NUM_THREADS: "1"      # one torch thread per xdist worker
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
-          python-version: ${{ matrix.python }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install -e ".[test,serve,worker]"
-      - run: python -m pytest -x -q --timeout=60 -n auto
+          version: "0.12.19"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --python ${{ matrix.python }} --extra test --extra serve --extra worker
+      - run: uv run --no-sync pytest -x -q --timeout=60 -n auto
 
   import-clean:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          version: "0.12.19"
+          enable-cache: false
       - run: .github/import-clean.sh

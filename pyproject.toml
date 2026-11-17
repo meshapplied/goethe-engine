@@ -37,3 +37,14 @@ select = ["E9", "F"]   # syntax errors and pyflakes: real bugs only
 
 [tool.ruff.lint.per-file-ignores]
 "tests/conformance/test_conformance.py" = ["F811"]   # fixtures imported by name, then requested by argument
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]   # the lock is for the Linux CI and dev hosts; torch comes from its CPU index
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
