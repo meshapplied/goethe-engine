@@ -205,7 +205,7 @@ class Runtime:
         # buffers are each bucket's own (llama.cpp's allocator sizes and splits them per graph)
         first = next(iter(plans.values()))
         shared_layout = [(b["role"], b["size"]) for b in first["buffers"] if b["role"] != "compute"]
-        self.shared, self.allocs, self.bases = [], [], {}
+        self.shared, self.allocs, self.bases, self.hosts = [], [], {}, []
         for r, n in shared_layout:          # zeroed, weights too: ggml zeroes a quantized tensor's row padding at load
             self.shared.append(self._alloc(n, zero=True))
         share = share or {}
@@ -321,54 +321,67 @@ class Runtime:
                                                u32(*t["box"]), u32(*t["es"]), t["il"], t["sw"], t["l2"], t["oob"]), "tensor map")
         return bytes(m)
 
-    def _graph(self, pid):
-        if pid not in self.graphs:
-            keep, g, ge = [], C.c_void_p(), C.c_void_p()
+    def _pinned(self, n):
+        h = C.c_void_p()
+        self.ck(self.cu.cuMemAllocHost_v2(C.byref(h), C.c_size_t(max(n, 1))), f"pinned {n} B")
+        self.hosts.append(h.value)
+        return h.value
+
+    def _graph(self, pid, argmax=0):
+        """bucket pid's step as one CUDA graph: its inputs uploaded from a pinned staging buffer, its actions, its outputs (argmax=n:
+        the last one reduced on the device to n row argmaxes) read back into pinned buffers. A step is: fill, launch, sync"""
+        key = (pid, argmax)
+        if key not in self.graphs:
+            p, base, keep, g, ge = self.plans[pid], self.bases[pid], [], C.c_void_p(), C.c_void_p()
+            ins = [a for a in p["actions"] if "input" in a]
+            stage = self._pinned(sum(a["n"] for a in ins))
+            oa = [a for a in p["actions"] if "output" in a]
+            outs = [(self._pinned(4 * argmax if argmax and k == len(oa) - 1 else a["n"]),
+                     4 * argmax if argmax and k == len(oa) - 1 else a["n"]) for k, a in enumerate(oa)]
+            if argmax and getattr(self, "_amax", None) is None:    # no allocation while capturing
+                self._amax = self._alloc(4 * 4096, zero=False)
             self.ck(self.cu.cuStreamBeginCapture_v2(self.st, 0), "begin capture")
-            for a in self.plans[pid]["actions"]:
-                self._issue(a, keep, self.bases[pid])
+            o = 0
+            for a in ins:
+                self.ck(self.cu.cuMemcpyHtoDAsync_v2(C.c_uint64(base[a["dst"][0]] + a["dst"][1]), C.c_void_p(stage + o), C.c_size_t(a["n"]),
+                                                     self.st), a["input"])
+                o += a["n"]
+            for a in p["actions"]:
+                self._issue(a, keep, base)
+            for k, (a, (h, n)) in enumerate(zip(oa, outs)):
+                src = base[a["src"][0]] + a["src"][1]
+                if argmax and k == len(oa) - 1:
+                    prm = [C.c_uint64(src), C.c_int(a["n"] // 4 // argmax), C.c_uint64(self._amax)]
+                    arr = (C.c_void_p * 3)(*[C.cast(C.pointer(x), C.c_void_p) for x in prm])
+                    keep += [prm, arr]
+                    self.ck(self.cu.cuLaunchKernel(self.fn["gc_argmax_rows"], argmax, 1, 1, 256, 1, 1, 0, self.st, arr, None), "argmax")
+                    src = self._amax
+                self.ck(self.cu.cuMemcpyDtoHAsync_v2(C.c_void_p(h), C.c_uint64(src), C.c_size_t(n), self.st), "output")
             self.ck(self.cu.cuStreamEndCapture(self.st, C.byref(g)), "end capture")
             self.ck(self.cu.cuGraphInstantiateWithFlags(C.byref(ge), g, C.c_ulonglong(0)), "instantiate")
-            self.graphs[pid] = (ge, keep)
-        return self.graphs[pid][0]
+            self.graphs[key] = (ge, keep, ins, stage, outs)
+        return self.graphs[key]
 
-    def warm(self):
-        """capture every bucket's CUDA graph now (otherwise on first use)"""
+    def warm(self, greedy=None):
+        """capture every bucket's CUDA graph now (otherwise on first use); greedy {pid: n}: also its n-row argmax form"""
         for pid in self.plans:
             self._graph(pid)
+        for pid, n in (greedy or {}).items():
+            self._graph(pid, n)
 
     def step(self, pid, step, argmax=0):
-        """run bucket pid on this step: its inputs uploaded, its graph launched; the step's outputs (all of them, in order).
-        argmax=n: the last output is n logits rows reduced on the device to their argmax (int32 each, the pack's gc_argmax_rows)"""
-        p, keep, base = self.plans[pid], [], self.bases[pid]
-        ge = self._graph(pid)
-        for a in p["actions"]:
-            if "input" in a:
-                b = generate(a["input"], a["n"], step, p["io"]["inputs"])
-                P.need(len(b) == a["n"], f"input {a['input']}: {len(b)} B, the plan wants {a['n']}")
-                h = C.create_string_buffer(b, len(b))
-                keep.append(h)
-                self.ck(self.cu.cuMemcpyHtoDAsync_v2(C.c_uint64(base[a["dst"][0]] + a["dst"][1]), h, C.c_size_t(len(b)), self.st), a["input"])
+        """run bucket pid on this step: its inputs generated into the staging buffer, its graph launched; the step's outputs (all of
+        them, in order). argmax=n: the last output is n logits rows reduced on the device to their argmax (int32 each)"""
+        ge, _, ins, stage, outs = self._graph(pid, argmax)
+        hp, o = self.plans[pid]["io"]["inputs"], 0
+        for a in ins:
+            b = generate(a["input"], a["n"], step, hp)
+            P.need(len(b) == a["n"], f"input {a['input']}: {len(b)} B, the plan wants {a['n']}")
+            C.memmove(stage + o, b, a["n"])
+            o += a["n"]
         self.ck(self.cu.cuGraphLaunch(ge, self.st), "graph launch")
-        outs, oa = [], [a for a in p["actions"] if "output" in a]
-        for k, a in enumerate(oa):
-            src = base[a["src"][0]] + a["src"][1]
-            if argmax and k == len(oa) - 1:
-                if getattr(self, "_amax", None) is None:
-                    self._amax = self._alloc(4 * 4096, zero=False)
-                f = self.fn["gc_argmax_rows"]
-                cols = a["n"] // 4 // argmax
-                prm = [C.c_uint64(src), C.c_int(cols), C.c_uint64(self._amax)]
-                arr = (C.c_void_p * 3)(*[C.cast(C.pointer(x), C.c_void_p) for x in prm])
-                self.ck(self.cu.cuLaunchKernel(f, argmax, 1, 1, 256, 1, 1, 0, self.st, arr, None), "argmax")
-                h = C.create_string_buffer(4 * argmax)
-                self.ck(self.cu.cuMemcpyDtoHAsync_v2(h, C.c_uint64(self._amax), C.c_size_t(4 * argmax), self.st), "argmax")
-            else:
-                h = C.create_string_buffer(a["n"])
-                self.ck(self.cu.cuMemcpyDtoHAsync_v2(h, C.c_uint64(src), C.c_size_t(a["n"]), self.st), "output")
-            outs.append(h)
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
-        return [h.raw for h in outs]
+        return [C.string_at(h, n) for h, n in outs]
 
     def _rows(self):            # (device address of sequence block 0, block bytes) of every cache (kv and recurrent state)
         p = next(iter(self.plans))
@@ -388,8 +401,10 @@ class Runtime:
 
     def close(self):
         if getattr(self, "ctx", None):
-            for ge, _ in self.graphs.values():
-                self.cu.cuGraphExecDestroy(ge)
+            for g in self.graphs.values():
+                self.cu.cuGraphExecDestroy(g[0])
+            for h in self.hosts:
+                self.cu.cuMemFreeHost(C.c_void_p(h))
             for m in self.mods.values():
                 self.cu.cuModuleUnload(m)
             for a in self.allocs:
@@ -517,6 +532,10 @@ class PlanBackend:
         rec = any(re.match(r"cache_[rs]_l", k) for k in self.rt.plans[self.dec].get("caches", {}))
         self.caps = {"recurrent": "chain"} if rec else {}
         self.numerics = dict(contract=self.bucket["contract"], determinism=self.bucket.get("determinism"))
+
+    def warm(self):
+        """every bucket's graph captured now, the decode buckets in their greedy (device argmax) form too"""
+        self.rt.warm({pid: n for (n, _), pid in self.decs.items()} if "gc_argmax_rows" in self.rt.fn else None)
 
     def _stream(self, sid):
         if sid not in self.live:
