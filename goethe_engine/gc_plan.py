@@ -324,6 +324,7 @@ class Runtime:
     def _pinned(self, n):
         h = C.c_void_p()
         self.ck(self.cu.cuMemAllocHost_v2(C.byref(h), C.c_size_t(max(n, 1))), f"pinned {n} B")
+        C.memset(h, 0, max(n, 1))             # zeroed: a graph run from it before any step (warm) reads valid ids
         self.hosts.append(h.value)
         return h.value
 
@@ -363,11 +364,16 @@ class Runtime:
         return self.graphs[key]
 
     def warm(self, greedy=None):
-        """capture every bucket's CUDA graph now (otherwise on first use); greedy {pid: n}: also its n-row argmax form"""
+        """capture every bucket's CUDA graph now (otherwise on first use) and run each once (zero inputs: token 0 at position 0), so
+        the first real step finds its modules loaded; greedy {pid: n}: also its n-row argmax form. Caches and recurrent states hold
+        garbage afterwards: a sequence's stream is zeroed when it takes it."""
         for pid in self.plans:
             self._graph(pid)
         for pid, n in (greedy or {}).items():
             self._graph(pid, n)
+        for g in self.graphs.values():
+            self.ck(self.cu.cuGraphLaunch(g[0], self.st), "warm launch")
+        self.ck(self.cu.cuStreamSynchronize(self.st), "warm")
 
     def step(self, pid, step, argmax=0):
         """run bucket pid on this step: its inputs generated into the staging buffer, its graph launched; the step's outputs (all of
