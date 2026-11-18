@@ -496,8 +496,9 @@ class PlanBackend:
     positions whose cells fit it (cells past the position are masked). A bucket's graph fixes its streams: prefill buckets run
     stream 0, a B-sequence decode bucket streams [0, B). So live sequences are kept packed in streams [0, n) (a finished one's
     hole takes the last), the top stream is spare: a prefill runs in stream 0 with its occupant parked in the spare; a step that
-    decodes every live sequence runs the decode bucket of exactly that width, any other decode runs one sequence at a time the
-    same way. A token run splits exactly into the prefill chunk lengths, largest first, the last tokens through the one-sequence
+    decodes every live sequence runs the smallest decode bucket of at least that many (its rows past the live ones in free
+    streams, their outputs dropped), any other decode runs one sequence at a time the same way. A token run splits exactly into
+    the prefill chunk lengths, largest first, the last tokens through the one-sequence
     decode bucket (padding would advance recurrent state). Buckets come in KV widths n_kv (llama.cpp's cells per stream, padded
     to 256): a launch takes the width llama.cpp would, pad(last position + 1), so short contexts read few cells and the numerics
     are llama.cpp's own."""
@@ -589,19 +590,27 @@ class PlanBackend:
             if w not in dec:
                 rows[w.sid] = self._alone(w)
         n = len(self.live)
-        pid, W = self._pick(self.decs, n, max((w.pos for w in dec), default=0) + 1)
+        end = max((w.pos for w in dec), default=0) + 1
+        pid = B = W = None                  # the smallest ladder batch B >= n with a width that holds end
+        for b in sorted({k for k, _ in self.decs if k >= n}):
+            pid, W = self._pick(self.decs, b, end)
+            if pid:
+                B = b
+                break
         if dec and {w.sid for w in dec} == set(self.live) and pid:     # every live sequence, one batch
             by = {w.sid: w for w in dec}
             ws = [by[s] for s in self.live]
-            st = Step([w.tokens[0] for w in ws], list(range(n)), [w.pos for w in ws], [w.pos for w in ws], list(range(n)),
-                      self.kv_size, W, list(range(n)))
+            # rows n .. B-1 run in free streams (the live ones are packed in [0, n)), position 0, their outputs dropped: a free
+            # stream's state is garbage until a sequence takes it (zeroed then)
+            st = Step([w.tokens[0] for w in ws] + [0] * (B - n), list(range(B)), [w.pos for w in ws] + [0] * (B - n),
+                      [w.pos for w in ws] + [0] * (B - n), list(range(B)), self.kv_size, W, list(range(B)))
             if greedy:                    # the argmax of each row's first vocab_size logits (the buffer's rows may be wider)
-                P.need(self.rt_vocab(pid, n) == self.vocab_size, "gc-plan: logits rows wider than the vocabulary")
-                ids = np.frombuffer(self.rt.step(pid, st, argmax=n)[-1], np.int32)
+                P.need(self.rt_vocab(pid, B) == self.vocab_size, "gc-plan: logits rows wider than the vocabulary")
+                ids = np.frombuffer(self.rt.step(pid, st, argmax=B)[-1], np.int32)
                 for i, s in enumerate(self.live):
                     rows[s] = int(ids[i])
             else:
-                out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(n, -1)
+                out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(B, -1)
                 for i, s in enumerate(self.live):
                     rows[s] = out[i, :self.vocab_size]
         else:
