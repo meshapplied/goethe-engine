@@ -318,6 +318,11 @@ class Runtime:
             self.graphs[pid] = (ge, keep)
         return self.graphs[pid][0]
 
+    def warm(self):
+        """capture every bucket's CUDA graph now (otherwise on first use)"""
+        for pid in self.plans:
+            self._graph(pid)
+
     def step(self, pid, step, argmax=0):
         """run bucket pid on this step: its inputs uploaded, its graph launched; the step's outputs (all of them, in order).
         argmax=n: the last output is n logits rows reduced on the device to their argmax (int32 each, the pack's gc_argmax_rows)"""
