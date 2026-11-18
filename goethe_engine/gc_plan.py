@@ -355,7 +355,7 @@ class Runtime:
                     prm = [C.c_uint64(src), C.c_int(a["n"] // 4 // argmax), C.c_uint64(self._amax)]
                     arr = (C.c_void_p * 3)(*[C.cast(C.pointer(x), C.c_void_p) for x in prm])
                     keep += [prm, arr]
-                    self.ck(self.cu.cuLaunchKernel(self.fn["gc_argmax_rows"], argmax, 1, 1, 256, 1, 1, 0, self.st, arr, None), "argmax")
+                    self.ck(self.cu.cuLaunchKernel(self.fn["gc_argmax_rows"], argmax, 1, 1, 1024, 1, 1, 0, self.st, arr, None), "argmax")
                     src = self._amax
                 self.ck(self.cu.cuMemcpyDtoHAsync_v2(C.c_void_p(h), C.c_uint64(src), C.c_size_t(n), self.st), "output")
             self.ck(self.cu.cuStreamEndCapture(self.st, C.byref(g)), "end capture")
