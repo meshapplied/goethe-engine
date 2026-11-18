@@ -87,3 +87,30 @@ def test_runtime_kind_accepted():
     assert P.RUNTIMES["gc-plan"] == (1,)
     m = {"runtime": {"kind": "gc-plan", "version": 1}}
     assert json.loads(json.dumps(m))["runtime"]["kind"] in P.RUNTIMES
+
+
+def _ring_reference(pos_by_stream, S, W, K):
+    """a sliding-window ring simulated: every position up to the stream's last is written to cell p % S (newest wins); a query
+    at p sees cell j iff it holds p_j with p - W < p_j <= p (llama.cpp's LLAMA_SWA_TYPE_STANDARD)"""
+    rows = []
+    for ps in pos_by_stream:
+        held = {}
+        for q in range(max(ps) + 1):
+            held[q % S] = q
+        for p in ps:
+            rows.append([j in held and held[j] <= p and p - held[j] < W for j in range(K)])
+    return np.array(rows)
+
+
+def test_swa_ring_inputs_match_a_simulated_cache():
+    S, W, hp = 1536, 1024, {"swa_cells": 1536, "n_swa": 1024}
+    cases = [([4096] * 4, 1536), ([2047], 1536), (list(range(3584, 4096)), 1536), (list(range(0, 300)), 512), ([5], 256)]
+    for ps, K in cases:
+        multi = len(ps) > 1 and len(set(ps)) == 1                  # a decode of several sequences: one token per stream
+        streams = list(range(len(ps))) if multi else [0] * len(ps)
+        st = G.Step([1] * len(ps), streams, ps, ps, streams, 4352, 0, range(len(ps)))
+        m = np.frombuffer(G.generate("CUDA0#attn_inp_kq_mask_swa#0", 2 * len(ps) * K, st, hp), np.uint16).reshape(len(ps), K)
+        ref = _ring_reference([[p] for p in ps] if multi else [ps], S, W, K)
+        assert ((m == 0) == ref).all(), (ps[:2], K)
+        idx = np.frombuffer(G.generate("CUDA0#attn_inp_k_idxs_swa#0", 8 * len(ps), st, hp), np.int64)
+        assert (idx == np.array(streams) * S + np.array(ps) % S).all()

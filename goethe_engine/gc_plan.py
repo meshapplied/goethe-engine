@@ -94,6 +94,20 @@ def generate(name, n, step, hp):
         for i, p in enumerate(step.pos):
             m[i // tps if n_stream > 1 else 0, i % tps if n_stream > 1 else i, :p + 1] = 0
         return m.tobytes()
+    if k in ("attn_inp_k_idxs_swa", "attn_inp_v_idxs_swa"):   # a sliding-window cache: a ring of swa_cells cells per stream
+        return (step.streams.astype(np.int64) * hp["swa_cells"] + step.pos % hp["swa_cells"]).tobytes()
+    if k == "attn_inp_kq_mask_swa":   # ring cell j holds the newest written position = j (mod S); visible when 0 <= p - p_j < n_swa
+        S, W, n_stream = hp["swa_cells"], hp["n_swa"], len(np.unique(step.streams))
+        tps, K = T // n_stream, n // (2 * T)
+        P.need(K * 2 * T == n, f"plan input {name}: {n} bytes are no [{T}][K] f16 mask")
+        m, j = np.full((n_stream, tps, K), NEG_INF_F16, np.uint16), np.arange(K)
+        for s in range(n_stream):
+            last = int(step.pos[s * tps:(s + 1) * tps].max())    # the step writes its tokens before attending
+            pj = last - (last - j) % S
+            for r in range(tps):
+                p = int(step.pos[s * tps + r])
+                m[s, r, (pj >= 0) & (pj <= p) & (p - pj < W)] = 0
+        return m.tobytes()
     if k == "out_ids":
         return step.outputs.astype(np.int32).tobytes()
     if k == "rs_s_copy":
