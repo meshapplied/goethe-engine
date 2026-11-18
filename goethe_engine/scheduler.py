@@ -82,6 +82,8 @@ class Scheduler:
         self.cfg, self.kv, self.drafter, self.spec_round, self.vocab = cfg, kv, drafter, spec_round, vocab
         self.waiting, self.running = [], []
         self.preemptions = 0
+        self.unmixed = False    # the backend batches decodes only when every live sequence decodes (gc-plan buckets): prefill first
+        self.align = 1          # the backend's prefill chunk: a prompt piece short of the prompt's end is a whole number of them
 
     def add(self, seq):
         self.waiting.append(seq)
@@ -115,7 +117,15 @@ class Scheduler:
         return out
 
     def schedule(self):
-        """(items, copies): the work of one step and the CoW block copies to run before it."""
+        """(items, copies): the work of one step and the CoW block copies to run before it. unmixed: a step that can carry
+        prefill work carries no decodes (they wait one step and then run batched); it never leaves a step empty."""
+        if self.unmixed:
+            items, copies = self._schedule(skip_decode=True)
+            if items:
+                return items, copies
+        return self._schedule()
+
+    def _schedule(self, skip_decode=False):
         cfg, kv = self.cfg, self.kv
         budget, items, copies, preempted = cfg.max_num_batched_tokens, [], [], False
         self.preempted = []
@@ -135,6 +145,9 @@ class Scheduler:
         while i < len(self.running) and budget > 0:
             s = self.running[i]
             need = chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps)
+            if skip_decode and len(s.tokens) - s.computed == 1:
+                i += 1
+                continue
             t = trees.get(s.sid, empty)
             if need + len(t) > budget:
                 if len(t) and strict(s):
@@ -142,6 +155,11 @@ class Scheduler:
                     continue
                 t = t.cut(budget - need)
             n = min(need + len(t), budget)
+            if n < need and not len(t) and self.align > 1:
+                n -= n % self.align
+                if n <= 0:
+                    i += 1
+                    continue
             while (pairs := kv.reserve(s, s.computed + n)) is None:
                 if len(t) and not strict(s):
                     t, n = empty, min(need, budget)
@@ -174,7 +192,13 @@ class Scheduler:
                 if lead * kv.bs >= 32:
                     continue
             kv.attach(s)
-            n = min(chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps), budget)
+            need = chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps)
+            n = min(need, budget)
+            if n < need and self.align > 1:
+                n -= n % self.align
+                if n <= 0:
+                    kv.release(s)
+                    break
             if len(s.tokens) - s.computed == 1 and strict(s) and s.nout:
                 n = 0  # the anchor alone: next step's decode carries its drafts
             pairs = kv.reserve(s, s.computed + n)

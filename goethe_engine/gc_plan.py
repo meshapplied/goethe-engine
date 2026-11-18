@@ -318,8 +318,9 @@ class Runtime:
             self.graphs[pid] = (ge, keep)
         return self.graphs[pid][0]
 
-    def step(self, pid, step):
-        """run bucket pid on this step: its inputs uploaded, its graph launched; the step's outputs (all of them, in order)"""
+    def step(self, pid, step, argmax=0):
+        """run bucket pid on this step: its inputs uploaded, its graph launched; the step's outputs (all of them, in order).
+        argmax=n: the last output is n logits rows reduced on the device to their argmax (int32 each, the pack's gc_argmax_rows)"""
         p, keep, base = self.plans[pid], [], self.bases[pid]
         ge = self._graph(pid)
         for a in p["actions"]:
@@ -330,10 +331,22 @@ class Runtime:
                 keep.append(h)
                 self.ck(self.cu.cuMemcpyHtoDAsync_v2(C.c_uint64(base[a["dst"][0]] + a["dst"][1]), h, C.c_size_t(len(b)), self.st), a["input"])
         self.ck(self.cu.cuGraphLaunch(ge, self.st), "graph launch")
-        outs = []
-        for a in (a for a in p["actions"] if "output" in a):
-            h = C.create_string_buffer(a["n"])
-            self.ck(self.cu.cuMemcpyDtoHAsync_v2(h, C.c_uint64(base[a["src"][0]] + a["src"][1]), C.c_size_t(a["n"]), self.st), "output")
+        outs, oa = [], [a for a in p["actions"] if "output" in a]
+        for k, a in enumerate(oa):
+            src = base[a["src"][0]] + a["src"][1]
+            if argmax and k == len(oa) - 1:
+                if getattr(self, "_amax", None) is None:
+                    self._amax = self._alloc(4 * 4096, zero=False)
+                f = self.fn["gc_argmax_rows"]
+                cols = a["n"] // 4 // argmax
+                prm = [C.c_uint64(src), C.c_int(cols), C.c_uint64(self._amax)]
+                arr = (C.c_void_p * 3)(*[C.cast(C.pointer(x), C.c_void_p) for x in prm])
+                self.ck(self.cu.cuLaunchKernel(f, argmax, 1, 1, 256, 1, 1, 0, self.st, arr, None), "argmax")
+                h = C.create_string_buffer(4 * argmax)
+                self.ck(self.cu.cuMemcpyDtoHAsync_v2(h, C.c_uint64(self._amax), C.c_size_t(4 * argmax), self.st), "argmax")
+            else:
+                h = C.create_string_buffer(a["n"])
+                self.ck(self.cu.cuMemcpyDtoHAsync_v2(h, C.c_uint64(src), C.c_size_t(a["n"]), self.st), "output")
             outs.append(h)
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
         return [h.raw for h in outs]
@@ -454,6 +467,11 @@ class PlanBackend:
     decode bucket (padding would advance recurrent state). Buckets come in KV widths n_kv (llama.cpp's cells per stream, padded
     to 256): a launch takes the width llama.cpp would, pad(last position + 1), so short contexts read few cells and the numerics
     are llama.cpp's own."""
+    batches_all_live = True     # a decode bucket runs every live sequence (cache blocks [0, n)): the scheduler prefills first
+
+    @property
+    def prefill_align(self):    # the largest prefill chunk: a prompt piece of whole chunks runs in whole buckets
+        return max(self.chunks) if self.chunks else 1
     paged, state_pages, prefix_cache, bounded = False, 0, False, False
 
     def __init__(self, pack, weights, *, device=-1, trusted=None, store=None, sku=None, price=None, allow_broken=False, **_):
@@ -527,6 +545,7 @@ class PlanBackend:
                    "gc-plan decoders return the last row (or none, a prompt chunk before its last) so far")
             P.need(w.pos + len(w.tokens) <= self.max_len, f"position {w.pos + len(w.tokens)} past the pack's {self.max_len}")
         rows = {}
+        greedy = all(w.greedy or not w.want for w in work) and "gc_argmax_rows" in self.rt.fn     # tokens, not logits
         dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
         for w in work:
             if w not in dec:
@@ -538,14 +557,26 @@ class PlanBackend:
             ws = [by[s] for s in self.live]
             st = Step([w.tokens[0] for w in ws], list(range(n)), [w.pos for w in ws], [w.pos for w in ws], list(range(n)),
                       self.kv_size, W, list(range(n)))
-            out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(n, -1)
-            for i, s in enumerate(self.live):
-                rows[s] = out[i, :self.vocab_size]
+            if greedy:                    # the argmax of each row's first vocab_size logits (the buffer's rows may be wider)
+                P.need(self.rt_vocab(pid, n) == self.vocab_size, "gc-plan: logits rows wider than the vocabulary")
+                ids = np.frombuffer(self.rt.step(pid, st, argmax=n)[-1], np.int32)
+                for i, s in enumerate(self.live):
+                    rows[s] = int(ids[i])
+            else:
+                out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(n, -1)
+                for i, s in enumerate(self.live):
+                    rows[s] = out[i, :self.vocab_size]
         else:
             for w in dec:
                 rows[w.sid] = self._alone(w)
+        if greedy:                        # tokens per work item (the engine's list form), a row's argmax where one came back
+            return [[rows[w.sid] if isinstance(rows[w.sid], int) else int(np.argmax(np.nan_to_num(rows[w.sid])))] if w.want else []
+                    for w in work]
         keep = [rows[w.sid] for w in work if w.want]
         return np.stack(keep) if keep else np.empty((0, self.vocab_size), np.float32)
+
+    def rt_vocab(self, pid, n):           # logits per row of bucket pid's last output
+        return next(a for a in reversed(self.rt.plans[pid]["actions"]) if "output" in a)["n"] // 4 // n
 
     def copy_blocks(self, pairs):
         for src, dst in pairs:
