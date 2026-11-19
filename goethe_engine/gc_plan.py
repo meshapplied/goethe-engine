@@ -187,6 +187,7 @@ def lerp_plan(x0, x1, t):
 
 
 _PDL = os.environ.get("GOETHE_PLAN_PDL", "1") != "0"     # 0: every launch without PDL (profiling: true kernel durations)
+_PAD = os.environ.get("GOETHE_PAD", "1") != "0"          # 0: a short prefill tail runs token by token (the exact split)
 
 
 class Runtime:
@@ -480,27 +481,38 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
     br = P.open_branch(stage, ws, pick, sku=sku, ordinal=device, price=price, allow_broken=allow_broken)
     bs = [b for b in sel["all"] if b["variant"] == br.bucket["variant"]]
     path = lambda b, rel: os.path.join(stage.dir, "blobs", b["files"][rel])
-    plans, byid, share, out = {}, {}, {}, []
+    plans, byid, share, out, cands = {}, {}, {}, [], []
     for b in bs:
         p0 = json.load(open(path(b, b["lib"])))
         a = b.get("affine")
+        alts = b.get("alts", ())                         # S3's near ties: the JIT times them on this device (jit)
         if not a:
             plans[b["id"]], byid[b["id"]] = p0, b
-            for i, alt in enumerate(b.get("alts", ())):     # S3's near ties: the JIT times them here (jit)
+            for i, alt in enumerate(alts):
                 plans[f"{b['id']}~{i}"], byid[f"{b['id']}~{i}"] = json.load(open(path(b, alt["lib"]))), b
             out.append(b)
+            if alts:
+                cands.append((b, b["id"], [b["id"]], len(alts)))
             continue
         p1, (w0, w1) = json.load(open(path(b, a["lib1"]))), (a["n_kv0"], a["n_kv1"])     # every width between, step 256
         top = f"{b['id']}@{w1}"
+        apair = [(json.load(open(path(b, x["lib"]))), json.load(open(path(b, x["lib1"])))) for x in alts if "lib1" in x]
         for w in range(w0, w1 + 1, 256):
             pid = f"{b['id']}@{w}"
-            plans[pid] = p0 if w == w0 else p1 if w == w1 else lerp_plan(p0, p1, (w - w0, w1 - w0))
+            lerp = lambda q0, q1: q0 if w == w0 else q1 if w == w1 else lerp_plan(q0, q1, (w - w0, w1 - w0))
+            plans[pid] = lerp(p0, p1)
             byid[pid] = b
             out.append({**b, "id": pid, "io": plans[pid]["io"]})
+            for i, (q0, q1) in enumerate(apair):           # an alternative segment, at the same widths
+                plans[f"{pid}~{i}"], byid[f"{pid}~{i}"] = lerp(q0, q1), b
+                if w != w1:
+                    share[f"{pid}~{i}"] = f"{top}~{i}"
             if w != w1:
                 share[pid] = top
+        if apair:
+            cands.append(({**b, "id": top, "io": plans[top]["io"]}, top, [f"{b['id']}@{w}" for w in range(w0, w1 + 1, 256)], len(apair)))
     rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device, share)
-    jit(rt, [b for b in out if b.get("alts")], pack)
+    jit(rt, cands, pack)
     return stage, br.m, out, rt
 
 
@@ -510,7 +522,7 @@ def jit(rt, buckets, pack):
     ~/.goethe/tune/<uuid>-<pack sha>.json (a later start reads it; GOETHE_JIT=0 skips, =force re-times)"""
     import hashlib
     import time
-    if not buckets or os.environ.get("GOETHE_JIT") == "0":
+    if not buckets or os.environ.get("GOETHE_JIT") == "0":             # buckets: [(bucket, timed plan id, member ids, n alts)]
         return
     uu, drv = (C.c_ubyte * 16)(), C.c_int()
     rt.ck(rt.cu.cuDeviceGetUuid_v2(uu, rt.dev), "uuid")
@@ -527,13 +539,13 @@ def jit(rt, buckets, pack):
     rt.ck(rt.cu.cuEventCreate(C.byref(e0), 0), "event")
     rt.ck(rt.cu.cuEventCreate(C.byref(e1), 0), "event")
     pick, t0, log = {}, time.perf_counter(), {}
-    for b in buckets:
-        io, n = rt.plans[b["id"]]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
+    for b, rep, members, na in buckets:           # (bucket, the plan timed: an affine bucket's widest, its widths, alternatives)
+        io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
         w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
         pos = max(w - 256, 0)
         st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
             Step([1] * n, [0] * n, range(pos, pos + n), range(pos, pos + n), [0] * n, kv, w, [n - 1])
-        pids = [b["id"]] + [f"{b['id']}~{i}" for i in range(len(b["alts"]))]
+        pids = [rep] + [f"{rep}~{i}" for i in range(na)]
         ge = {}
         for pid in pids:                          # one real step each (fills the graph's inputs), then its graph alone
             rt.step(pid, st)
@@ -548,8 +560,10 @@ def jit(rt, buckets, pack):
                 rt.ck(rt.cu.cuEventElapsedTime(C.byref(ms), e0, e1), "elapsed")
                 ts[pid].append(ms.value)
         med = {pid: float(np.median(v[2:])) for pid, v in ts.items()}
-        pick[b["id"]] = min(med, key=med.get)
-        log[b["id"]] = {pid: round(v * 1000, 1) for pid, v in med.items()}
+        best = min(med, key=med.get)
+        for m in members:                         # every width of the bucket takes the pick
+            pick[m] = m + best[len(rep):]
+        log[rep] = {pid: round(v * 1000, 1) for pid, v in med.items()}
     for a, row in rt._rows():                     # the timing steps wrote the caches: zeroed for the requests to come
         rt.ck(rt.cu.cuMemsetD8Async(C.c_uint64(a), C.c_ubyte(0), C.c_size_t(row * next(iter(rt.plans.values()))["nseq"]), rt.st), "zero")
     rt.ck(rt.cu.cuStreamSynchronize(rt.st), "sync")
@@ -607,8 +621,8 @@ class PlanBackend:
     hole takes the last), the top stream is spare: a prefill runs in stream 0 with its occupant parked in the spare; a step that
     decodes every live sequence runs the smallest decode bucket of at least that many (its rows past the live ones in free
     streams, their outputs dropped), any other decode runs one sequence at a time the same way. A token run splits exactly into
-    the prefill chunk lengths, largest first, the last tokens through the one-sequence
-    decode bucket (padding would advance recurrent state). Buckets come in KV widths n_kv (llama.cpp's cells per stream, padded
+    the prefill chunk lengths, largest first; a shorter tail runs padded in the smallest prefill chunk that holds it (causal
+    attention, row-wise ops), or, for a recurrent model (padding would advance its state), through the one-sequence decode bucket. Buckets come in KV widths n_kv (llama.cpp's cells per stream, padded
     to 256): a launch takes the width llama.cpp would, pad(last position + 1), so short contexts read few cells and the numerics
     are llama.cpp's own."""
     batches_all_live = True     # a decode bucket runs every live sequence (cache blocks [0, n)): the scheduler prefills first
@@ -665,14 +679,19 @@ class PlanBackend:
         """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
         i, row = 0, None
         while i < len(toks):
-            q = pos + i
-            T = next((t for t in self.chunks if t <= len(toks) - i and self._pick(self.pres, t, q + t)[0]), 1)
-            pid, W = self._pick(self.pres, T, q + T) if T > 1 else self._pick(self.decs, 1, q + 1)
-            P.need(pid is not None, f"position {q + T} past the pack's KV widths")
-            p = list(range(q, q + T))
-            st = Step(toks[i:i + T], [0] * T, p, p, [0] * T, self.kv_size, W, [T - 1] if T > 1 else [0])
+            q, r = pos + i, len(toks) - i
+            T = next((t for t in self.chunks if t <= r and self._pick(self.pres, t, q + t)[0]), 1)
+            n = T                                  # the real tokens of this launch
+            if T == 1 and r > 1 and not self.caps.get("recurrent") and _PAD:   # a short tail: the smallest prefill chunk that holds it,
+                T = next((t for t in reversed(self.chunks) if t >= r and self._pick(self.pres, t, q + t)[0]), 1)   # padded
+                n = r if T > 1 else 1              # (causal attention and row-wise ops: the padding changes no real row; its KV
+            pid, W = self._pick(self.pres, T, q + T) if T > 1 else self._pick(self.decs, 1, q + 1)  # cells sit past the last real
+            P.need(pid is not None, f"position {q + T} past the pack's KV widths")                     # position: masked, then
+            p = list(range(q, q + T))                                                                  # overwritten by decode)
+            tk = list(toks[i:i + n]) + [toks[i + n - 1]] * (T - n)
+            st = Step(tk, [0] * T, p, p, [0] * T, self.kv_size, W, [n - 1] if T > 1 else [0])
             row = self.rt.step(pid, st)[-1]
-            i += T
+            i += n
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
     def _alone(self, w):
