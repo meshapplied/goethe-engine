@@ -186,6 +186,9 @@ def lerp_plan(x0, x1, t):
     return _lerp_int(x0, x1, t)
 
 
+_PDL = os.environ.get("GOETHE_PLAN_PDL", "1") != "0"     # 0: every launch without PDL (profiling: true kernel durations)
+
+
 class Runtime:
     """the device side of a gc-plan pack: one context, the plans' buffers, their cubins, the weights, a CUDA graph per bucket"""
 
@@ -293,7 +296,7 @@ class Runtime:
                 x = _Attr(CLUSTER)
                 C.memmove(C.addressof(x.val), (C.c_uint * 3)(*a["cluster"]), 12)
                 attrs.append(x)
-            if a.get("pdl"):
+            if a.get("pdl") and _PDL:
                 x = _Attr(PDL)
                 x.val[0] = 1
                 attrs.append(x)
