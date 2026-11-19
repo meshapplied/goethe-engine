@@ -211,7 +211,7 @@ class Runtime:
         self.shared, self.allocs, self.bases, self.hosts = [], [], {}, []
         for r, n in shared_layout:          # zeroed, weights too: ggml zeroes a quantized tensor's row padding at load
             self.shared.append(self._alloc(n, zero=True))
-        share = share or {}
+        share, arena_need = share or {}, 0
         for pid, p in sorted(plans.items(), key=lambda kv: kv[0] in share):     # the owners first
             P.need([(b["role"], b["size"]) for b in p["buffers"] if b["role"] != "compute"] == shared_layout,
                    f"bucket {pid}: weights or caches laid out differently from the other buckets")
@@ -222,7 +222,26 @@ class Runtime:
                        f"bucket {pid}: scratch larger than its affine bucket's widest")
                 self.bases[pid] = list(self.bases[share[pid]])
                 continue
-            self.bases[pid] = [next(it) if b["role"] != "compute" else self._alloc(b["size"], zero=True) for b in p["buffers"]]
+            if p.get("init"):                # init actions write their buffers once: those stay the bucket's own
+                self.bases[pid] = [next(it) if b["role"] != "compute" else self._alloc(b["size"], zero=True) for b in p["buffers"]]
+                continue
+            off, self.bases[pid] = 0, []     # one bucket runs at a time: every bucket's scratch is carved from one arena
+            for b in p["buffers"]:
+                if b["role"] != "compute":
+                    self.bases[pid].append(next(it))
+                else:
+                    self.bases[pid].append(off)
+                    off += -(-max(b["size"], 1) // 4096) * 4096
+            arena_need = max(arena_need, off)
+        if arena_need:                       # the widest bucket's scratch, zeroed once; offsets become addresses
+            arena = self._alloc(arena_need, zero=True)
+            for pid, p in plans.items():
+                if pid not in share and not p.get("init"):
+                    self.bases[pid] = [x + arena if b["role"] == "compute" else x for x, b in zip(self.bases[pid], p["buffers"])]
+            for pid in share:
+                self.bases[pid] = list(self.bases[share[pid]])
+        if any('"gemm"' in json.dumps(p.get("actions")) for p in plans.values()):
+            self._blas()                     # cuBLAS made before any capture (it allocates; a capture forbids that)
         self.plans, self.fn, self.graphs, mods = plans, {}, {}, {}
         for pid, p in plans.items():
             for k, rel in p["kernels"].items():
@@ -314,8 +333,30 @@ class Runtime:
         elif "copy" in a:
             self.ck(cu.cuMemcpyDtoDAsync_v2(C.c_uint64(addr(a["dst"])), C.c_uint64(addr(a["copy"])), C.c_size_t(a["n"]), st),
                     "copy")
-        elif "gemm" in a:
-            raise P.PackError("a plan calls cuBLAS: not a gc-plan pack")
+        elif "gemm" in a:                    # a library GEMM S3 picked (cuBLAS GemmEx, cuBLASLt underneath), captured like a launch
+            g = a["gemm"]
+            P.need(g["gemm"] == 1, "a batched cuBLAS GEMM: not carried yet")
+            h, al, be = self._blas(), bytes.fromhex(g["alpha"]), bytes.fromhex(g["beta"])
+            self.ck_blas(self.blas.cublasGemmEx(h, g["ta"], g["tb"], g["m"], g["n"], g["k"], al, C.c_uint64(addr(a["A"])), g["at"], g["lda"],
+                                                C.c_uint64(addr(a["B"])), g["bt"], g["ldb"], be, C.c_uint64(addr(a["C"])), g["ct"], g["ldc"],
+                                                g["comp"], g["algo"]), "cublasGemmEx")
+
+    def _blas(self):
+        """cuBLAS on this context and stream, with its own fixed workspace (graph capture needs one), made at first use"""
+        if getattr(self, "blas_h", None) is None:  # (Runtime init, before any capture)
+            import ctypes.util
+            self.blas = C.CDLL(os.environ.get("GOETHE_CUBLAS") or ctypes.util.find_library("cublas") or "libcublas.so.12")
+            h = C.c_void_p()
+            self.ck_blas(self.blas.cublasCreate_v2(C.byref(h)), "cublasCreate")
+            ws = 32 << 20
+            self.ck_blas(self.blas.cublasSetStream_v2(h, self.st), "cublasSetStream")
+            self.ck_blas(self.blas.cublasSetWorkspace_v2(h, C.c_uint64(self._alloc(ws, zero=False)), C.c_size_t(ws)), "cublasSetWorkspace")
+            self.blas_h = h
+        return self.blas_h
+
+    def ck_blas(self, rc, what):
+        if rc:
+            raise RuntimeError(f"{what}: cuBLAS status {rc}")
 
     def _tmap(self, t, gaddr):
         m, r = (C.c_ubyte * 128)(), t["rank"]
