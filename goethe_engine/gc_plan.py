@@ -422,6 +422,7 @@ class Runtime:
     def step(self, pid, step, argmax=0):
         """run bucket pid on this step: its inputs generated into the staging buffer, its graph launched; the step's outputs (all of
         them, in order). argmax=n: the last output is n logits rows reduced on the device to their argmax (int32 each)"""
+        pid = getattr(self, "alias", {}).get(pid, pid)     # the JIT's pick for this bucket on this device
         ge, _, ins, stage, outs = self._graph(pid, argmax)
         hp, o = self.plans[pid]["io"]["inputs"], 0
         for a in ins:
@@ -485,6 +486,8 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
         a = b.get("affine")
         if not a:
             plans[b["id"]], byid[b["id"]] = p0, b
+            for i, alt in enumerate(b.get("alts", ())):     # S3's near ties: the JIT times them here (jit)
+                plans[f"{b['id']}~{i}"], byid[f"{b['id']}~{i}"] = json.load(open(path(b, alt["lib"]))), b
             out.append(b)
             continue
         p1, (w0, w1) = json.load(open(path(b, a["lib1"]))), (a["n_kv0"], a["n_kv1"])     # every width between, step 256
@@ -497,7 +500,63 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
             if w != w1:
                 share[pid] = top
     rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device, share)
+    jit(rt, [b for b in out if b.get("alts")], pack)
     return stage, br.m, out, rt
+
+
+def jit(rt, buckets, pack):
+    """the pack's near-tie alternatives (S3's, per bucket) timed on this device, the fastest serving each bucket: in-graph, round
+    robin over the candidates (drift cancels), median of the launches; cached per (GPU UUID, pack, driver) in
+    ~/.goethe/tune/<uuid>-<pack sha>.json (a later start reads it; GOETHE_JIT=0 skips, =force re-times)"""
+    import hashlib
+    import time
+    if not buckets or os.environ.get("GOETHE_JIT") == "0":
+        return
+    uu, drv = (C.c_ubyte * 16)(), C.c_int()
+    rt.ck(rt.cu.cuDeviceGetUuid_v2(uu, rt.dev), "uuid")
+    rt.ck(rt.cu.cuDriverGetVersion(C.byref(drv)), "driver")
+    h = hashlib.sha256()
+    with open(pack, "rb") as f:
+        h.update(f.read(1 << 20))
+    key = f"{bytes(uu).hex()}-{h.hexdigest()[:16]}-{drv.value}"
+    cache = os.path.join(os.environ.get("GOETHE_HOME", os.path.expanduser("~/.goethe")), "tune", key + ".json")
+    if os.path.exists(cache) and os.environ.get("GOETHE_JIT") != "force":
+        rt.alias = {k: v for k, v in json.load(open(cache))["pick"].items() if v in rt.plans}
+        return
+    e0, e1, ms = C.c_void_p(), C.c_void_p(), C.c_float()
+    rt.ck(rt.cu.cuEventCreate(C.byref(e0), 0), "event")
+    rt.ck(rt.cu.cuEventCreate(C.byref(e1), 0), "event")
+    pick, t0, log = {}, time.perf_counter(), {}
+    for b in buckets:
+        io, n = rt.plans[b["id"]]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
+        w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
+        pos = max(w - 256, 0)
+        st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
+            Step([1] * n, [0] * n, range(pos, pos + n), range(pos, pos + n), [0] * n, kv, w, [n - 1])
+        pids = [b["id"]] + [f"{b['id']}~{i}" for i in range(len(b["alts"]))]
+        ge = {}
+        for pid in pids:                          # one real step each (fills the graph's inputs), then its graph alone
+            rt.step(pid, st)
+            ge[pid] = rt._graph(pid)[0]
+        ts = {pid: [] for pid in pids}
+        for _ in range(7):
+            for pid in pids:
+                rt.ck(rt.cu.cuEventRecord(e0, rt.st), "event")
+                rt.ck(rt.cu.cuGraphLaunch(ge[pid], rt.st), "launch")
+                rt.ck(rt.cu.cuEventRecord(e1, rt.st), "event")
+                rt.ck(rt.cu.cuEventSynchronize(e1), "sync")
+                rt.ck(rt.cu.cuEventElapsedTime(C.byref(ms), e0, e1), "elapsed")
+                ts[pid].append(ms.value)
+        med = {pid: float(np.median(v[2:])) for pid, v in ts.items()}
+        pick[b["id"]] = min(med, key=med.get)
+        log[b["id"]] = {pid: round(v * 1000, 1) for pid, v in med.items()}
+    for a, row in rt._rows():                     # the timing steps wrote the caches: zeroed for the requests to come
+        rt.ck(rt.cu.cuMemsetD8Async(C.c_uint64(a), C.c_ubyte(0), C.c_size_t(row * next(iter(rt.plans.values()))["nseq"]), rt.st), "zero")
+    rt.ck(rt.cu.cuStreamSynchronize(rt.st), "sync")
+    rt.alias = {k: v for k, v in pick.items() if v != k}
+    os.makedirs(os.path.dirname(cache), exist_ok=True)
+    json.dump({"pick": pick, "us": log, "seconds": round(time.perf_counter() - t0, 2)}, open(cache + ".tmp", "w"), indent=1)
+    os.replace(cache + ".tmp", cache)
 
 
 class PlanEmbed:
