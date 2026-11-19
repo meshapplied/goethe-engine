@@ -512,7 +512,15 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
         if apair:
             cands.append(({**b, "id": top, "io": plans[top]["io"]}, top, [f"{b['id']}@{w}" for w in range(w0, w1 + 1, 256)], len(apair)))
     rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device, share)
-    jit(rt, cands, pack)
+    base = {}                                      # each chunk length's narrowest and widest buckets (and the one-sequence decode's):
+    for b in out:                                  # timed once on this device, the backend's price of a launch, affine in the width
+        k = (b["kind"], b.get("prefill") if b["kind"] == "prefill" else b.get("ncol"))   # between (PlanBackend._split)
+        if k[0] == "prefill" or k[1] == 1:
+            for e, better in ((0, lambda x, y: x < y), (1, lambda x, y: x > y)):
+                if (k, e) not in base or better(b["io"]["n_kv"], base[k, e]["io"]["n_kv"]):
+                    base[k, e] = b
+    reps = {c[1] for c in cands}
+    jit(rt, cands + [(b, b["id"], [], 0) for b in {b["id"]: b for b in base.values()}.values() if b["id"] not in reps], pack)
     return stage, br.m, out, rt
 
 
@@ -533,16 +541,18 @@ def jit(rt, buckets, pack):
     key = f"{bytes(uu).hex()}-{h.hexdigest()[:16]}-{drv.value}"
     cache = os.path.join(os.environ.get("GOETHE_HOME", os.path.expanduser("~/.goethe")), "tune", key + ".json")
     if os.path.exists(cache) and os.environ.get("GOETHE_JIT") != "force":
-        rt.alias = {k: v for k, v in json.load(open(cache))["pick"].items() if v in rt.plans}
+        d = json.load(open(cache))
+        rt.alias = {k: v for k, v in d["pick"].items() if v in rt.plans}
+        rt.cost = {k: v[k] / 1e6 for k, v in d["us"].items()}
         return
     e0, e1, ms = C.c_void_p(), C.c_void_p(), C.c_float()
     rt.ck(rt.cu.cuEventCreate(C.byref(e0), 0), "event")
     rt.ck(rt.cu.cuEventCreate(C.byref(e1), 0), "event")
-    pick, t0, log = {}, time.perf_counter(), {}
+    pick, t0, log, rt.cost = {}, time.perf_counter(), {}, {}
     for b, rep, members, na in buckets:           # (bucket, the plan timed: an affine bucket's widest, its widths, alternatives)
         io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
         w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
-        pos = max(w - 256, 0)
+        pos = max(w - (256 if b["kind"] == "decode" else n), 0)    # the widest positions the bucket serves
         st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
             Step([1] * n, [0] * n, range(pos, pos + n), range(pos, pos + n), [0] * n, kv, w, [n - 1])
         pids = [rep] + [f"{rep}~{i}" for i in range(na)]
@@ -564,6 +574,7 @@ def jit(rt, buckets, pack):
         for m in members:                         # every width of the bucket takes the pick
             pick[m] = m + best[len(rep):]
         log[rep] = {pid: round(v * 1000, 1) for pid, v in med.items()}
+        rt.cost[rep] = med[rep] / 1000
     for a, row in rt._rows():                     # the timing steps wrote the caches: zeroed for the requests to come
         rt.ck(rt.cu.cuMemsetD8Async(C.c_uint64(a), C.c_ubyte(0), C.c_size_t(row * next(iter(rt.plans.values()))["nseq"]), rt.st), "zero")
     rt.ck(rt.cu.cuStreamSynchronize(rt.st), "sync")
@@ -643,6 +654,11 @@ class PlanBackend:
         P.need(any(n == 1 for n, _ in self.decs), "the pack has no one-sequence decode bucket")
         self.dec = self.decs[max(k for k in self.decs if k[0] == 1)]
         self.chunks = sorted({t for t, _ in self.pres}, reverse=True)
+        cs = getattr(self.rt, "cost", {})               # each chunk length's launch time at its narrowest width (jit)
+        tab = [(t, self.pres) for t in self.chunks] + [(1, self.decs)]     # 1: a token through the one-sequence decode bucket
+        self.price = {t: sorted((w, cs[p]) for (n, w), p in tb.items() if n == t and p in cs) for t, tb in tab}
+        if not all(self.price.values()):                # not every length timed: launched tokens for all
+            self.price = {}
         self.bucket = next(b for b in bs if b["id"] == self.dec)
         self.n_kv, self.kv_size = self.widths[-1], io[self.dec]["kv_size"]
         P.need(all(x["kv_size"] == self.kv_size for x in io.values()), "buckets recorded at different capacities")
@@ -675,19 +691,50 @@ class PlanBackend:
         ws = sorted(w for k, w in table if k == n and w >= -(-end // 256) * 256)
         return (table[(n, ws[0])], ws[0]) if ws else (None, None)
 
+    def _split(self, pos, r):
+        """[(chunk, real tokens)] for r tokens from pos, the least measured time (else launched tokens), then the fewest launches:
+        exact chunks, or (not
+        for a recurrent model: padding would advance its state; GOETHE_PAD=0) one padded chunk holding the rest (causal attention
+        and row-wise ops: padding changes no real row; its KV cells sit past the last real position, masked, then overwritten by
+        decode). No chunk fits: token by token through the one-sequence decode bucket (only then: it measured ~10x a padded chunk)"""
+        fits = lambda t, q: self._pick(self.pres, t, q + t)[0] is not None
+        price = getattr(self, "price", {})          # {chunk: [(width, seconds)]} timed at load (else launched tokens)
+
+        def cost(t, q):                              # the launch at the width it takes: affine between the timed widths
+            if t not in price:
+                return t
+            w, pts = self._pick(self.pres, t, q + t)[1] if t > 1 else self._pick(self.decs, 1, q + 1)[1], price[t]
+            (w0, c0), (w1, c1) = pts[0], pts[-1]
+            return c0 if w1 == w0 else c0 + (c1 - c0) * (w - w0) / (w1 - w0)
+        pad_ok = _PAD and not self.caps.get("recurrent")
+        memo = {}
+
+        def best(q, r):                           # ((tokens, launches), plan)
+            if r == 0:
+                return (0, 0), []
+            if (q, r) not in memo:
+                c = []
+                for t in self.chunks:
+                    if t <= r and fits(t, q):
+                        (k, n), pl = best(q + t, r - t)
+                        c.append(((k + cost(t, q), n + 1), [(t, t)] + pl))
+                    elif t > r and pad_ok and fits(t, q):
+                        c.append(((cost(t, q), 1), [(t, r)]))
+                if not c:
+                    (k, n), pl = best(q + 1, r - 1)
+                    c.append(((k + cost(1, q), n + 1), [(1, 1)] + pl))
+                memo[q, r] = min(c, key=lambda x: x[0])
+            return memo[q, r]
+        return best(pos, r)[1]
+
     def _run(self, toks, pos):
         """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
         i, row = 0, None
-        while i < len(toks):
-            q, r = pos + i, len(toks) - i
-            T = next((t for t in self.chunks if t <= r and self._pick(self.pres, t, q + t)[0]), 1)
-            n = T                                  # the real tokens of this launch
-            if T == 1 and r > 1 and not self.caps.get("recurrent") and _PAD:   # a short tail: the smallest prefill chunk that holds it,
-                T = next((t for t in reversed(self.chunks) if t >= r and self._pick(self.pres, t, q + t)[0]), 1)   # padded
-                n = r if T > 1 else 1              # (causal attention and row-wise ops: the padding changes no real row; its KV
-            pid, W = self._pick(self.pres, T, q + T) if T > 1 else self._pick(self.decs, 1, q + 1)  # cells sit past the last real
-            P.need(pid is not None, f"position {q + T} past the pack's KV widths")                     # position: masked, then
-            p = list(range(q, q + T))                                                                  # overwritten by decode)
+        for T, n in self._split(pos, len(toks)):
+            q = pos + i
+            pid, W = self._pick(self.pres, T, q + T) if T > 1 else self._pick(self.decs, 1, q + 1)
+            P.need(pid is not None, f"position {q + T} past the pack's KV widths")
+            p = list(range(q, q + T))
             tk = list(toks[i:i + n]) + [toks[i + n - 1]] * (T - n)
             st = Step(tk, [0] * T, p, p, [0] * T, self.kv_size, W, [n - 1] if T > 1 else [0])
             row = self.rt.step(pid, st)[-1]
