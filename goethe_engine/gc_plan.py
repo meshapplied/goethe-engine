@@ -189,7 +189,7 @@ def lerp_plan(x0, x1, t):
 
 _PDL = os.environ.get("GOETHE_PLAN_PDL", "1") != "0"     # 0: every launch without PDL (profiling: true kernel durations)
 _PAD = os.environ.get("GOETHE_PAD", "1") != "0"          # 0: a short prefill tail runs token by token (the exact split)
-_PACKED = os.environ.get("GOETHE_PACKED", "0") != "0"    # 1: concurrent prompts in packed prefills (off: wrong rows, 11-20)
+_PACKED = os.environ.get("GOETHE_PACKED", "1") != "0"    # 0: concurrent prompts prefill one at a time
 
 
 class Runtime:
