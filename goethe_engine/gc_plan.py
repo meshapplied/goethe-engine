@@ -726,9 +726,11 @@ class PlanBackend:
         S = min(k[0] for k in fit)
         T = max(k[1] for k in fit if k[0] == S)
         pts = self.pprice.get((S, T))
-        if self.price and pts:                   # measured, at the middle of each bucket's widths (a prompt's chunks cross them
-            mid = lambda q: (q[0][1] + q[-1][1]) / 2     # all): a packed launch's seconds per real token vs the cheapest chunk's;
-            if mid(pts) / (n * T) >= min(mid(p) / t for t, p in self.price.items() if t > 1):     # not cheaper: no split
+        if self.price and pts:                   # measured, both at one width (the middle of the packed bucket's, which a prompt's
+            w = (pts[0][0] + pts[-1][0]) / 2     # chunks cross): a packed launch's seconds per real token vs the cheapest chunk's
+            at = lambda q: q[0][1] if q[-1][0] == q[0][0] else \
+                q[0][1] + (q[-1][1] - q[0][1]) * (min(max(w, q[0][0]), q[-1][0]) - q[0][0]) / (q[-1][0] - q[0][0])
+            if at(pts) / (n * T) >= min(at(p) / t for t, p in self.price.items() if t > 1):     # not cheaper: no split
                 return None
         per = budget // n
         return per - per % T if per >= T else None
