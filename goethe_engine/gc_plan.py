@@ -829,9 +829,10 @@ class PlanBackend:
         rows = {}
         greedy = all(w.greedy or not w.want for w in work) and "gc_argmax_rows" in self.rt.fn     # tokens, not logits
         dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
-        rows.update(self._packed([w for w in work if w not in dec]))
+        isdec = {id(w) for w in dec}          # by identity: a work item's == compares every field
+        rows.update(self._packed([w for w in work if id(w) not in isdec]))
         for w in work:
-            if w not in dec and w.sid not in rows:
+            if id(w) not in isdec and w.sid not in rows:
                 rows[w.sid] = self._alone(w)
         n = len(self.live)
         end = max((w.pos for w in dec), default=0) + 1
