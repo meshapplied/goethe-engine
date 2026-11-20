@@ -791,10 +791,12 @@ class PlanBackend:
         fits = lambda t, q: self._pick(self.pres, t, q + t)[0] is not None
         price = getattr(self, "price", {})          # {chunk: [(width, seconds)]} timed at load (else launched tokens)
 
-        def cost(t, q):                              # the launch at the width it takes: affine between the timed widths
-            if t not in price:
+        def cost(t, q):                              # the launch at the width it takes: affine between the timed widths (paged KV:
+            if t not in price:                       # at the chunk's end, its attention's length; each width was timed ending there)
                 return t
             w, pts = self._pick(self.pres, t, q + t)[1] if t > 1 else self._pick(self.decs, 1, q + 1)[1], price[t]
+            if getattr(self, "page", None):
+                w = min(max(q + t, pts[0][0]), pts[-1][0])
             (w0, c0), (w1, c1) = pts[0], pts[-1]
             return c0 if w1 == w0 else c0 + (c1 - c0) * (w - w0) / (w1 - w0)
         pad_ok = _PAD and not self.caps.get("recurrent")
