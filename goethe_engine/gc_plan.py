@@ -733,6 +733,14 @@ class PlanBackend:
         self.geometry = KVGeometry(block_size=self.max_len, num_blocks=self.max_seqs, layers=1, kv_heads=1, head_dim=1)
         rec = any(re.match(r"cache_[rs]_l", k) for k in self.rt.plans[self.dec].get("caches", {}))
         self.caps = {"recurrent": "chain"} if rec else {}
+        # paged KV (a pack recorded with GC_PAGED): attention reads pages of `page` cells through the gc_pages tables, so a
+        # sequence's cells are anywhere in the cache (page 0: the padding rows' scratch); no stream moves, no spare
+        self.page = self.rt.plans[self.dec]["io"]["inputs"].get("page")
+        if self.page:
+            P.need(not rec, "gc-plan: paged KV with recurrent state")
+            self.free = list(range(self.nseq * self.kv_size // self.page - 1, 0, -1))
+            self.tab = {}                    # sid -> its pages
+            self.max_seqs = max(1, min(max(n for n, _ in self.decs), self.nseq))
         self.numerics = dict(contract=self.bucket["contract"], determinism=self.bucket.get("determinism"))
 
     def warm(self):
@@ -767,11 +775,11 @@ class PlanBackend:
             self.rt.zero_slot(len(self.live) - 1)     # a new sequence starts from zero recurrent state
         return self.live.index(sid)
 
-    @staticmethod
-    def _pick(table, n, end):
+    def _pick(self, table, n, end):
         """the bucket of table {(n, n_kv): id} for n whose KV width is the one llama.cpp reads when the last cell used is end - 1
-        (end padded to 256), else the narrowest wider one (cells past the position are masked); None: no width holds it"""
-        ws = sorted(w for k, w in table if k == n and w >= -(-end // 256) * 256)
+        (end padded to 256), else the narrowest wider one (cells past the position are masked); None: no width holds it.
+        Paged KV: the narrowest (attention reads the page tables, not the width)"""
+        ws = sorted(w for k, w in table if k == n and (getattr(self, "page", None) or w >= -(-end // 256) * 256))
         return (table[(n, ws[0])], ws[0]) if ws else (None, None)
 
     def _split(self, pos, r, priced=False):
@@ -810,8 +818,16 @@ class PlanBackend:
             return memo[q, r]
         return best(pos, r)[0][0] if priced else best(pos, r)[1]   # priced: its measured seconds
 
-    def _run(self, toks, pos):
-        """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
+    def _cells(self, sid, pos):
+        """paged KV: the cells of sid's positions pos (its pages, taken from the free list as it grows)"""
+        t = self.tab.setdefault(sid, [])
+        while len(t) <= max(pos) // self.page:
+            P.need(self.free, "gc-plan: paged KV: no free page")
+            t.append(self.free.pop())
+        return [t[x // self.page] * self.page + x % self.page for x in pos]
+
+    def _run(self, toks, pos, sid=None):
+        """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0 (paged KV: in sid's pages)"""
         i, row = 0, None
         for T, n in self._split(pos, len(toks)):
             q = pos + i
@@ -819,7 +835,9 @@ class PlanBackend:
             P.need(pid is not None, f"position {q + T} past the pack's KV widths")
             p = list(range(q, q + T))
             tk = list(toks[i:i + n]) + [toks[i + n - 1]] * (T - n)
-            st = Step(tk, [0] * T, p, p, [0] * T, self.kv_size, W, [n - 1] if T > 1 else [0])
+            st = Step(tk, [0] * T, p, self._cells(sid, p) if self.page else p, [0] * T, self.kv_size, W, [n - 1] if T > 1 else [0])
+            if self.page:
+                st.pages = [(T, list(self.tab[sid]), q + T)]
             row = self.rt.step(pid, st)[-1]
             i += n
         return np.frombuffer(row, np.float32)[:self.vocab_size]
@@ -831,7 +849,7 @@ class PlanBackend:
         stream's padding writes cells past its prompt, masked, then overwritten by decode), free streams' rows dropped; a sequence
         takes the row of its last token from the chunk that holds it; past the widest packed width the rest runs alone.
         {sid: last row} of those it ran (none: not this step's shape); greedy: {sid: token}, each row's argmax on the device"""
-        if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or len({w.pos for w in pre}) != 1:
+        if not self.packs or self.page or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or len({w.pos for w in pre}) != 1:
             return {}                            # (prompt pieces at one common position: the scheduler feeds long prompts in chunks)
         for w in pre:
             self._stream(w.sid)
@@ -887,8 +905,10 @@ class PlanBackend:
         return rows
 
     def _alone(self, w):
-        """one sequence's run in stream 0, its stream's occupant parked in the spare"""
+        """one sequence's run in stream 0, its stream's occupant parked in the spare (paged KV: in its own pages, nothing moves)"""
         k = self._stream(w.sid)
+        if self.page:
+            return self._run(list(w.tokens), w.pos, w.sid)
         occ, end = self.live[0], w.pos + len(w.tokens)
         if k:                                    # only computed cells move (a fresh prompt's: none)
             self.rt.copy_slot(0, self.spare, self.used.get(occ, 0), self.kv_size)
@@ -914,7 +934,7 @@ class PlanBackend:
         for w in work:
             if id(w) not in isdec and w.sid not in rows:
                 rows[w.sid] = self._alone(w)
-        n = len(self.live)
+        n = len(dec) if self.page else len(self.live)
         end = max((w.pos for w in dec), default=0) + 1
         pid = B = W = None                  # the smallest ladder batch B >= n with a width that holds end
         for b in sorted({k for k, _ in self.decs if k >= n}):
@@ -922,7 +942,21 @@ class PlanBackend:
             if pid:
                 B = b
                 break
-        if dec and {w.sid for w in dec} == set(self.live) and pid:     # every live sequence, one batch
+        if dec and self.page and pid:         # paged KV: the decoding sequences in their pages, rows past them on page 0
+            cells = [self._cells(w.sid, [w.pos])[0] for w in dec]
+            st = Step([w.tokens[0] for w in dec] + [0] * (B - len(dec)), list(range(B)), [w.pos for w in dec] + [0] * (B - len(dec)),
+                      cells + [0] * (B - len(dec)), [0] * B, self.kv_size, W, list(range(B)))
+            st.pages = [(1, list(self.tab[w.sid]), w.pos + 1) for w in dec] + [(1, [0], 1)] * (B - len(dec))
+            if greedy:
+                P.need(self.rt_vocab(pid, B) == self.vocab_size, "gc-plan: logits rows wider than the vocabulary")
+                ids = np.frombuffer(self.rt.step(pid, st, argmax=B)[-1], np.int32)
+                for i, w in enumerate(dec):
+                    rows[w.sid] = int(ids[i])
+            else:
+                out = np.frombuffer(self.rt.step(pid, st)[-1], np.float32).reshape(B, -1)
+                for i, w in enumerate(dec):
+                    rows[w.sid] = out[i, :self.vocab_size]
+        elif dec and {w.sid for w in dec} == set(self.live) and pid:     # every live sequence, one batch
             by = {w.sid: w for w in dec}
             ws = [by[s] for s in self.live]
             # rows n .. B-1 run in free streams (the live ones are packed in [0, n)), position 0, their outputs dropped: a free
@@ -955,7 +989,14 @@ class PlanBackend:
             self.rt.copy_slot(src, dst)
 
     def release(self, sid):
-        """the sequence's stream is freed: the last live sequence moves into the hole (streams stay packed)"""
+        """the sequence's stream is freed: the last live sequence moves into the hole (streams stay packed); paged KV: its pages
+        go back to the free list"""
+        if self.page:
+            self.free.extend(self.tab.pop(sid, []))
+            if sid in self.live:
+                self.live.remove(sid)
+            self.used.pop(sid, None)
+            return
         if sid not in self.live:
             return
         k, last = self.live.index(sid), len(self.live) - 1
