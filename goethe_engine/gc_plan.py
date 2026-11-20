@@ -517,7 +517,7 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
     base = {}                                      # each chunk length's narrowest and widest buckets (and the one-sequence decode's):
     for b in out:                                  # timed once on this device, the backend's price of a launch, affine in the width
         k = (b["kind"], b.get("prefill") if b["kind"] == "prefill" else b.get("ncol"))   # between (PlanBackend._split)
-        if k[0] == "prefill" or k[1] == 1:
+        if (k[0] == "prefill" and b.get("ncol", 1) == 1) or (k[0] == "decode" and k[1] == 1):   # (packed prefills: not priced)
             for e, better in ((0, lambda x, y: x < y), (1, lambda x, y: x > y)):
                 if (k, e) not in base or better(b["io"]["n_kv"], base[k, e]["io"]["n_kv"]):
                     base[k, e] = b
