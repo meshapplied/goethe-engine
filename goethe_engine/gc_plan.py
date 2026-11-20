@@ -412,15 +412,15 @@ class Runtime:
 
     def warm(self, greedy=None):
         """capture every bucket's CUDA graph now (otherwise on first use) and run each once (zero inputs: token 0 at position 0), so
-        the first real step finds its modules loaded; greedy {pid: n}: also its n-row argmax form. Caches and recurrent states hold
-        garbage afterwards: a sequence's stream is zeroed when it takes it."""
+        the first real step finds its modules loaded; greedy {pid: n}: also its n-row argmax form. Every cache zeroed afterwards."""
         for pid in self.plans:
             self._graph(pid)
         for pid, n in (greedy or {}).items():
             self._graph(pid, n)
         for g in self.graphs.values():
             self.ck(self.cu.cuGraphLaunch(g[0], self.st), "warm launch")
-        self.ck(self.cu.cuStreamSynchronize(self.st), "warm")
+        for s in range(self.plans[next(iter(self.plans))]["nseq"]):     # every cell finite again (zero_slot leaves KV cells)
+            self.zero_slot(s, state=False)
 
     def step(self, pid, step, argmax=0):
         """run bucket pid on this step: its inputs generated into the staging buffer, its graph launched; the step's outputs (all of
@@ -437,19 +437,22 @@ class Runtime:
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
         return [C.string_at(h, n) for h, n in outs]
 
-    def _rows(self):            # (device address of sequence block 0, block bytes) of every cache (kv and recurrent state)
+    def _rows(self, state=False):   # (device address of sequence block 0, block bytes) of every cache (state: recurrent ones only)
         p = next(iter(self.plans))
         base = self.bases[p]
-        for b, off, n in self.plans[p].get("caches", {}).values():
-            yield base[b] + off, n // self.plans[p]["nseq"]
+        for k, (b, off, n) in self.plans[p].get("caches", {}).items():
+            if not state or re.match(r"cache_[rs]_l", k):
+                yield base[b] + off, n // self.plans[p]["nseq"]
 
     def copy_slot(self, src, dst):
         for a, row in self._rows():
             self.ck(self.cu.cuMemcpyDtoDAsync_v2(C.c_uint64(a + dst * row), C.c_uint64(a + src * row), C.c_size_t(row), self.st), "copy slot")
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
 
-    def zero_slot(self, s):
-        for a, row in self._rows():
+    def zero_slot(self, s, state=True):
+        """stream s zeroed: its recurrent state (a new sequence starts from zero); state=False: its KV cells too (a new sequence
+        needs no KV zeroing: cells past its positions are masked to weight 0 and hold finite values, warm() zeroes them once)"""
+        for a, row in self._rows(state):
             self.ck(self.cu.cuMemsetD8Async(C.c_uint64(a + s * row), C.c_ubyte(0), C.c_size_t(row), self.st), "zero slot")
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
 
