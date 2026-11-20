@@ -81,6 +81,8 @@ def generate(name, n, step, hp):
         if mk["swa"] and hp.get("n_swa"):   # symmetric window (non-causal): |p_q - p_k| <= n_swa / 2
             pq, pk = step.pos.astype(np.int64), np.arange(K)
             keep &= np.abs(pq[:, None] - pk[None, :]) <= hp["n_swa"] // 2
+            keep[step.n_real:, :step.n_real] = True     # pad queries past the window keep every real key (a row of only -inf is
+            #                                             NaN, and NaN V poisons real rows even at weight 0; pooling drops pad rows)
         if mk["esize"] == 4:
             return np.where(keep, 0, -np.inf).astype(np.float32).tobytes()
         return np.where(keep, np.uint16(0), NEG_INF_F16).astype(np.uint16).tobytes()
