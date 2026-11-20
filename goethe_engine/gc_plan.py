@@ -516,8 +516,8 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
     rt = Runtime(plans, lambda rel, pid: open(path(byid[pid], rel), "rb").read(), ws, device, share)
     base = {}                                      # each chunk length's narrowest and widest buckets (and the one-sequence decode's):
     for b in out:                                  # timed once on this device, the backend's price of a launch, affine in the width
-        k = (b["kind"], b.get("prefill") if b["kind"] == "prefill" else b.get("ncol"))   # between (PlanBackend._split)
-        if (k[0] == "prefill" and b.get("ncol", 1) == 1) or (k[0] == "decode" and k[1] == 1):   # (packed prefills: not priced)
+        k = (b["kind"], b.get("prefill") if b["kind"] == "prefill" else b.get("ncol"), b.get("ncol", 1))   # between (_split, _packed)
+        if k[0] == "prefill" or (k[0] == "decode" and k[1] == 1):
             for e, better in ((0, lambda x, y: x < y), (1, lambda x, y: x > y)):
                 if (k, e) not in base or better(b["io"]["n_kv"], base[k, e]["io"]["n_kv"]):
                     base[k, e] = b
@@ -555,8 +555,10 @@ def jit(rt, buckets, pack):
         io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
         w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
         pos = max(w - (256 if b["kind"] == "decode" else n), 0)    # the widest positions the bucket serves
+        S = b.get("ncol", 1) if b["kind"] == "prefill" else 1     # a packed prefill: S sequences of n tokens, sequence s in stream s
+        p, sq = list(range(pos, pos + n)) * S, [s for s in range(S) for _ in range(n)]
         st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
-            Step([1] * n, [0] * n, range(pos, pos + n), range(pos, pos + n), [0] * n, kv, w, [n - 1])
+            Step([1] * n * S, sq, p, p, sq, kv, w, [s * n + n - 1 for s in range(S)])
         pids = [rep] + [f"{rep}~{i}" for i in range(na)]
         ge = {}
         for pid in pids:                          # one real step each (fills the graph's inputs), then its graph alone
@@ -663,6 +665,7 @@ class PlanBackend:
         self.price = {t: sorted((w, cs[p]) for (n, w), p in tb.items() if n == t and p in cs) for t, tb in tab}
         if not all(self.price.values()):                # not every length timed: launched tokens for all
             self.price = {}
+        self.pprice = {k[:2]: sorted((w, cs[p]) for (s, t, w), p in self.packs.items() if (s, t) == k[:2] and p in cs) for k in self.packs}
         self.bucket = next(b for b in bs if b["id"] == self.dec)
         self.n_kv, self.kv_size = self.widths[-1], io[self.dec]["kv_size"]
         P.need(all(x["kv_size"] == self.kv_size for x in io.values()), "buckets recorded at different capacities")
@@ -695,7 +698,7 @@ class PlanBackend:
         ws = sorted(w for k, w in table if k == n and w >= -(-end // 256) * 256)
         return (table[(n, ws[0])], ws[0]) if ws else (None, None)
 
-    def _split(self, pos, r):
+    def _split(self, pos, r, priced=False):
         """[(chunk, real tokens)] for r tokens from pos, the least measured time (else launched tokens), then the fewest launches:
         exact chunks, or (not
         for a recurrent model: padding would advance its state; GOETHE_PAD=0) one padded chunk holding the rest (causal attention
@@ -729,7 +732,7 @@ class PlanBackend:
                     c.append(((k + cost(1, q), n + 1), [(1, 1)] + pl))
                 memo[q, r] = min(c, key=lambda x: x[0])
             return memo[q, r]
-        return best(pos, r)[1]
+        return best(pos, r)[0][0] if priced else best(pos, r)[1]   # priced: its measured seconds
 
     def _run(self, toks, pos):
         """logits row of the last token of toks run at positions pos .. pos + len - 1 in stream 0"""
@@ -746,14 +749,14 @@ class PlanBackend:
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
     def _packed(self, pre):
-        """fresh prompts filling the live streams at once (every live sequence is one of them, each from position 0) in packed
+        """prompt pieces filling the live streams at once (every live sequence is one of them, all from one position q0) in packed
         prefills: the smallest S >= their count, the smallest T >= their longest (else the largest), chunk by chunk (q = 0, T,
         2T, ...) at the width that holds q + T; each stream's chunk padded to T (causal: padding changes no real row; a finished
         stream's padding writes cells past its prompt, masked, then overwritten by decode), free streams' rows dropped; a sequence
         takes the row of its last token from the chunk that holds it; past the widest packed width the rest runs alone.
         {sid: last row} of those it ran (none: not this step's shape)"""
-        if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or any(w.pos for w in pre):
-            return {}
+        if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or len({w.pos for w in pre}) != 1:
+            return {}                            # (prompt pieces at one common position: the scheduler feeds long prompts in chunks)
         for w in pre:
             self._stream(w.sid)
         if sorted(self.live) != sorted(w.sid for w in pre):
@@ -768,16 +771,26 @@ class PlanBackend:
         longest = max(len(w.tokens) for w in ws)
         T = next((t for t in Ts if t >= longest), Ts[-1])
         widths = {k[2]: pid for k, pid in self.packs.items() if k[:2] == (S, T)}
-        rows, q = {}, 0
-        while q < longest:
+        q0 = ws[0].pos
+        pts = self.pprice.get((S, T))
+        if self.price and pts:                   # measured: the packed launches vs every prompt alone (the cheaper runs)
+            lin = lambda w: pts[0][1] if pts[-1][0] == pts[0][0] else \
+                pts[0][1] + (pts[-1][1] - pts[0][1]) * (w - pts[0][0]) / (pts[-1][0] - pts[0][0])
+            fit = lambda q: next((x for x in sorted(widths) if x >= -(-(q + T) // 256) * 256), None)
+            qs = range(q0, q0 + longest, T)
+            if any(fit(q) is None for q in qs) or \
+                    sum(lin(fit(q)) for q in qs) >= sum(self._split(q0, len(w.tokens), priced=True) for w in ws):
+                return {}
+        rows, q = {}, q0
+        while q < q0 + longest:
             W = next((x for x in sorted(widths) if x >= -(-(q + T) // 256) * 256), None)
             if W is None:
                 break
             toks, sq, pos, outs = [], [], [], []
             for s in range(S):
-                t = list(ws[s].tokens[q:q + T]) if s < n else []
+                t = list(ws[s].tokens[q - q0:q - q0 + T]) if s < n else []
                 t = t or [ws[s].tokens[-1] if s < n else 0]
-                last = len(ws[s].tokens) - 1 - q if s < n else -1
+                last = len(ws[s].tokens) - 1 - (q - q0) if s < n else -1
                 outs.append(s * T + (last if 0 <= last < T else 0))
                 toks += t + [t[-1]] * (T - len(t))
                 sq += [s] * T
@@ -785,12 +798,12 @@ class PlanBackend:
             out = np.frombuffer(self.rt.step(widths[W], Step(toks, sq, pos, pos, sq, self.kv_size, W, outs))[-1],
                                 np.float32).reshape(S, -1)
             for s in range(n):
-                if q <= len(ws[s].tokens) - 1 < q + T:
+                if q - q0 <= len(ws[s].tokens) - 1 < q - q0 + T:
                     rows[ws[s].sid] = out[s, :self.vocab_size].copy()
             q += T
         for w in ws:                             # past the widest packed width: the rest alone
             if w.sid not in rows:
-                rows[w.sid] = self._alone(dataclasses.replace(w, tokens=w.tokens[q:], pos=q))
+                rows[w.sid] = self._alone(dataclasses.replace(w, tokens=w.tokens[q - q0:], pos=q))
         return rows
 
     def _alone(self, w):
