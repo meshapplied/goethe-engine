@@ -653,7 +653,7 @@ class PlanBackend:
         self.decs = {(b["ncol"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "decode"}   # (sequences, n_kv) -> bucket
         self.pres = {(b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill" and b.get("ncol", 1) == 1}
         # packed prefills: S prompts of T tokens in streams [0, S) at once, (S, T) -> bucket (their positions from 0)
-        self.packs = {(b["ncol"], b["prefill"]): b["id"] for b in bs if b["kind"] == "prefill" and b.get("ncol", 1) > 1}
+        self.packs = {(b["ncol"], b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill" and b.get("ncol", 1) > 1}
         self.widths = sorted({w for _, w in self.decs} | {w for _, w in self.pres})
         P.need(any(n == 1 for n, _ in self.decs), "the pack has no one-sequence decode bucket")
         self.dec = self.decs[max(k for k in self.decs if k[0] == 1)]
@@ -746,42 +746,51 @@ class PlanBackend:
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
     def _packed(self, pre):
-        """fresh prompts filling the live streams at once (every live sequence is one of them, each from position 0): their first
-        T tokens in one packed prefill (the smallest S >= their count, the smallest T >= their longest, else the largest T), each
-        padded to T (causal: padding changes no real row; its cells past the prompt are overwritten), free streams' rows dropped;
-        a longer prompt continues alone from T. {sid: last row} of those it ran (none: not this step's shape)"""
+        """fresh prompts filling the live streams at once (every live sequence is one of them, each from position 0) in packed
+        prefills: the smallest S >= their count, the smallest T >= their longest (else the largest), chunk by chunk (q = 0, T,
+        2T, ...) at the width that holds q + T; each stream's chunk padded to T (causal: padding changes no real row; a finished
+        stream's padding writes cells past its prompt, masked, then overwritten by decode), free streams' rows dropped; a sequence
+        takes the row of its last token from the chunk that holds it; past the widest packed width the rest runs alone.
+        {sid: last row} of those it ran (none: not this step's shape)"""
         if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or any(w.pos for w in pre):
             return {}
         for w in pre:
             self._stream(w.sid)
         if sorted(self.live) != sorted(w.sid for w in pre):
             return {}
-        n, longest = len(pre), max(len(w.tokens) for w in pre)
-        fit = [k for k in self.packs if k[0] >= n]
+        n = len(pre)
+        fit = {(k[0], k[1]) for k in self.packs if k[0] >= n}
         if not fit:
             return {}
         S = min(k[0] for k in fit)
         Ts = sorted(t for s, t in fit if s == S)
+        ws = [{w.sid: w for w in pre}[self.live[s]] for s in range(n)]
+        longest = max(len(w.tokens) for w in ws)
         T = next((t for t in Ts if t >= longest), Ts[-1])
-        pid = self.packs[S, T]
-        by = {w.sid: w for w in pre}
-        toks, sq, pos, outs = [], [], [], []
-        for s in range(S):
-            w = by.get(self.live[s]) if s < n else None
-            t = list(w.tokens[:T]) if w else [0]
-            outs.append(s * T + len(t) - 1)
-            toks += t + [t[-1]] * (T - len(t))
-            sq += [s] * T
-            pos += list(range(T))
-        W = self.rt.plans[pid]["io"]["n_kv"]
-        out = np.frombuffer(self.rt.step(pid, Step(toks, sq, pos, pos, sq, self.kv_size, W, outs))[-1], np.float32).reshape(S, -1)
-        rows = {}
-        for s in range(n):
-            w = by[self.live[s]]
-            if len(w.tokens) > T:                 # the rest alone, from position T
-                rows[w.sid] = self._alone(dataclasses.replace(w, tokens=w.tokens[T:], pos=T))
-            else:
-                rows[w.sid] = out[s, :self.vocab_size]
+        widths = {k[2]: pid for k, pid in self.packs.items() if k[:2] == (S, T)}
+        rows, q = {}, 0
+        while q < longest:
+            W = next((x for x in sorted(widths) if x >= -(-(q + T) // 256) * 256), None)
+            if W is None:
+                break
+            toks, sq, pos, outs = [], [], [], []
+            for s in range(S):
+                t = list(ws[s].tokens[q:q + T]) if s < n else []
+                t = t or [ws[s].tokens[-1] if s < n else 0]
+                last = len(ws[s].tokens) - 1 - q if s < n else -1
+                outs.append(s * T + (last if 0 <= last < T else 0))
+                toks += t + [t[-1]] * (T - len(t))
+                sq += [s] * T
+                pos += list(range(q, q + T))
+            out = np.frombuffer(self.rt.step(widths[W], Step(toks, sq, pos, pos, sq, self.kv_size, W, outs))[-1],
+                                np.float32).reshape(S, -1)
+            for s in range(n):
+                if q <= len(ws[s].tokens) - 1 < q + T:
+                    rows[ws[s].sid] = out[s, :self.vocab_size].copy()
+            q += T
+        for w in ws:                             # past the widest packed width: the rest alone
+            if w.sid not in rows:
+                rows[w.sid] = self._alone(dataclasses.replace(w, tokens=w.tokens[q:], pos=q))
         return rows
 
     def _alone(self, w):
