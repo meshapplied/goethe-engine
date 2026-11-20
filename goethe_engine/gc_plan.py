@@ -69,6 +69,29 @@ def _enc_mask(K, n_real, n_swa, esize, pos):
     return np.where(keep, np.uint16(0), NEG_INF_F16).astype(np.uint16).tobytes()
 
 
+def _page_tables(step, P, n):
+    """int32 [q_indptr B + 1][kv_indptr B + 1][last_page_len B][indices], zero-padded to n bytes, for the step's requests in the
+    order their rows come (B of them): step.pages [(rows, [page ids], kv_len)] when the backend allocated them, else each
+    request's cells as the stream layout holds them (stream s: cells s * kv_size .. contiguous, page = cell / P)"""
+    reqs = getattr(step, "pages", None)
+    if reqs is None:
+        reqs, order = [], {}
+        for i, s in enumerate(step.seqs.tolist()):
+            order.setdefault(s, []).append(i)
+        for s, rows in order.items():
+            L = int(step.pos[rows].max()) + 1
+            first = int(step.streams[rows[0]]) * step.kv_size // P
+            reqs.append((len(rows), list(range(first, first + -(-L // P))), L))
+    B = len(reqs)
+    q = np.concatenate([[0], np.cumsum([r for r, _, _ in reqs])])
+    kvp = np.concatenate([[0], np.cumsum([len(p) for _, p, _ in reqs])])
+    last = [L - (len(p) - 1) * P for _, p, L in reqs]
+    out = np.concatenate([q, kvp, last, [x for _, p, _ in reqs for x in p]]).astype(np.int32).tobytes()
+    if len(out) > n:
+        raise ValueError(f"gc_pages: {len(out)} B of page tables, the plan holds {n}")
+    return out + bytes(n - len(out))
+
+
 def generate(name, n, step, hp):
     """bytes of the plan input `name` (n bytes in the plan) for this step; hp: the bucket's io.inputs (n_pos, causal, n_swa, fills)"""
     if "(view)" in name:                     # a slice of its base input at the element offset the compiler measured
@@ -91,6 +114,8 @@ def generate(name, n, step, hp):
     if mk and not hp.get("causal", True):   # every query sees the chunk's real keys (pad queries too: finite rows)
         return _enc_mask(n // (mk["esize"] * T), step.n_real, hp.get("n_swa", 0) if mk["swa"] else 0, mk["esize"],
                          step.pos.astype(np.int64).tobytes())
+    if k == "gc_pages":                     # paged KV: the step's page tables (fakecuda's gc_pages, kern/fa_ggml.cu gc_fa_paged_*)
+        return _page_tables(step, hp["page"], n)
     if k == "inp_pos":
         p = step.pos.astype(np.int32)
         return (np.concatenate([p, p, p, np.zeros_like(p)]) if hp.get("n_pos", 1) == 4 else p).tobytes()
