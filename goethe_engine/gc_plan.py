@@ -452,7 +452,10 @@ class Runtime:
     def zero_slot(self, s, state=True):
         """stream s zeroed: its recurrent state (a new sequence starts from zero); state=False: its KV cells too (a new sequence
         needs no KV zeroing: cells past its positions are masked to weight 0 and hold finite values, warm() zeroes them once)"""
-        for a, row in self._rows(state):
+        rows = list(self._rows(state))
+        if not rows:
+            return
+        for a, row in rows:
             self.ck(self.cu.cuMemsetD8Async(C.c_uint64(a + s * row), C.c_ubyte(0), C.c_size_t(row), self.st), "zero slot")
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
 
@@ -685,7 +688,8 @@ class PlanBackend:
 
     def warm(self):
         """every bucket's graph captured now, the decode buckets in their greedy (device argmax) form too"""
-        self.rt.warm({pid: n for (n, _), pid in self.decs.items()} if "gc_argmax_rows" in self.rt.fn else None)
+        self.rt.warm({**{pid: n for (n, _), pid in self.decs.items()}, **{pid: k[0] for k, pid in self.packs.items()}}
+                     if "gc_argmax_rows" in self.rt.fn else None)
 
     def _stream(self, sid):
         if sid not in self.live:
@@ -751,13 +755,13 @@ class PlanBackend:
             i += n
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
-    def _packed(self, pre):
+    def _packed(self, pre, greedy=False):
         """prompt pieces filling the live streams at once (every live sequence is one of them, all from one position q0) in packed
         prefills: the smallest S >= their count, the smallest T >= their longest (else the largest), chunk by chunk (q = 0, T,
         2T, ...) at the width that holds q + T; each stream's chunk padded to T (causal: padding changes no real row; a finished
         stream's padding writes cells past its prompt, masked, then overwritten by decode), free streams' rows dropped; a sequence
         takes the row of its last token from the chunk that holds it; past the widest packed width the rest runs alone.
-        {sid: last row} of those it ran (none: not this step's shape)"""
+        {sid: last row} of those it ran (none: not this step's shape); greedy: {sid: token}, each row's argmax on the device"""
         if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or len({w.pos for w in pre}) != 1:
             return {}                            # (prompt pieces at one common position: the scheduler feeds long prompts in chunks)
         for w in pre:
@@ -798,11 +802,15 @@ class PlanBackend:
                 toks += t + [t[-1]] * (T - len(t))
                 sq += [s] * T
                 pos += list(range(q, q + T))
-            out = np.frombuffer(self.rt.step(widths[W], Step(toks, sq, pos, pos, sq, self.kv_size, W, outs))[-1],
-                                np.float32).reshape(S, -1)
+            st = Step(toks, sq, pos, pos, sq, self.kv_size, W, outs)
+            if greedy:
+                P.need(self.rt_vocab(widths[W], S) == self.vocab_size, "gc-plan: logits rows wider than the vocabulary")
+                out = np.frombuffer(self.rt.step(widths[W], st, argmax=S)[-1], np.int32)
+            else:
+                out = np.frombuffer(self.rt.step(widths[W], st)[-1], np.float32).reshape(S, -1)
             for s in range(n):
                 if q - q0 <= len(ws[s].tokens) - 1 < q - q0 + T:
-                    rows[ws[s].sid] = out[s, :self.vocab_size].copy()
+                    rows[ws[s].sid] = int(out[s]) if greedy else out[s, :self.vocab_size].copy()
             q += T
         for w in ws:                             # past the widest packed width: the rest alone
             if w.sid not in rows:
@@ -830,7 +838,7 @@ class PlanBackend:
         greedy = all(w.greedy or not w.want for w in work) and "gc_argmax_rows" in self.rt.fn     # tokens, not logits
         dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
         isdec = {id(w) for w in dec}          # by identity: a work item's == compares every field
-        rows.update(self._packed([w for w in work if id(w) not in isdec]))
+        rows.update(self._packed([w for w in work if id(w) not in isdec], greedy))
         for w in work:
             if id(w) not in isdec and w.sid not in rows:
                 rows[w.sid] = self._alone(w)
