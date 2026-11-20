@@ -198,6 +198,8 @@ def lerp_plan(x0, x1, t):
 _PDL = os.environ.get("GOETHE_PLAN_PDL", "1") != "0"     # 0: every launch without PDL (profiling: true kernel durations)
 _PAD = os.environ.get("GOETHE_PAD", "1") != "0"          # 0: a short prefill tail runs token by token (the exact split)
 _PACKED = os.environ.get("GOETHE_PACKED", "1") != "0"    # 0: concurrent prompts prefill one at a time
+_SPLIT = os.environ.get("GOETHE_SPLIT", "0") != "0"    # 1: the scheduler splits a step over waiting prompts (prefill_share): off until
+#                                                        packed buckets build their masks on the device (host masks: ~16 MB a launch at 4k)
 
 
 class Runtime:
@@ -712,6 +714,24 @@ class PlanBackend:
         """every bucket's graph captured now, the decode buckets in their greedy (device argmax) form too"""
         self.rt.warm({**{pid: n for (n, _), pid in self.decs.items()}, **{pid: k[0] for k, pid in self.packs.items()}}
                      if "gc_argmax_rows" in self.rt.fn else None)
+
+    def prefill_share(self, n, budget):
+        """tokens per prompt when n prompts prefill in one step (the scheduler's split): the budget evenly, a whole number of the
+        widest packed chunk for n streams, so packed prefill runs them at once (_packed's measured prices may still run them
+        alone); None (first come first served): no packed bucket for n, less than one chunk each, or (measured) its launch costs
+        more per real token than the cheapest single-prompt chunk"""
+        fit = [k for k in self.packs if k[0] >= n]
+        if not _SPLIT or not _PACKED or not _PAD or self.caps.get("recurrent") or not fit:
+            return None
+        S = min(k[0] for k in fit)
+        T = max(k[1] for k in fit if k[0] == S)
+        pts = self.pprice.get((S, T))
+        if self.price and pts:                   # measured, at the middle of each bucket's widths (a prompt's chunks cross them
+            mid = lambda q: (q[0][1] + q[-1][1]) / 2     # all): a packed launch's seconds per real token vs the cheapest chunk's;
+            if mid(pts) / (n * T) >= min(mid(p) / t for t, p in self.price.items() if t > 1):     # not cheaper: no split
+                return None
+        per = budget // n
+        return per - per % T if per >= T else None
 
     def _stream(self, sid):
         if sid not in self.live:

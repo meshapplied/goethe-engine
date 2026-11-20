@@ -84,6 +84,8 @@ class Scheduler:
         self.preemptions = 0
         self.unmixed = False    # the backend batches decodes only when every live sequence decodes (gc-plan buckets): prefill first
         self.align = 1          # the backend's prefill chunk: a prompt piece short of the prompt's end is a whole number of them
+        self.share = None       # the backend's split of a step's budget over n prompts (share(n, budget): tokens per prompt, None:
+        #                         first come first served): prompts prefilled side by side (a packed backend runs them at once)
 
     def add(self, seq):
         self.waiting.append(seq)
@@ -142,6 +144,8 @@ class Scheduler:
                         continue
                     trees[s.sid] = t.fit(cfg.spec_k, s.limit - s.nout - 1)
         i, empty = 0, Tree([], [])
+        pre = sum(len(s.tokens) - s.computed > 1 for s in self.running) + min(len(self.waiting), cfg.max_num_seqs - len(self.running))
+        cap = self.share(pre, budget) if self.share and pre > 1 else None      # tokens per prompt piece this step
         while i < len(self.running) and budget > 0:
             s = self.running[i]
             need = chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps)
@@ -154,8 +158,8 @@ class Scheduler:
                     i += 1
                     continue
                 t = t.cut(budget - need)
-            n = min(need + len(t), budget)
-            if n < need and not len(t) and self.align > 1:
+            n = min(need + len(t), budget, cap if cap and need > 1 and not len(t) else budget)
+            if n < need and not len(t) and self.align > 1 and not cap:
                 n -= n % self.align
                 if n <= 0:
                     i += 1
@@ -193,8 +197,8 @@ class Scheduler:
                     continue
             kv.attach(s)
             need = chunk(s, len(s.tokens) - s.computed, kv.snaps or kv.bsnaps)
-            n = min(need, budget)
-            if n < need and self.align > 1:
+            n = min(need, budget, cap or budget)
+            if n < need and self.align > 1 and not cap:
                 n -= n % self.align
                 if n <= 0:
                     kv.release(s)
