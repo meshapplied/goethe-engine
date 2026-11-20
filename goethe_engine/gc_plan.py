@@ -10,6 +10,7 @@ and cls pooling, per-row constants the compiler measured (io.inputs.fills), outp
 """
 import dataclasses
 import ctypes as C
+import functools
 import json
 import os
 import re
@@ -437,16 +438,29 @@ class Runtime:
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
         return [C.string_at(h, n) for h, n in outs]
 
-    def _rows(self, state=False):   # (device address of sequence block 0, block bytes) of every cache (state: recurrent ones only)
-        p = next(iter(self.plans))
+    def _rows(self, state=False, kv=False):   # (device address of sequence block 0, block bytes) of every cache (state: recurrent
+        p = next(iter(self.plans))                # ones only); kv: and whether it is a KV cache (rows of cells), not a state
         base = self.bases[p]
         for k, (b, off, n) in self.plans[p].get("caches", {}).items():
-            if not state or re.match(r"cache_[rs]_l", k):
-                yield base[b] + off, n // self.plans[p]["nseq"]
+            rec = bool(re.match(r"cache_[rs]_l", k))
+            if not state or rec:
+                yield (base[b] + off, n // self.plans[p]["nseq"], not rec) if kv else (base[b] + off, n // self.plans[p]["nseq"])
 
-    def copy_slot(self, src, dst):
-        for a, row in self._rows():
-            self.ck(self.cu.cuMemcpyDtoDAsync_v2(C.c_uint64(a + dst * row), C.c_uint64(a + src * row), C.c_size_t(row), self.st), "copy slot")
+    @functools.cached_property
+    def cell_major(self):        # flash attention in the plans (llama.cpp's context-wide choice): V not transposed, every KV row
+        fa = ("flash_attn", "BatchDecode", "Prefill", "gc_fa_")     # [cells][heads][dim], so a stream's first n cells are a prefix
+        return any(any(x in a.get("launch", "") for x in fa) for pl in self.plans.values() for a in pl["actions"])
+
+    def copy_slot(self, src, dst, cells=None, kv_size=None):
+        """stream src's caches into stream dst: whole, or (cells, kv_size: cell-major KV caches) only their first cells cells (a
+        sequence's computed positions; the rest is masked), recurrent state whole"""
+        for a, row, kv in self._rows(kv=True):
+            n = row
+            if kv and cells is not None and kv_size and self.cell_major and row % kv_size == 0:
+                n = min(row, row // kv_size * cells)
+            if n:
+                self.ck(self.cu.cuMemcpyDtoDAsync_v2(C.c_uint64(a + dst * row), C.c_uint64(a + src * row), C.c_size_t(n), self.st),
+                        "copy slot")
         self.ck(self.cu.cuStreamSynchronize(self.st), "sync")
 
     def zero_slot(self, s, state=True):
@@ -680,6 +694,7 @@ class PlanBackend:
         self.vocab_size, self.max_len = io[self.dec]["out"]["vocab"], self.n_kv
         self.max_seqs = max(1, min(max(n for n, _ in self.decs), self.nseq - 1))
         self.live = []                       # sids, index = stream
+        self.used = {}                       # sid -> cells computed
         from .backend import KVGeometry
         self.geometry = KVGeometry(block_size=self.max_len, num_blocks=self.max_seqs, layers=1, kv_heads=1, head_dim=1)
         rec = any(re.match(r"cache_[rs]_l", k) for k in self.rt.plans[self.dec].get("caches", {}))
@@ -820,13 +835,14 @@ class PlanBackend:
     def _alone(self, w):
         """one sequence's run in stream 0, its stream's occupant parked in the spare"""
         k = self._stream(w.sid)
-        if k:
-            self.rt.copy_slot(0, self.spare)
-            self.rt.copy_slot(k, 0)
+        occ, end = self.live[0], w.pos + len(w.tokens)
+        if k:                                    # only computed cells move (a fresh prompt's: none)
+            self.rt.copy_slot(0, self.spare, self.used.get(occ, 0), self.kv_size)
+            self.rt.copy_slot(k, 0, w.pos, self.kv_size)
         row = self._run(list(w.tokens), w.pos)
         if k:
-            self.rt.copy_slot(0, k)
-            self.rt.copy_slot(self.spare, 0)
+            self.rt.copy_slot(0, k, end, self.kv_size)
+            self.rt.copy_slot(self.spare, 0, self.used.get(occ, 0), self.kv_size)
         return row
 
     def step(self, work):
@@ -836,6 +852,8 @@ class PlanBackend:
             P.need(w.pos + len(w.tokens) <= self.max_len, f"position {w.pos + len(w.tokens)} past the pack's {self.max_len}")
         rows = {}
         greedy = all(w.greedy or not w.want for w in work) and "gc_argmax_rows" in self.rt.fn     # tokens, not logits
+        for w in work:                         # cells each sequence has computed once this step runs (what a stream move copies)
+            self.used[w.sid] = max(self.used.get(w.sid, 0), w.pos + len(w.tokens))
         dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
         isdec = {id(w) for w in dec}          # by identity: a work item's == compares every field
         rows.update(self._packed([w for w in work if id(w) not in isdec], greedy))
@@ -888,9 +906,10 @@ class PlanBackend:
             return
         k, last = self.live.index(sid), len(self.live) - 1
         if k != last:
-            self.rt.copy_slot(last, k)
+            self.rt.copy_slot(last, k, self.used.get(self.live[last]), self.kv_size)
             self.live[k] = self.live[last]
         self.live.pop()
+        self.used.pop(sid, None)
 
     def close(self):
         if self.rt:
