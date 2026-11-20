@@ -8,6 +8,7 @@ zero_slot move a sequence's blocks. Inputs (kinds of llama.cpp's graph inputs, t
 positions, the encoder KQ mask (non-causal; padded keys masked, pad queries kept finite), the symmetric sliding-window mask, mean
 and cls pooling, per-row constants the compiler measured (io.inputs.fills), output ids.
 """
+import dataclasses
 import ctypes as C
 import json
 import os
@@ -188,6 +189,7 @@ def lerp_plan(x0, x1, t):
 
 _PDL = os.environ.get("GOETHE_PLAN_PDL", "1") != "0"     # 0: every launch without PDL (profiling: true kernel durations)
 _PAD = os.environ.get("GOETHE_PAD", "1") != "0"          # 0: a short prefill tail runs token by token (the exact split)
+_PACKED = os.environ.get("GOETHE_PACKED", "0") != "0"    # 1: concurrent prompts in packed prefills (off: wrong rows, 11-20)
 
 
 class Runtime:
@@ -649,7 +651,9 @@ class PlanBackend:
                                                 device=device, price=price, allow_broken=allow_broken)
         io = {b["id"]: b["io"] for b in bs}
         self.decs = {(b["ncol"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "decode"}   # (sequences, n_kv) -> bucket
-        self.pres = {(b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill"}
+        self.pres = {(b["prefill"], io[b["id"]]["n_kv"]): b["id"] for b in bs if b["kind"] == "prefill" and b.get("ncol", 1) == 1}
+        # packed prefills: S prompts of T tokens in streams [0, S) at once, (S, T) -> bucket (their positions from 0)
+        self.packs = {(b["ncol"], b["prefill"]): b["id"] for b in bs if b["kind"] == "prefill" and b.get("ncol", 1) > 1}
         self.widths = sorted({w for _, w in self.decs} | {w for _, w in self.pres})
         P.need(any(n == 1 for n, _ in self.decs), "the pack has no one-sequence decode bucket")
         self.dec = self.decs[max(k for k in self.decs if k[0] == 1)]
@@ -741,6 +745,45 @@ class PlanBackend:
             i += n
         return np.frombuffer(row, np.float32)[:self.vocab_size]
 
+    def _packed(self, pre):
+        """fresh prompts filling the live streams at once (every live sequence is one of them, each from position 0): their first
+        T tokens in one packed prefill (the smallest S >= their count, the smallest T >= their longest, else the largest T), each
+        padded to T (causal: padding changes no real row; its cells past the prompt are overwritten), free streams' rows dropped;
+        a longer prompt continues alone from T. {sid: last row} of those it ran (none: not this step's shape)"""
+        if not self.packs or len(pre) < 2 or self.caps.get("recurrent") or not _PAD or not _PACKED or any(w.pos for w in pre):
+            return {}
+        for w in pre:
+            self._stream(w.sid)
+        if sorted(self.live) != sorted(w.sid for w in pre):
+            return {}
+        n, longest = len(pre), max(len(w.tokens) for w in pre)
+        fit = [k for k in self.packs if k[0] >= n]
+        if not fit:
+            return {}
+        S = min(k[0] for k in fit)
+        Ts = sorted(t for s, t in fit if s == S)
+        T = next((t for t in Ts if t >= longest), Ts[-1])
+        pid = self.packs[S, T]
+        by = {w.sid: w for w in pre}
+        toks, sq, pos, outs = [], [], [], []
+        for s in range(S):
+            w = by.get(self.live[s]) if s < n else None
+            t = list(w.tokens[:T]) if w else [0]
+            outs.append(s * T + len(t) - 1)
+            toks += t + [t[-1]] * (T - len(t))
+            sq += [s] * T
+            pos += list(range(T))
+        W = self.rt.plans[pid]["io"]["n_kv"]
+        out = np.frombuffer(self.rt.step(pid, Step(toks, sq, pos, pos, sq, self.kv_size, W, outs))[-1], np.float32).reshape(S, -1)
+        rows = {}
+        for s in range(n):
+            w = by[self.live[s]]
+            if len(w.tokens) > T:                 # the rest alone, from position T
+                rows[w.sid] = self._alone(dataclasses.replace(w, tokens=w.tokens[T:], pos=T))
+            else:
+                rows[w.sid] = out[s, :self.vocab_size]
+        return rows
+
     def _alone(self, w):
         """one sequence's run in stream 0, its stream's occupant parked in the spare"""
         k = self._stream(w.sid)
@@ -761,8 +804,9 @@ class PlanBackend:
         rows = {}
         greedy = all(w.greedy or not w.want for w in work) and "gc_argmax_rows" in self.rt.fn     # tokens, not logits
         dec = [w for w in work if len(w.tokens) == 1 and w.sid in self.live]
+        rows.update(self._packed([w for w in work if w not in dec]))
         for w in work:
-            if w not in dec:
+            if w not in dec and w.sid not in rows:
                 rows[w.sid] = self._alone(w)
         n = len(self.live)
         end = max((w.pos for w in dec), default=0) + 1
