@@ -55,6 +55,20 @@ class Step:
         self.n_real = len(self.tokens) if n_real is None else n_real
 
 
+@functools.lru_cache(maxsize=32)
+def _enc_mask(K, n_real, n_swa, esize, pos):
+    """an encoder's [T queries][K key cells] mask bytes (cached: items of one length and padding share it)"""
+    pq = np.frombuffer(pos, np.int64)
+    keep = np.zeros((len(pq), K), bool)
+    keep[:, :n_real] = True
+    if n_swa:                                # symmetric window (non-causal): |p_q - p_k| <= n_swa / 2
+        keep &= np.abs(pq[:, None] - np.arange(K)[None, :]) <= n_swa // 2
+        keep[n_real:, :n_real] = True        # pad queries past the window keep every real key (a row of only -inf is NaN, and
+    if esize == 4:                           # NaN V poisons real rows even at weight 0; pooling drops pad rows)
+        return np.where(keep, 0, -np.inf).astype(np.float32).tobytes()
+    return np.where(keep, np.uint16(0), NEG_INF_F16).astype(np.uint16).tobytes()
+
+
 def generate(name, n, step, hp):
     """bytes of the plan input `name` (n bytes in the plan) for this step; hp: the bucket's io.inputs (n_pos, causal, n_swa, fills)"""
     if "(view)" in name:                     # a slice of its base input at the element offset the compiler measured
@@ -75,17 +89,8 @@ def generate(name, n, step, hp):
         return np.zeros(1, np.int32).tobytes()
     mk = hp.get("masks", {}).get(k)          # an encoder mask: [T queries][K key cells], K = T padded to llama.cpp's 256 cells
     if mk and not hp.get("causal", True):   # every query sees the chunk's real keys (pad queries too: finite rows)
-        K = n // (mk["esize"] * T)
-        keep = np.zeros((T, K), bool)
-        keep[:, :step.n_real] = True
-        if mk["swa"] and hp.get("n_swa"):   # symmetric window (non-causal): |p_q - p_k| <= n_swa / 2
-            pq, pk = step.pos.astype(np.int64), np.arange(K)
-            keep &= np.abs(pq[:, None] - pk[None, :]) <= hp["n_swa"] // 2
-            keep[step.n_real:, :step.n_real] = True     # pad queries past the window keep every real key (a row of only -inf is
-            #                                             NaN, and NaN V poisons real rows even at weight 0; pooling drops pad rows)
-        if mk["esize"] == 4:
-            return np.where(keep, 0, -np.inf).astype(np.float32).tobytes()
-        return np.where(keep, np.uint16(0), NEG_INF_F16).astype(np.uint16).tobytes()
+        return _enc_mask(n // (mk["esize"] * T), step.n_real, hp.get("n_swa", 0) if mk["swa"] else 0, mk["esize"],
+                         step.pos.astype(np.int64).tobytes())
     if k == "inp_pos":
         p = step.pos.astype(np.int32)
         return (np.concatenate([p, p, p, np.zeros_like(p)]) if hp.get("n_pos", 1) == 4 else p).tobytes()
