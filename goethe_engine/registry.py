@@ -19,6 +19,14 @@ from . import pack as P
 
 
 def _gc_c(pack, weights, *, mesh, model_type="decoder", **kw):
+    m = _manifest(pack)
+    if isinstance(m, dict) and (m.get("runtime") or {}).get("kind") == "gc-plan":   # a data-only pack: the engine runs its plans
+        from .gc_plan import PlanBackend, PlanEmbed
+        if model_type == "embedding":
+            return PlanEmbed(pack, weights, device=mesh.devices[0], **kw)
+        if model_type == "decoder":
+            return PlanBackend(pack, weights, device=mesh.devices[0], **kw)
+        raise P.PackError(f"gc-plan packs serve embedding and decoder models so far, not {model_type}")
     if model_type == "embedding":
         from .embed import GcEmbed
         return GcEmbed(pack, weights, device=mesh.devices[0], **kw)

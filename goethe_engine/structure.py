@@ -87,6 +87,32 @@ def gguf_header(path):
     return kv, tens
 
 
+def gguf_offsets(path):
+    """{tensor name: absolute file offset of its data} of a GGUF file (general.alignment, default 32): where a runtime reads a
+    tensor's bytes; sizes come from what reads them."""
+    with open(path, "rb") as f:
+        r = _Rd(f)
+        if r.take(4) != b"GGUF" or r.get("I") not in (2, 3):
+            raise StructureError(f"{path}: not a GGUF v2/v3 file")
+        nt, nkv = r.get("Q"), r.get("Q")
+        kv = {}
+        for _ in range(nkv):
+            k = r.str()
+            kv[k] = _value(r, r.get("I"))
+        rel = {}
+        for _ in range(nt):
+            name, nd = r.str(), r.get("I")
+            if nd > 8:
+                raise StructureError(f"{path}: tensor rank")
+            for _ in range(nd):
+                r.get("Q")
+            r.get("I")
+            rel[name] = r.get("Q")
+        al = int(kv.get("general.alignment", 32))
+        start = -(-f.tell() // al) * al
+    return {n: start + o for n, o in rel.items()}
+
+
 def st_header(path):
     """[(name, shape, dtype)] of a safetensors file: header only."""
     with open(path, "rb") as f:

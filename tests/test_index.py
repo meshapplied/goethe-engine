@@ -69,6 +69,17 @@ def test_a_finetune_matches_and_changed_structure_does_not(key, tmp_path):
     assert I.match_dir(ix, str(tmp_path / "empty"), "sm_120a", "0.2.0") == []
 
 
+def test_pack4_gc_plan_entries_match_after_gc_c(key, tmp_path):
+    ref = model_dir(tmp_path / "ref", TARGET)
+    raw, sig = signed(key, index(entries=[
+        entry(variants=(("v0", sha(ref)),), abi_major=4, runtime=dict(kind="gc-plan", version=1), manifest_sha256=H("c")),
+        entry(variants=(("q4", sha(ref)),))]))
+    ix, _ = I.verify(raw, sig, 5, NOW, (key.kid,))
+    assert [(e["runtime"]["kind"], e["abi_major"]) for e in I.match_dir(ix, ref, "sm_120a", "0.2.0")] == [("gc-c", 3), ("gc-plan", 4)]
+    with pytest.raises(I.IndexError_, match="abi_major"):
+        I.verify(*signed(key, index(entries=[entry(abi_major=5)])), 5, NOW, (key.kid,))
+
+
 def test_rollback_and_freeze_refused(key):
     raw, sig = signed(key, index(serial=4))
     with pytest.raises(I.IndexError_, match="rollback"):

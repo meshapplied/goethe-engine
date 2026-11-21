@@ -11,7 +11,7 @@ from toypack import toy_pack
 
 
 def test_loader_is_the_pinned_abi():
-    assert P.ABI == "3.0.0" and P.MAGIC == b"GCPACK3\n" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c"]
+    assert P.ABI == "3.0.0" and P.MAGIC == b"GCPACK3\n" and P.SCHEMA == "gc-pack" and list(P.RUNTIMES) == ["gc-c", "gc-plan"]
 
 
 def test_caps_and_numerics_of_a_bucket(toy, key):

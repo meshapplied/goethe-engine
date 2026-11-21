@@ -41,7 +41,7 @@ DOMAIN = b"gc-pack-3\n"             # signed digest = sha256(DOMAIN + manifest b
 ABI4, MAGIC4, DOMAIN4 = "4.0.0", b"GCPACK4\n", b"gc-pack-4\n"   # pack 4: the same framing, blobs by hash from a store
 MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
-RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
+RUNTIMES = {"gc-c": (1,), "gc-plan": (1,)}   # runtime kinds this loader runs, with their versions (gc-plan: gc_plan.py)
 MAX_RAW = 4 << 30                   # bytes: no blob inflates past this (xz bombs are refused as the output grows)
 XZ_MEM = 64 << 20                   # bytes: xz decoder memory limit
 MAX_JSON = 16 << 20                 # bytes: larger manifests are refused before parsing
