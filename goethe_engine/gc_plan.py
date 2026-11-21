@@ -403,8 +403,8 @@ class Runtime:
                     self.ck(self.cu.cuMemcpyHtoD_v2(C.c_uint64(base[buf] + o), b, C.c_size_t(n)), name)
         P.need(not left, f"weights: {len(left)} plan tensors in no weight file (first {next(iter(left), '')})")
 
-    def _issue(self, a, keep, base):
-        cu, st = self.cu, self.st
+    def _issue(self, a, keep, base, st=None):
+        cu, st = self.cu, st or self.st
         addr = lambda w: base[w[0]] + w[1]
         if "launch" in a:
             args = []
@@ -458,6 +458,52 @@ class Runtime:
             self.ck_blas(self.blas.cublasGemmEx(h, g["ta"], g["tb"], g["m"], g["n"], g["k"], al, C.c_uint64(addr(a["A"])), g["at"], g["lda"],
                                                 C.c_uint64(addr(a["B"])), g["bt"], g["ldb"], be, C.c_uint64(addr(a["C"])), g["ct"], g["ldc"],
                                                 g["comp"], g["algo"]), "cublasGemmEx")
+
+    def _issue_dag(self, acts, keep, base):
+        """a step's actions captured over a few streams along the plan's dependencies (epack's "after": RAW, WAR, WAW by
+        tensor range): an action runs on the stream of its latest dependency (a chain stays on one stream), waits on events
+        only for dependencies issued on another one, and every stream joins the capture's own before the outputs. A library
+        GEMM stays on the capture's stream (its handle's). The kernels and their arguments are the linear plan's: the step's
+        result is the same; only independent launches may overlap. O(actions + edges)."""
+        cu, n = self.cu, int(os.environ.get("GOETHE_DAG_STREAMS", "4"))
+        if len(getattr(self, "xst", [])) < n - 1:
+            self.xst = getattr(self, "xst", [])
+            while len(self.xst) < n - 1:
+                s = C.c_void_p()
+                self.ck(cu.cuStreamCreate(C.byref(s), 1), "dag stream")
+                self.xst.append(s)
+        need = len(acts) + n + 1
+        self.evs = getattr(self, "evs", [])
+        while len(self.evs) < need:
+            e = C.c_void_p()
+            self.ck(cu.cuEventCreate(C.byref(e), 2), "dag event")     # CU_EVENT_DISABLE_TIMING
+            self.evs.append(e)
+        sts = [self.st] + self.xst[:n - 1]
+        fork = self.evs[len(acts)]
+        self.ck(cu.cuEventRecord(fork, self.st), "dag fork")
+        for s in sts[1:]:
+            self.ck(cu.cuStreamWaitEvent(s, fork, 0), "dag fork wait")
+        on, last, rr = {}, [-1] * n, 0
+        for i, a in enumerate(acts):
+            if "input" in a or "output" in a:
+                continue
+            deps = [d for d in a["after"] if d in on]
+            if "gemm" in a:
+                k = 0
+            elif deps:
+                k = on[max(deps)]
+            else:
+                k, rr = rr % n, rr + 1
+            for d in deps:
+                if on[d] != k:
+                    self.ck(cu.cuStreamWaitEvent(sts[k], self.evs[d], 0), "dag wait")
+            self._issue(a, keep, base, sts[k])
+            self.ck(cu.cuEventRecord(self.evs[i], sts[k]), "dag record")
+            on[i], last[k] = k, i
+        for j, s in enumerate(sts[1:], 1):
+            e = self.evs[len(acts) + j]
+            self.ck(cu.cuEventRecord(e, s), "dag join")
+            self.ck(cu.cuStreamWaitEvent(self.st, e, 0), "dag join wait")
 
     def _blas(self):
         """cuBLAS on this context and stream, with its own fixed workspace (graph capture needs one), made at first use"""
@@ -514,8 +560,11 @@ class Runtime:
                 self.ck(self.cu.cuMemcpyHtoDAsync_v2(C.c_uint64(base[a["dst"][0]] + a["dst"][1]), C.c_void_p(stage + o), C.c_size_t(a["n"]),
                                                      self.st), a["input"])
                 o += a["n"]
-            for a in p["actions"]:
-                self._issue(a, keep, base)
+            if os.environ.get("GOETHE_DAG") == "1" and p["actions"] and all("after" in a for a in p["actions"]):
+                self._issue_dag(p["actions"], keep, base)
+            else:
+                for a in p["actions"]:
+                    self._issue(a, keep, base)
             for k, (a, (h, n)) in enumerate(zip(oa, outs)):
                 src = base[a["src"][0]] + a["src"][1]
                 if argmax and k == len(oa) - 1:
