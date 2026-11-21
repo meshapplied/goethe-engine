@@ -880,37 +880,56 @@ class PlanBackend:
         for a recurrent model: padding would advance its state; GOETHE_PAD=0) one padded chunk holding the rest (causal attention
         and row-wise ops: padding changes no real row; its KV cells sit past the last real position, masked, then overwritten by
         decode). No chunk fits: token by token through the one-sequence decode bucket (only then: it measured ~10x a padded chunk)"""
-        fits = lambda t, q: self._pick(self.pres, t, q + t)[0] is not None
         price = getattr(self, "price", {})          # {chunk: [(width, seconds)]} timed at load (else launched tokens)
+        paged = getattr(self, "page", None)
+        picks = {}
+
+        def pick(t, end):                            # (pid, width) of chunk t ending at end; a pick depends on end only through its
+            k = (t, end if paged else -(-end // 256))   # 256-cell width class: cached, O(C r / 256) picks for r tokens, C chunks
+            if k not in picks:
+                picks[k] = self._pick(self.pres, t, end) if t > 1 else self._pick(self.decs, 1, end)
+            return picks[k]
 
         def cost(t, q):                              # the launch at the width it takes: affine between the timed widths (paged KV:
             if t not in price:                       # at the chunk's end, its attention's length; each width was timed ending there)
                 return t
-            w, pts = self._pick(self.pres, t, q + t)[1] if t > 1 else self._pick(self.decs, 1, q + 1)[1], price[t]
-            if getattr(self, "page", None):
+            w, pts = pick(t, q + t)[1], price[t]
+            if paged:
                 w = min(max(q + t, pts[0][0]), pts[-1][0])
             (w0, c0), (w1, c1) = pts[0], pts[-1]
             return c0 if w1 == w0 else c0 + (c1 - c0) * (w - w0) / (w1 - w0)
         pad_ok = _PAD and not self.caps.get("recurrent")
-        memo = {}
-
-        def best(q, r):                           # ((tokens, launches), plan)
-            if r == 0:
-                return (0, 0), []
-            if (q, r) not in memo:
-                c = []
-                for t in self.chunks:
-                    if t <= r and fits(t, q):
-                        (k, n), pl = best(q + t, r - t)
-                        c.append(((k + cost(t, q), n + 1), [(t, t)] + pl))
-                    elif t > r and pad_ok and fits(t, q):
-                        c.append(((cost(t, q), 1), [(t, r)]))
-                if not c:
-                    (k, n), pl = best(q + 1, r - 1)
-                    c.append(((k + cost(1, q), n + 1), [(1, 1)] + pl))
-                memo[q, r] = min(c, key=lambda x: x[0])
-            return memo[q, r]
-        return best(pos, r)[0][0] if priced else best(pos, r)[1]   # priced: its measured seconds
+        # the states reachable from 0 tokens done (a fitting chunk's step, else one token) in one forward pass, then best[j] =
+        # (seconds, launches) to finish from j over them in reverse: O(|R| C) for |R| reachable states and C chunks (sparse for large
+        # chunks, at most r + 1), no recursion, back-pointers how[j] = (chunk, real tokens) instead of per-state plan copies
+        steps, reach, stack = {}, {0}, [0]
+        while stack:
+            j = stack.pop()
+            q, left = pos + j, r - j
+            if left == 0:
+                continue
+            opts = [(t, j + t if t <= left else None) for t in self.chunks         # in chunk order (ties: the first, as before);
+                    if (t <= left or pad_ok) and pick(t, q + t)[0] is not None]  # k None: padded, the rest in one launch
+            steps[j] = opts or [(1, j + 1)]
+            for _, k in steps[j]:
+                if k is not None and k not in reach:
+                    reach.add(k)
+                    stack.append(k)
+        best, how = {r: (0, 0)}, {}
+        for j in sorted(reach - {r}, reverse=True):
+            q, c = pos + j, None
+            for t, k in steps[j]:
+                x = ((best[k][0] + cost(t, q), best[k][1] + 1), (t, t)) if k is not None else ((cost(t, q), 1), (t, r - j))
+                if c is None or x[0] < c[0]:
+                    c = x
+            best[j], how[j] = c
+        if priced:
+            return best[0][0]                        # its measured seconds
+        plan, j = [], 0
+        while j < r:
+            plan.append(how[j])
+            j += how[j][0] if how[j][1] == how[j][0] else r - j
+        return plan
 
     def _cells(self, sid, pos):
         """paged KV: the cells of sid's positions pos (its pages, taken from the free list as it grows)"""
