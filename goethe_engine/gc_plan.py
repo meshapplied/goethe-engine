@@ -246,6 +246,61 @@ _SPLIT = os.environ.get("GOETHE_SPLIT", "0") != "0"    # 1: the scheduler splits
 #                                                        packed buckets build their masks on the device (host masks: ~16 MB a launch at 4k)
 
 
+def _fit_streams(plans, free):
+    """the plans with their caches held for as many streams as this device's memory takes beside the weights and the largest
+    bucket's scratch (at most the recorded nseq; GOETHE_NSEQ forces one): every cache keeps its per-stream bytes and order, the
+    caches of a buffer packed after one another, and every reference into a cache buffer (launch pointers, copies, GEMM operands,
+    TMA descriptors, inputs, outputs) moved to the cache's new place. Streams are cache-major (a stream's rows at s * row), so the
+    first nseq streams of each cache are where they were relative to the cache; buckets need B <= nseq streams (the backend's
+    ladder reads nseq). A pack recorded on a large GPU thus runs on a smaller one, with fewer sequences at once."""
+    import copy
+    first = next(iter(plans.values()))
+    nseq = first["nseq"]
+    caches = first.get("caches", {})
+    per = sum(n // nseq for _, _, n in caches.values())
+    weights = sum(b["size"] for b in first["buffers"] if b["role"] == "weights")
+    scratch = max(sum(b["size"] for b in p["buffers"] if b["role"] == "compute") for p in plans.values())
+    margin = (1 << 30) + free // 50                         # cuBLAS / graphs / allocator slack
+    fit = (free - weights - scratch - margin) // per if per else nseq
+    want = int(os.environ["GOETHE_NSEQ"]) if os.environ.get("GOETHE_NSEQ") else min(nseq, fit)
+    P.need(want >= 2, f"gc-plan: {free >> 20} MiB free holds the weights ({weights >> 20} MiB) and scratch but not two streams")
+    if want >= nseq:
+        return plans
+    out = {}
+    for pid, p in plans.items():
+        q = copy.deepcopy(p)
+        moves = {}                                           # buffer -> [(old off, old end, new off)]
+        for b in {b for b, _, _ in p["caches"].values()}:
+            end = 0
+            for name, (bb, o, n) in sorted(((k, v) for k, v in p["caches"].items() if v[0] == b), key=lambda kv: kv[1][1]):
+                moves.setdefault(b, []).append((o, o + n, end))
+                q["caches"][name] = [b, end, n // nseq * want]
+                end = -(-(end + n // nseq * want) // 256) * 256
+            q["buffers"][b] = dict(q["buffers"][b], size=max(end, 256))
+        def mv(b, off):                                      # the cache holding off (caches abut: a cache's end is the next
+            for o, e, no in moves.get(b, ()):                # one's base, which belongs to the next); else an end pointer
+                if o <= off < e:
+                    return no + off - o
+            for o, e, no in moves.get(b, ()):
+                if off == e:
+                    return no + off - o
+            P.need(b not in moves, f"gc-plan: a reference into cache buffer {b} at {off} is in no cache")
+            return off
+        for a in q["actions"]:
+            for k in ("dst", "src", "copy", "copy2d", "memset", "A", "B", "C"):
+                v = a.get(k)
+                if isinstance(v, list) and len(v) == 2 and v[0] in moves:
+                    a[k] = [v[0], mv(*v)]
+            if "ptrs" in a:
+                a["ptrs"] = [[[o, b, mv(b, off)] for o, b, off in ps] for ps in a["ptrs"]]
+            for _, _, t in a.get("tmaps", ()):
+                if t["gaddr"][0] in moves:
+                    t["gaddr"] = [t["gaddr"][0], mv(*t["gaddr"])]
+        q["nseq"] = want
+        out[pid] = q
+    return out
+
+
 class Runtime:
     """the device side of a gc-plan pack: one context, the plans' buffers, their cubins, the weights, a CUDA graph per bucket"""
 
@@ -261,6 +316,7 @@ class Runtime:
         self.ck(cu.cuCtxSetCurrent(self.ctx), "context")
         self.st = C.c_void_p()
         self.ck(cu.cuStreamCreate(C.byref(self.st), 1), "stream")
+        plans = _fit_streams(plans, self._free_bytes())    # the cache capacity this device holds (a pack is GPU-agnostic)
         # weights and caches (kv) are shared by every bucket, by role and order (one model, one cache layout); scratch (compute)
         # buffers are each bucket's own (llama.cpp's allocator sizes and splits them per graph)
         first = next(iter(plans.values()))
@@ -419,6 +475,11 @@ class Runtime:
     def ck_blas(self, rc, what):
         if rc:
             raise RuntimeError(f"{what}: cuBLAS status {rc}")
+
+    def _free_bytes(self):
+        free, total = C.c_size_t(), C.c_size_t()
+        self.ck(self.cu.cuMemGetInfo_v2(C.byref(free), C.byref(total)), "memory")
+        return free.value
 
     def _tmap(self, t, gaddr):
         m, r = (C.c_ubyte * 128)(), t["rank"]
@@ -630,6 +691,8 @@ def jit(rt, buckets, pack):
     rt.ck(rt.cu.cuEventCreate(C.byref(e1), 0), "event")
     pick, t0, log, rt.cost = {}, time.perf_counter(), {}, {}
     for b, rep, members, na in buckets:           # (bucket, the plan timed: an affine bucket's widest, its widths, alternatives)
+        if b.get("ncol", 1) > rt.plans[rep]["nseq"] - 1:    # more streams than this device's caches hold (_fit_streams)
+            continue
         io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
         w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
         pos = max(w - (256 if b["kind"] == "decode" else n), 0)    # the widest positions the bucket serves
@@ -748,6 +811,11 @@ class PlanBackend:
         self.n_kv, self.kv_size = self.widths[-1], io[self.dec]["kv_size"]
         P.need(all(x["kv_size"] == self.kv_size for x in io.values()), "buckets recorded at different capacities")
         self.nseq = self.rt.plans[self.dec]["nseq"]
+        over = {v for k, v in list(self.decs.items()) + list(self.packs.items()) if k[0] > self.nseq - 1}
+        self.decs = {k: v for k, v in self.decs.items() if v not in over}      # the streams this device's caches hold
+        self.packs = {k: v for k, v in self.packs.items() if v not in over}
+        for pid in [x for x in self.rt.plans if x.split("~")[0] in over]:      # (and their JIT alternatives): never warmed or run
+            del self.rt.plans[pid]
         self.spare = self.nseq - 1
         self.vocab_size, self.max_len = io[self.dec]["out"]["vocab"], self.n_kv
         self.max_seqs = max(1, min(max(n for n, _ in self.decs), self.nseq - 1))
