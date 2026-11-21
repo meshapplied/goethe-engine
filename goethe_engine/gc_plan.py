@@ -142,6 +142,25 @@ def generate(name, n, step, hp):
                 p = int(step.pos[s * tps + r])
                 m[s, r, (pj >= 0) & (pj <= p) & (p - pj < W)] = 0
         return m.tobytes()
+    if k in ("attn_inp_rel_pos", "attn_inp_rel_pos_swa"):   # relative-position attention: [T][K] int32 distances p - p_j of the
+        swa = k.endswith("_swa")                             # cells the query sees (0 <= d < extent), extent where none (llama.cpp)
+        E = hp["n_swa"] if swa else hp["rel_extent"]
+        n_stream = len(np.unique(step.streams))
+        tps, K = T // n_stream, n // (4 * T)
+        P.need(K * 4 * T == n, f"plan input {name}: {n} bytes are no [{T}][K] int32 distances")
+        d, j = np.full((n_stream, tps, K), E, np.int32), np.arange(K)
+        for s in range(n_stream):
+            rows = step.pos[s * tps:(s + 1) * tps].astype(np.int64)
+            if swa:                                          # ring cell j holds the newest written position = j (mod S)
+                S = hp["swa_cells"]
+                last = int(rows.max())
+                pj = last - (last - j) % S
+            else:                                            # stream cell j holds position j (written up to the step's last)
+                pj = np.where(j <= int(rows.max()), j, -1)
+            for r, p in enumerate(rows):
+                dist = p - pj
+                d[s, r] = np.where((pj >= 0) & (dist >= 0) & (dist < E), dist, E)
+        return d.tobytes()
     if k == "out_ids":
         return step.outputs.astype(np.int32).tobytes()
     if k == "rs_s_copy":
@@ -373,8 +392,13 @@ class Runtime:
                     "copy")
         elif "gemm" in a:                    # a library GEMM S3 picked (cuBLAS GemmEx, cuBLASLt underneath), captured like a launch
             g = a["gemm"]
-            P.need(g["gemm"] == 1, "a batched cuBLAS GEMM: not carried yet")
             h, al, be = self._blas(), bytes.fromhex(g["alpha"]), bytes.fromhex(g["beta"])
+            if g.get("ptrarray"):            # A, B, C: device arrays of operand pointers (filled by an earlier kernel of the step)
+                self.ck_blas(self.blas.cublasGemmBatchedEx(h, g["ta"], g["tb"], g["m"], g["n"], g["k"], al, C.c_uint64(addr(a["A"])), g["at"],
+                                                           g["lda"], C.c_uint64(addr(a["B"])), g["bt"], g["ldb"], be, C.c_uint64(addr(a["C"])),
+                                                           g["ct"], g["ldc"], g["gemm"], g["comp"], g["algo"]), "cublasGemmBatchedEx")
+                return
+            P.need(g["gemm"] == 1, "a strided batched cuBLAS GEMM: not carried yet")
             self.ck_blas(self.blas.cublasGemmEx(h, g["ta"], g["tb"], g["m"], g["n"], g["k"], al, C.c_uint64(addr(a["A"])), g["at"], g["lda"],
                                                 C.c_uint64(addr(a["B"])), g["bt"], g["ldb"], be, C.c_uint64(addr(a["C"])), g["ct"], g["ldc"],
                                                 g["comp"], g["algo"]), "cublasGemmEx")
