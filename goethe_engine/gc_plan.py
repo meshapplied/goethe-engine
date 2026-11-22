@@ -23,6 +23,7 @@ from .structure import gguf_offsets
 
 NEG_INF_F16 = np.uint16(0xFC00)
 PDL, CLUSTER = 6, 4                   # CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, _CLUSTER_DIMENSION
+_HEXPAD = ["0" * (32 - k) if k else "" for k in range(32)]     # hex zeros padding an argument to 16 bytes
 
 
 class _Attr(C.Structure):
@@ -459,19 +460,24 @@ class Runtime:
         cu, st = self.cu, st or self.st
         addr = lambda w: base[w[0]] + w[1]
         if "launch" in a:
-            args = []
             tm = {}
             for i, o, t in a.get("tmaps", ()):
                 tm.setdefault(i, []).append((o, t))
-            for i, (raw, ptrs) in enumerate(zip(a["args"], a["ptrs"])):
-                raw = bytearray.fromhex(raw)
+            at, n, hs = [], 0, []            # the arguments in one buffer, each at a 16-byte boundary (as malloc placed them)
+            for h in a["args"]:
+                at.append(n)
+                n += -(-len(h) // 32) * 16
+                hs += [h, _HEXPAD[len(h) % 32]]
+            raw = bytearray.fromhex("".join(hs) or "00")
+            for i, (s, ptrs) in enumerate(zip(at, a["ptrs"])):
                 for o, buf, off in ptrs:
-                    struct.pack_into("<Q", raw, o, base[buf] + off)
+                    struct.pack_into("<Q", raw, s + o, base[buf] + off)
                 for o, t in tm.get(i, ()):     # a TMA descriptor in the argument: encoded by this driver at the real address
-                    raw[o:o + 128] = self._tmap(t, base[t["gaddr"][0]] + t["gaddr"][1])
-                args.append(C.create_string_buffer(bytes(raw), len(raw)))
-            pp = (C.c_void_p * len(args))(*[C.cast(x, C.c_void_p) for x in args])
-            keep += [args, pp]
+                    raw[s + o:s + o + 128] = self._tmap(t, base[t["gaddr"][0]] + t["gaddr"][1])
+            cb = (C.c_char * len(raw)).from_buffer(raw)
+            a0 = C.addressof(cb)              # (addresses, not ctypes.cast: 6x cheaper a launch)
+            pp = (C.c_void_p * len(at))(*[a0 + s for s in at])
+            keep += [raw, cb, pp]
             f = self.fn[a["launch"]]
             if a["smem"] > 48 * 1024:
                 self.ck(cu.cuFuncSetAttribute(f, 8, a["smem"]), "max dynamic smem")
