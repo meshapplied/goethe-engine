@@ -775,7 +775,9 @@ def _open(pack, weights, kinds, *, trusted, store, sku, device, price, allow_bro
 def jit(rt, buckets, pack):
     """the pack's near-tie alternatives (S3's, per bucket) timed on this device, the fastest serving each bucket: in-graph, round
     robin over the candidates (drift cancels), median of the launches; cached per (GPU UUID, pack, driver) in
-    ~/.goethe/tune/<uuid>-<pack sha>.json (a later start reads it; GOETHE_JIT=0 skips, =force re-times)"""
+    ~/.goethe/tune/<uuid>-<pack sha>.json (a later start reads it; GOETHE_JIT=0 skips, =force re-times); each bucket's timings
+    also by its own content (its files' hashes, the plan's io and streams, this code) in tune/<uuid>-<driver>/, so a new pack
+    re-times only the buckets that changed"""
     import hashlib
     import time
     if not buckets or os.environ.get("GOETHE_JIT") == "0":             # buckets: [(bucket, timed plan id, member ids, n alts)]
@@ -797,31 +799,21 @@ def jit(rt, buckets, pack):
     rt.ck(rt.cu.cuEventCreate(C.byref(e0), 0), "event")
     rt.ck(rt.cu.cuEventCreate(C.byref(e1), 0), "event")
     pick, t0, log, rt.cost = {}, time.perf_counter(), {}, {}
+    gdir = os.path.join(os.path.dirname(cache), f"{bytes(uu).hex()}-{drv.value}")
+    own = hashlib.sha256(open(__file__, "rb").read()).hexdigest()
     for b, rep, members, na in buckets:           # (bucket, the plan timed: an affine bucket's widest, its widths, alternatives)
         if b.get("ncol", 1) > rt.plans[rep]["nseq"] - 1:    # more streams than this device's caches hold (_fit_streams)
             continue
-        io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
-        w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
-        pos = max(w - (256 if b["kind"] == "decode" else n), 0)    # the widest positions the bucket serves
-        S = b.get("ncol", 1) if b["kind"] == "prefill" else 1     # a packed prefill: S sequences of n tokens, sequence s in stream s
-        p, sq = list(range(pos, pos + n)) * S, [s for s in range(S) for _ in range(n)]
-        st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
-            Step([1] * n * S, sq, p, p, sq, kv, w, [s * n + n - 1 for s in range(S)])
-        pids = [rep] + [f"{rep}~{i}" for i in range(na)]
-        ge = {}
-        for pid in pids:                          # one real step each (fills the graph's inputs), then its graph alone
-            rt.step(pid, st)
-            ge[pid] = rt._graph(pid)[0]
-        ts = {pid: [] for pid in pids}
-        for _ in range(7):
-            for pid in pids:
-                rt.ck(rt.cu.cuEventRecord(e0, rt.st), "event")
-                rt.ck(rt.cu.cuGraphLaunch(ge[pid], rt.st), "launch")
-                rt.ck(rt.cu.cuEventRecord(e1, rt.st), "event")
-                rt.ck(rt.cu.cuEventSynchronize(e1), "sync")
-                rt.ck(rt.cu.cuEventElapsedTime(C.byref(ms), e0, e1), "elapsed")
-                ts[pid].append(ms.value)
-        med = {pid: float(np.median(v[2:])) for pid, v in ts.items()}
+        gk = hashlib.sha256(json.dumps([own, sorted(b["files"].items()), rt.plans[rep]["io"], rt.plans[rep]["nseq"], na,
+                                        os.environ.get("GOETHE_DAG")], sort_keys=True).encode()).hexdigest()
+        gf = os.path.join(gdir, gk + ".json")
+        if os.path.exists(gf) and os.environ.get("GOETHE_JIT") != "force":     # these plans timed on this device before
+            med = {rep + sfx: v for sfx, v in json.load(open(gf)).items()}
+        else:
+            med = _time_bucket(rt, b, rep, na, e0, e1, ms)
+            os.makedirs(gdir, exist_ok=True)
+            json.dump({pid[len(rep):]: v for pid, v in med.items()}, open(gf + ".tmp", "w"))
+            os.replace(gf + ".tmp", gf)
         best = min(med, key=med.get)
         for m in members:                         # every width of the bucket takes the pick
             pick[m] = m + best[len(rep):]
@@ -834,6 +826,32 @@ def jit(rt, buckets, pack):
     os.makedirs(os.path.dirname(cache), exist_ok=True)
     json.dump({"pick": pick, "us": log, "seconds": round(time.perf_counter() - t0, 2)}, open(cache + ".tmp", "w"), indent=1)
     os.replace(cache + ".tmp", cache)
+
+
+def _time_bucket(rt, b, rep, na, e0, e1, ms):
+    """{plan id: median ms} of bucket b's timed plan rep and its na alternatives: one real step each, then the graphs round robin"""
+    io, n = rt.plans[rep]["io"], b.get("ncol") if b["kind"] == "decode" else b.get("prefill", 1)
+    w, kv = io["n_kv"], io.get("kv_size", io["n_kv"])
+    pos = max(w - (256 if b["kind"] == "decode" else n), 0)    # the widest positions the bucket serves
+    S = b.get("ncol", 1) if b["kind"] == "prefill" else 1     # a packed prefill: S sequences of n tokens, sequence s in stream s
+    p, sq = list(range(pos, pos + n)) * S, [s for s in range(S) for _ in range(n)]
+    st = Step([1] * n, range(n), [pos] * n, [pos] * n, range(n), kv, w, range(n)) if b["kind"] == "decode" else \
+        Step([1] * n * S, sq, p, p, sq, kv, w, [s * n + n - 1 for s in range(S)])
+    pids = [rep] + [f"{rep}~{i}" for i in range(na)]
+    ge = {}
+    for pid in pids:                          # one real step each (fills the graph's inputs), then its graph alone
+        rt.step(pid, st)
+        ge[pid] = rt._graph(pid)[0]
+    ts = {pid: [] for pid in pids}
+    for _ in range(7):
+        for pid in pids:
+            rt.ck(rt.cu.cuEventRecord(e0, rt.st), "event")
+            rt.ck(rt.cu.cuGraphLaunch(ge[pid], rt.st), "launch")
+            rt.ck(rt.cu.cuEventRecord(e1, rt.st), "event")
+            rt.ck(rt.cu.cuEventSynchronize(e1), "sync")
+            rt.ck(rt.cu.cuEventElapsedTime(C.byref(ms), e0, e1), "elapsed")
+            ts[pid].append(ms.value)
+    return {pid: float(np.median(v[2:])) for pid, v in ts.items()}
 
 
 class PlanEmbed:
