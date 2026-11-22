@@ -246,14 +246,14 @@ _SPLIT = os.environ.get("GOETHE_SPLIT", "0") != "0"    # 1: the scheduler splits
 #                                                        packed buckets build their masks on the device (host masks: ~16 MB a launch at 4k)
 
 
-def _fit_streams(plans, free):
+def _fit_streams(plans, free, min_streams=0):
     """the plans with their caches held for as many streams as this device's memory takes beside the weights and the largest
     bucket's scratch (at most the recorded nseq; GOETHE_NSEQ forces one): every cache keeps its per-stream bytes and order, the
     caches of a buffer packed after one another, and every reference into a cache buffer (launch pointers, copies, GEMM operands,
     TMA descriptors, inputs, outputs) moved to the cache's new place. Streams are cache-major (a stream's rows at s * row), so the
     first nseq streams of each cache are where they were relative to the cache; buckets need B <= nseq streams (the backend's
     ladder reads nseq). A pack recorded on a large GPU thus runs on a smaller one, with fewer sequences at once."""
-    import copy
+    import pickle
     first = next(iter(plans.values()))
     nseq = first["nseq"]
     caches = first.get("caches", {})
@@ -264,11 +264,12 @@ def _fit_streams(plans, free):
     fit = (free - weights - scratch - margin) // per if per else nseq
     want = int(os.environ["GOETHE_NSEQ"]) if os.environ.get("GOETHE_NSEQ") else min(nseq, fit)
     P.need(want >= 2, f"gc-plan: {free >> 20} MiB free holds the weights ({weights >> 20} MiB) and scratch but not two streams")
+    P.need(min(want, nseq) >= min_streams, f"{min(want, nseq)} streams fit this GPU, the bucket needs {min_streams}")
     if want >= nseq:
         return plans
     out = {}
     for pid, p in plans.items():
-        q = copy.deepcopy(p)
+        q = pickle.loads(pickle.dumps(p, pickle.HIGHEST_PROTOCOL))     # a deep copy (plans are JSON data: equal to copy.deepcopy's)
         moves = {}                                           # buffer -> [(old off, old end, new off)]
         for b in {b for b, _, _ in p["caches"].values()}:
             end = 0
@@ -277,7 +278,14 @@ def _fit_streams(plans, free):
                 q["caches"][name] = [b, end, n // nseq * want]
                 end = -(-(end + n // nseq * want) // 256) * 256
             q["buffers"][b] = dict(q["buffers"][b], size=max(end, 256))
-        def mv(b, off):                                      # the cache holding off (caches abut: a cache's end is the next
+        memo = {}
+
+        def mv(b, off):                                      # (once per buffer and offset: a plan names the same ones again)
+            if (b, off) not in memo:
+                memo[b, off] = mv1(b, off)
+            return memo[b, off]
+
+        def mv1(b, off):                                     # the cache holding off (caches abut: a cache's end is the next
             for o, e, no in moves.get(b, ()):                # one's base, which belongs to the next); else an end pointer
                 if o <= off < e:
                     return no + off - o
@@ -292,7 +300,7 @@ def _fit_streams(plans, free):
                 if isinstance(v, list) and len(v) == 2 and v[0] in moves:
                     a[k] = [v[0], mv(*v)]
             if "ptrs" in a:
-                a["ptrs"] = [[[o, b, mv(b, off)] for o, b, off in ps] for ps in a["ptrs"]]
+                a["ptrs"] = [[[o, b, mv(b, off) if b in moves else off] for o, b, off in ps] for ps in a["ptrs"]]
             for _, _, t in a.get("tmaps", ()):
                 if t["gaddr"][0] in moves:
                     t["gaddr"] = [t["gaddr"][0], mv(*t["gaddr"])]
@@ -301,12 +309,39 @@ def _fit_streams(plans, free):
     return out
 
 
+_HELD = {}       # one model's uploaded weights kept across Runtimes in this process: key, device addresses, device, bytes
+
+
+def _weights_key(plans, files, device):
+    """what a Runtime's uploaded weights are: the weight files (path, size, mtime), the device, the weight buffers' sizes and the
+    tensors bound into them; None when a plan has init actions (they may write the shared buffers: never kept)"""
+    import hashlib
+    if any(p.get("init") for p in plans.values()):
+        return None
+    first = next(iter(plans.values()))
+    st = [(os.path.abspath(f), os.stat(f).st_size, os.stat(f).st_mtime_ns) for f in files]
+    lay = [b["size"] for b in first["buffers"] if b["role"] == "weights"]
+    return hashlib.sha256(json.dumps([st, device, lay, first["weights"]], sort_keys=True).encode()).hexdigest()
+
+
+def _release_held(cu):
+    """the held weights freed and their context hold released"""
+    if _HELD.get("key"):
+        for a in _HELD["addrs"]:
+            cu.cuMemFree_v2(C.c_uint64(a))
+        cu.cuDevicePrimaryCtxRelease(_HELD["dev"])
+    _HELD.clear()
+
+
 class Runtime:
     """the device side of a gc-plan pack: one context, the plans' buffers, their cubins, the weights, a CUDA graph per bucket"""
 
-    def __init__(self, plans, blob, files, device=0, share=None):
+    def __init__(self, plans, blob, files, device=0, share=None, min_streams=0, keep_weights=False):
         """plans: {bucket id: plan dict}; blob(rel, bucket id) -> bytes of that bucket file; files: the model's weight files; share:
-        {bucket id: bucket id} whose scratch it reuses (the widths of an affine bucket: the widest one's buffers hold every width's)"""
+        {bucket id: bucket id} whose scratch it reuses (the widths of an affine bucket: the widest one's buffers hold every width's);
+        min_streams: the streams the caller's buckets need (a PackError before anything is allocated or read when fewer fit);
+        keep_weights: leave the uploaded weights on the device after close() for the next Runtime of the same weights in this
+        process (one Runtime per bucket, as gc test's S3 builds them); a Runtime of other weights frees them first"""
         cu = self.cu = C.CDLL("libcuda.so.1")
         self.ck(cu.cuInit(0), "cuInit")
         dev, self.ctx = C.c_int(), C.c_void_p()
@@ -316,14 +351,25 @@ class Runtime:
         self.ck(cu.cuCtxSetCurrent(self.ctx), "context")
         self.st = C.c_void_p()
         self.ck(cu.cuStreamCreate(C.byref(self.st), 1), "stream")
-        plans = _fit_streams(plans, self._free_bytes())    # the cache capacity this device holds (a pack is GPU-agnostic)
+        wkey = _weights_key(plans, files, device)
+        if _HELD.get("key") != wkey:         # another model's (or no) weights held: free them before measuring the device
+            _release_held(cu)
+        held = _HELD.get("key") == wkey and wkey is not None
+        free = self._free_bytes() + (_HELD["cost"] if held else 0)     # (as if this Runtime uploaded them itself)
+        plans = _fit_streams(plans, free, min_streams)    # the cache capacity this device holds (a pack is GPU-agnostic)
         # weights and caches (kv) are shared by every bucket, by role and order (one model, one cache layout); scratch (compute)
         # buffers are each bucket's own (llama.cpp's allocator sizes and splits them per graph)
         first = next(iter(plans.values()))
         shared_layout = [(b["role"], b["size"]) for b in first["buffers"] if b["role"] != "compute"]
         self.shared, self.allocs, self.bases, self.hosts = [], [], {}, []
-        for r, n in shared_layout:          # zeroed, weights too: ggml zeroes a quantized tensor's row padding at load
+        wi, cost = [i for i, (r, _) in enumerate(shared_layout) if r == "weights"], 0
+        for i, (r, n) in enumerate(shared_layout):   # zeroed, weights too: ggml zeroes a quantized tensor's row padding at load
+            if held and r == "weights":
+                self.shared.append(_HELD["addrs"][wi.index(i)])
+                continue
+            f0 = self._free_bytes() if r == "weights" else 0
             self.shared.append(self._alloc(n, zero=True))
+            cost += f0 - self._free_bytes() if r == "weights" else 0     # the device memory the weights take
         share, arena_need = share or {}, 0
         for pid, p in sorted(plans.items(), key=lambda kv: kv[0] in share):     # the owners first
             P.need([(b["role"], b["size"]) for b in p["buffers"] if b["role"] != "compute"] == shared_layout,
@@ -368,7 +414,13 @@ class Runtime:
                 self.ck(cu.cuModuleGetFunction(C.byref(f), mods[rel], k.encode()), k[:60])
                 self.fn[k] = f
         self.mods = mods
-        self._weights(first["weights"], files, self.bases[next(iter(plans))])
+        if not held:
+            self._weights(first["weights"], files, self.bases[next(iter(plans))])
+            if wkey is not None and keep_weights:     # kept for the next Runtime of these weights in this process
+                addrs = [self.shared[i] for i in wi]
+                self.allocs = [a for a in self.allocs if a not in addrs]
+                self.ck(cu.cuDevicePrimaryCtxRetain(C.byref(C.c_void_p()), self.dev), "context")   # the held weights' own hold
+                _HELD.update(key=wkey, addrs=addrs, dev=self.dev, cost=cost)
         for pid, p in plans.items():           # init actions (e.g. a weight relaid for another kernel): once, after the weights
             keep = []
             for a in p.get("init", ()):
