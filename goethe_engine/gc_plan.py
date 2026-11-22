@@ -442,19 +442,53 @@ class Runtime:
             self.cu.cuGetErrorString(rc, C.byref(s))
             raise RuntimeError(f"{what}: CUDA {rc} {s.value.decode() if s.value else ''}")
 
-    def _weights(self, bind, files, base):
-        """every tensor the plan binds, from the weight files by name (raw bytes: the plan reads them as llama.cpp does)"""
-        left = dict(bind)
+    def _weights(self, bind, files, base, chunk=1 << 28):
+        """every tensor the plan binds, from the weight files by name (raw bytes: the plan reads them as llama.cpp does), through
+        two pinned staging buffers: a thread fills chunk k + 1 from the file's map while the copy engine moves chunk k (pageable
+        tensor-by-tensor copies ran at ~2 GB/s). O(bytes)"""
+        import concurrent.futures as cf
+        import mmap
+        left, work, maps = dict(bind), [], []
         for path in files:
             off = gguf_offsets(path)
-            with open(path, "rb") as f:
-                for name in [n for n in left if n in off]:
-                    buf, o, n = left.pop(name)
-                    f.seek(off[name])
-                    b = f.read(n)
-                    P.need(len(b) == n, f"{path}: tensor {name} is short")
-                    self.ck(self.cu.cuMemcpyHtoD_v2(C.c_uint64(base[buf] + o), b, C.c_size_t(n)), name)
+            f = open(path, "rb")
+            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)      # (copy on write: never written, but addressable)
+            maps.append((f, m))
+            for name in [n for n in left if n in off]:
+                buf, o, n = left.pop(name)
+                P.need(off[name] + n <= len(m), f"{path}: tensor {name} is short")
+                for k in range(0, n, chunk):
+                    work.append((base[buf] + o + k, m, off[name] + k, min(chunk, n - k), name))
         P.need(not left, f"weights: {len(left)} plan tensors in no weight file (first {next(iter(left), '')})")
+        self.ck(self.cu.cuCtxSynchronize(), "zeroed buffers")       # (the buffers' zeroing ran on the legacy stream)
+        bufs, evs = [], []
+        for _ in range(2):
+            h, e = C.c_void_p(), C.c_void_p()
+            self.ck(self.cu.cuMemAllocHost_v2(C.byref(h), C.c_size_t(chunk)), "pinned staging")
+            self.ck(self.cu.cuEventCreate(C.byref(e), 0), "event")
+            bufs.append(h.value)
+            evs.append(e)
+
+        def fill(k):
+            _, m, o, n, _ = work[k]
+            C.memmove(bufs[k % 2], C.addressof(C.c_char.from_buffer(m, o)), n)
+        with cf.ThreadPoolExecutor(1) as ex:
+            nxt = ex.submit(fill, 0) if work else None
+            for k, (dst, _, _, n, name) in enumerate(work):
+                nxt.result()
+                self.ck(self.cu.cuMemcpyHtoDAsync_v2(C.c_uint64(dst), C.c_void_p(bufs[k % 2]), C.c_size_t(n), self.st), name)
+                self.ck(self.cu.cuEventRecord(evs[k % 2], self.st), "event")
+                if k + 1 < len(work):
+                    if k >= 1:
+                        self.ck(self.cu.cuEventSynchronize(evs[(k + 1) % 2]), "sync")   # the buffer chunk k + 1 refills is free
+                    nxt = ex.submit(fill, k + 1)
+        self.ck(self.cu.cuStreamSynchronize(self.st), "weights")
+        for h, e in zip(bufs, evs):
+            self.cu.cuMemFreeHost(C.c_void_p(h))
+            self.cu.cuEventDestroy_v2(e)
+        for f, m in maps:
+            m.close()
+            f.close()
 
     def _issue(self, a, keep, base, st=None):
         cu, st = self.cu, st or self.st
