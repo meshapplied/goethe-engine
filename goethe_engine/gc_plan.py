@@ -1260,6 +1260,32 @@ class PlanBackend:
         for src, dst in pairs:
             self.rt.copy_slot(src, dst)
 
+    def snapshot(self):
+        """the live sequences as they stand: their streams' cache rows (paged KV: every page) copied to host memory and this
+        backend's own bookkeeping; restore(snap) puts both back, so a step sequence runs again from here. O(cache bytes held)"""
+        import copy
+        n = self.nseq if self.page else len(self.live)
+        self.rt.ck(self.rt.cu.cuCtxSynchronize(), "sync")
+        host = []
+        for a, row in self.rt._rows():
+            h = np.empty(row * n, np.uint8)
+            if h.size:
+                self.rt.ck(self.rt.cu.cuMemcpyDtoH_v2(C.c_void_p(h.ctypes.data), C.c_uint64(a), C.c_size_t(h.size)), "snapshot")
+            host.append(h)
+        own = {k: copy.deepcopy(getattr(self, k)) for k in ("live", "used", "free", "tab") if hasattr(self, k)}
+        return host, own
+
+    def restore(self, snap):
+        """the state snapshot() took, back on the device and in this backend"""
+        import copy
+        host, own = snap
+        self.rt.ck(self.rt.cu.cuCtxSynchronize(), "sync")
+        for (a, _), h in zip(self.rt._rows(), host):
+            if h.size:
+                self.rt.ck(self.rt.cu.cuMemcpyHtoD_v2(C.c_uint64(a), C.c_void_p(h.ctypes.data), C.c_size_t(h.size)), "restore")
+        for k, v in own.items():
+            setattr(self, k, copy.deepcopy(v))
+
     def release(self, sid):
         """the sequence's stream is freed: the last live sequence moves into the hole (streams stay packed); paged KV: its pages
         go back to the free list"""
