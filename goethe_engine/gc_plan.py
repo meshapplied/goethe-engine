@@ -1262,16 +1262,25 @@ class PlanBackend:
 
     def snapshot(self):
         """the live sequences as they stand: their streams' cache rows (paged KV: every page) copied to host memory and this
-        backend's own bookkeeping; restore(snap) puts both back, so a step sequence runs again from here. O(cache bytes held)"""
+        backend's own bookkeeping; restore(snap) puts both back, so a step sequence runs again from here. O(cache bytes held).
+        One snapshot at a time: the host side is one pinned buffer per cache, kept and grown across snapshots (closed with
+        the backend)"""
         import copy
         n = self.nseq if self.page else len(self.live)
         self.rt.ck(self.rt.cu.cuCtxSynchronize(), "sync")
-        host = []
-        for a, row in self.rt._rows():
-            h = np.empty(row * n, np.uint8)
-            if h.size:
-                self.rt.ck(self.rt.cu.cuMemcpyDtoH_v2(C.c_void_p(h.ctypes.data), C.c_uint64(a), C.c_size_t(h.size)), "snapshot")
-            host.append(h)
+        bufs, host = getattr(self, "_snap_bufs", {}), []
+        for i, (a, row) in enumerate(self.rt._rows()):
+            k = row * n
+            if k and bufs.get(i, (0, 0))[1] < k:
+                if i in bufs:
+                    self.rt.cu.cuMemFreeHost(C.c_void_p(bufs[i][0]))
+                h = C.c_void_p()
+                self.rt.ck(self.rt.cu.cuMemAllocHost_v2(C.byref(h), C.c_size_t(k)), f"snapshot ({k >> 20} MiB pinned)")
+                bufs[i] = (h.value, k)
+            if k:
+                self.rt.ck(self.rt.cu.cuMemcpyDtoH_v2(C.c_void_p(bufs[i][0]), C.c_uint64(a), C.c_size_t(k)), "snapshot")
+            host.append((bufs.get(i, (0, 0))[0], k))
+        self._snap_bufs = bufs
         own = {k: copy.deepcopy(getattr(self, k)) for k in ("live", "used", "free", "tab") if hasattr(self, k)}
         return host, own
 
@@ -1280,9 +1289,9 @@ class PlanBackend:
         import copy
         host, own = snap
         self.rt.ck(self.rt.cu.cuCtxSynchronize(), "sync")
-        for (a, _), h in zip(self.rt._rows(), host):
-            if h.size:
-                self.rt.ck(self.rt.cu.cuMemcpyHtoD_v2(C.c_uint64(a), C.c_void_p(h.ctypes.data), C.c_size_t(h.size)), "restore")
+        for (a, _), (h, k) in zip(self.rt._rows(), host):
+            if k:
+                self.rt.ck(self.rt.cu.cuMemcpyHtoD_v2(C.c_uint64(a), C.c_void_p(h), C.c_size_t(k)), "restore")
         for k, v in own.items():
             setattr(self, k, copy.deepcopy(v))
 
@@ -1306,6 +1315,9 @@ class PlanBackend:
 
     def close(self):
         if self.rt:
+            for h, _ in getattr(self, "_snap_bufs", {}).values():     # (snapshot()'s pinned buffers)
+                self.rt.cu.cuMemFreeHost(C.c_void_p(h))
+            self._snap_bufs = {}
             self.rt.close()
             self.rt = None
         if self.stage:
