@@ -73,6 +73,22 @@ def test_lerp_plan_interpolates_widths():
         raise AssertionError("a non-integer step must be refused")
 
 
+def test_fit_is_one_typed_rule():
+    G_ = 1 << 30
+    p = {"nseq": 4, "buffers": [{"role": "weights", "size": 10 * G_}, {"role": "kv", "size": 2 * G_}, {"role": "compute", "size": G_}],
+         "caches": {"cache_k_l0": [1, 0, 2 * G_]}, "actions": []}
+    e = G.does_not_fit({"b": p}, 13 * G_)
+    assert isinstance(e, P.DoesNotFit) and isinstance(e, P.OutOfMemory) and (e.streams, e.needed) == (1, 2) and e.free == 13 * G_
+    assert e.need > e.free and "does not fit this GPU: 2 streams need" in str(e)
+    assert G.does_not_fit({"b": p}, 14 * G_) is None and G._streams({"b": p}, 14 * G_) == 3
+    try:
+        G._fit_streams({"b": p}, 14 * G_, min_streams=4)
+    except P.DoesNotFit as x:
+        assert (x.streams, x.needed) == (3, 4)
+    else:
+        raise AssertionError("a bucket needing more streams than fit must be refused by type")
+    assert G._fit_streams({"b": p}, 14 * G_)["b"]["nseq"] == 3
+
 def test_unknown_input_refused():
     st = G.Step([0], [0], [0], [0], [0], 1, 1, [0])
     try:
