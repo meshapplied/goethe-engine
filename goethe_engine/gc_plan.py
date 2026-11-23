@@ -254,7 +254,6 @@ def _fit_streams(plans, free, min_streams=0):
     TMA descriptors, inputs, outputs) moved to the cache's new place. Streams are cache-major (a stream's rows at s * row), so the
     first nseq streams of each cache are where they were relative to the cache; buckets need B <= nseq streams (the backend's
     ladder reads nseq). A pack recorded on a large GPU thus runs on a smaller one, with fewer sequences at once."""
-    import pickle
     first = next(iter(plans.values()))
     nseq = first["nseq"]
     caches = first.get("caches", {})
@@ -270,8 +269,8 @@ def _fit_streams(plans, free, min_streams=0):
         return plans
     out = {}
     for pid, p in plans.items():
-        q = pickle.loads(pickle.dumps(p, pickle.HIGHEST_PROTOCOL))     # a deep copy (plans are JSON data: equal to copy.deepcopy's)
-        moves = {}                                           # buffer -> [(old off, old end, new off)]
+        q = dict(p, caches=dict(p["caches"]), buffers=list(p["buffers"]))   # only what moves is copied (plans may share objects:
+        moves = {}                                           # an affine width is its end plan) buffer -> [(old off, old end, new off)]
         for b in {b for b, _, _ in p["caches"].values()}:
             end = 0
             for name, (bb, o, n) in sorted(((k, v) for k, v in p["caches"].items() if v[0] == b), key=lambda kv: kv[1][1]):
@@ -295,16 +294,15 @@ def _fit_streams(plans, free, min_streams=0):
                     return no + off - o
             P.need(b not in moves, f"gc-plan: a reference into cache buffer {b} at {off} is in no cache")
             return off
-        for a in q["actions"]:
-            for k in ("dst", "src", "copy", "copy2d", "memset", "A", "B", "C"):
-                v = a.get(k)
-                if isinstance(v, list) and len(v) == 2 and v[0] in moves:
-                    a[k] = [v[0], mv(*v)]
-            if "ptrs" in a:
-                a["ptrs"] = [[[o, b, mv(b, off) if b in moves else off] for o, b, off in ps] for ps in a["ptrs"]]
-            for _, _, t in a.get("tmaps", ()):
-                if t["gaddr"][0] in moves:
-                    t["gaddr"] = [t["gaddr"][0], mv(*t["gaddr"])]
+        def act(a):                                          # the action with its cache references moved (a copy only if one does)
+            c = {k: [v[0], mv(*v)] for k in ("dst", "src", "copy", "copy2d", "memset", "A", "B", "C")
+                 if isinstance(v := a.get(k), list) and len(v) == 2 and v[0] in moves}
+            if any(b in moves for ps in a.get("ptrs", ()) for _, b, _ in ps):
+                c["ptrs"] = [[[o, b, mv(b, off) if b in moves else off] for o, b, off in ps] for ps in a["ptrs"]]
+            if any(t["gaddr"][0] in moves for _, _, t in a.get("tmaps", ())):
+                c["tmaps"] = [[i, o, dict(t, gaddr=[t["gaddr"][0], mv(*t["gaddr"])]) if t["gaddr"][0] in moves else t] for i, o, t in a["tmaps"]]
+            return {**a, **c} if c else a
+        q["actions"] = [act(a) for a in p["actions"]]
         q["nseq"] = want
         out[pid] = q
     return out
