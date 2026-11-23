@@ -247,7 +247,96 @@ _SPLIT = os.environ.get("GOETHE_SPLIT", "0") != "0"    # 1: the scheduler splits
 #                                                        packed buckets build their masks on the device (host masks: ~16 MB a launch at 4k)
 
 
-def _fit_streams(plans, free, min_streams=0):
+_REFS = ("dst", "src", "copy", "copy2d", "memset", "A", "B", "C")
+
+
+_IA = {}         # id(an init list) -> (that list, its _init_actions): one hashing per plan object (cleared per Runtime)
+
+
+def _init_actions(p):
+    """[(key, {compute buffer: rank in the action})] of p's init actions in order (e.g. NVFP4 weights repacked at load): a key is the
+    action's content with every pointer slot zeroed, a weight or cache buffer by its rank among them and a compute buffer by its
+    rank in the action and its size; equal keys write equal bytes (their inputs: the weights)"""
+    import hashlib
+    if id(p.get("init")) in _IA:
+        return _IA[id(p.get("init"))][1]
+    comp = {i for i, b in enumerate(p["buffers"]) if b["role"] == "compute"}
+    srank = {b: k for k, b in enumerate(i for i, x in enumerate(p["buffers"]) if x["role"] != "compute")}
+    out = []
+    for a in p.get("init", ()):
+        names = [v[0] for k in _REFS if isinstance(v := a.get(k), (list, tuple)) and len(v) == 2]
+        names += [b for ps in a.get("ptrs", ()) for _, b, _ in ps] + [t["gaddr"][0] for _, _, t in a.get("tmaps", ())]
+        loc = {}
+        for b in names:
+            if b in comp and b not in loc:
+                loc[b] = len(loc)
+        ref = lambda b: ["d", loc[b], p["buffers"][b]["size"]] if b in loc else ["s", srank[b]]
+        x = {k: v for k, v in a.items() if k not in ("args", "ptrs", "tmaps", "after") + _REFS}
+        x.update({k: [ref(v[0]), v[1]] for k in _REFS if isinstance(v := a.get(k), (list, tuple)) and len(v) == 2})
+        if "args" in a:
+            args = [bytearray.fromhex(h) for h in a["args"]]
+            for i, ps in enumerate(a.get("ptrs", ())):
+                for o, _, _ in ps:
+                    args[i][o:o + 8] = bytes(8)
+            for i, o, _ in a.get("tmaps", ()):
+                args[i][o:o + 128] = bytes(128)
+            x.update(args=[g.hex() for g in args], ptrs=[[[o, ref(b), off] for o, b, off in ps] for ps in a.get("ptrs", ())],
+                     tmaps=[[i, o, dict(t, gaddr=[ref(t["gaddr"][0]), t["gaddr"][1]])] for i, o, t in a.get("tmaps", ())])
+        out.append((hashlib.sha256(json.dumps(x, sort_keys=True).encode()).hexdigest(), loc))
+    if p.get("init"):
+        _IA[id(p["init"])] = (p["init"], out)
+    return out
+
+
+def _derived(p):
+    """{compute buffer: (init action key, rank)}: the buffers p's init actions write, shared by every bucket and alternative of
+    the model whose init has the same action; None when two init actions name one compute buffer (then the bucket's own)"""
+    out = {}
+    for key, loc in _init_actions(p):
+        for b, r in loc.items():
+            if b in out:
+                return None
+            out[b] = (key, r)
+    return out
+
+
+def _device_parts(p):
+    """({(init action key, rank): bytes}, arena bytes, own bytes): plan p's compute buffers as a Runtime holds them: the outputs of
+    its init actions (one copy per distinct action, shared by every bucket), the rest carved from the arena, or all its own when
+    its init is not shareable"""
+    d = _derived(p) if p.get("init") else {}
+    if d is None:
+        return {}, 0, sum(b["size"] for b in p["buffers"] if b["role"] == "compute")
+    return ({kr: p["buffers"][b]["size"] for b, kr in d.items()},
+            sum(-(-max(b["size"], 1) // 4096) * 4096 for i, b in enumerate(p["buffers"]) if b["role"] == "compute" and i not in d), 0)
+
+
+def _device_bytes(plans, share=None):
+    """(derived, arena, own): the device bytes a Runtime allocates for the plans' compute buffers: derived (init outputs, one copy
+    per distinct init action), the arena (the largest bucket's other scratch), own (compute of plans whose init is not shareable).
+    The one account _streams and the Runtime both use"""
+    share, pool, arena, own = share or {}, {}, 0, 0
+    for pid, p in plans.items():
+        if pid not in share:
+            q, a, o = _device_parts(p)
+            pool.update(q)
+            arena, own = max(arena, a), own + o
+    return sum(pool.values()), arena, own
+
+
+def _streams(plans, free, share=None, dev=None):
+    """the streams free device bytes hold beside the weights, the compute (dev, else _device_bytes) and a slack of 1 GiB + free/50
+    (cuBLAS, graphs, allocator), at most the recorded nseq: the one fit rule of the Runtime and of a compiler choosing what a pack
+    carries"""
+    first = next(iter(plans.values()))
+    nseq = first["nseq"]
+    per = sum(n // nseq for _, _, n in first.get("caches", {}).values())
+    weights = sum(b["size"] for b in first["buffers"] if b["role"] == "weights")
+    dev = dev or _device_bytes(plans, share)
+    return min(nseq, (free - weights - sum(dev) - (1 << 30) - free // 50) // per) if per else nseq
+
+
+def _fit_streams(plans, free, min_streams=0, share=None):
     """the plans with their caches held for as many streams as this device's memory takes beside the weights and the largest
     bucket's scratch (at most the recorded nseq; GOETHE_NSEQ forces one): every cache keeps its per-stream bytes and order, the
     caches of a buffer packed after one another, and every reference into a cache buffer (launch pointers, copies, GEMM operands,
@@ -256,14 +345,11 @@ def _fit_streams(plans, free, min_streams=0):
     ladder reads nseq). A pack recorded on a large GPU thus runs on a smaller one, with fewer sequences at once."""
     first = next(iter(plans.values()))
     nseq = first["nseq"]
-    caches = first.get("caches", {})
-    per = sum(n // nseq for _, _, n in caches.values())
+    want = int(os.environ["GOETHE_NSEQ"]) if os.environ.get("GOETHE_NSEQ") else _streams(plans, free, share)
     weights = sum(b["size"] for b in first["buffers"] if b["role"] == "weights")
-    scratch = max(sum(b["size"] for b in p["buffers"] if b["role"] == "compute") for p in plans.values())
-    margin = (1 << 30) + free // 50                         # cuBLAS / graphs / allocator slack
-    fit = (free - weights - scratch - margin) // per if per else nseq
-    want = int(os.environ["GOETHE_NSEQ"]) if os.environ.get("GOETHE_NSEQ") else min(nseq, fit)
-    P.need(want >= 2, f"gc-plan: {free >> 20} MiB free holds the weights ({weights >> 20} MiB) and scratch but not two streams")
+    der, arena, own = _device_bytes(plans, share)
+    P.need(want >= 2, f"gc-plan: {free >> 20} MiB free holds the weights ({weights >> 20} MiB), init outputs ({der >> 20}), arena "
+                      f"({arena >> 20}) and unshared scratch ({own >> 20}) but not two streams")
     P.need(min(want, nseq) >= min_streams, f"{min(want, nseq)} streams fit this GPU, the bucket needs {min_streams}")
     if want >= nseq:
         return plans
@@ -355,7 +441,9 @@ class Runtime:
             _release_held(cu)
         held = _HELD.get("key") == wkey and wkey is not None
         free = self._free_bytes() + (_HELD["cost"] if held else 0)     # (as if this Runtime uploaded them itself)
-        plans = _fit_streams(plans, free, min_streams)    # the cache capacity this device holds (a pack is GPU-agnostic)
+        share = share or {}
+        _IA.clear()
+        plans = _fit_streams(plans, free, min_streams, share)   # the cache capacity this device holds (a pack is GPU-agnostic)
         # weights and caches (kv) are shared by every bucket, by role and order (one model, one cache layout); scratch (compute)
         # buffers are each bucket's own (llama.cpp's allocator sizes and splits them per graph)
         first = next(iter(plans.values()))
@@ -369,7 +457,7 @@ class Runtime:
             f0 = self._free_bytes() if r == "weights" else 0
             self.shared.append(self._alloc(n, zero=True))
             cost += f0 - self._free_bytes() if r == "weights" else 0     # the device memory the weights take
-        share, arena_need = share or {}, 0
+        arena_need, self.derived, run_init, ran = 0, {}, {}, set()   # (init action key, rank) -> address; pid -> init actions it runs
         for pid, p in sorted(plans.items(), key=lambda kv: kv[0] in share):     # the owners first
             P.need([(b["role"], b["size"]) for b in p["buffers"] if b["role"] != "compute"] == shared_layout,
                    f"bucket {pid}: weights or caches laid out differently from the other buckets")
@@ -380,13 +468,23 @@ class Runtime:
                        f"bucket {pid}: scratch larger than its affine bucket's widest")
                 self.bases[pid] = list(self.bases[share[pid]])
                 continue
-            if p.get("init"):                # init actions write their buffers once: those stay the bucket's own
+            d = _derived(p) if p.get("init") else {}
+            if d is None:                    # an init whose outputs are not shareable: every compute buffer the bucket's own
                 self.bases[pid] = [next(it) if b["role"] != "compute" else self._alloc(b["size"], zero=True) for b in p["buffers"]]
+                run_init[pid] = p["init"]
                 continue
+            acts = _init_actions(p)
+            run_init[pid] = [a for a, (k, _) in zip(p.get("init", ()), acts) if k not in ran]   # each distinct init action once
+            ran |= {k for k, _ in acts}
+            for b in d:                      # init outputs: one copy per distinct init action, shared by every bucket
+                if d[b] not in self.derived:
+                    self.derived[d[b]] = self._alloc(p["buffers"][b]["size"], zero=True)
             off, self.bases[pid] = 0, []     # one bucket runs at a time: every bucket's scratch is carved from one arena
-            for b in p["buffers"]:
+            for i, b in enumerate(p["buffers"]):
                 if b["role"] != "compute":
                     self.bases[pid].append(next(it))
+                elif i in d:
+                    self.bases[pid].append(self.derived[d[i]])
                 else:
                     self.bases[pid].append(off)
                     off += -(-max(b["size"], 1) // 4096) * 4096
@@ -394,8 +492,9 @@ class Runtime:
         if arena_need:                       # the widest bucket's scratch, zeroed once; offsets become addresses
             arena = self._alloc(arena_need, zero=True)
             for pid, p in plans.items():
-                if pid not in share and not p.get("init"):
-                    self.bases[pid] = [x + arena if b["role"] == "compute" else x for x, b in zip(self.bases[pid], p["buffers"])]
+                if pid not in share and (d := _derived(p) if p.get("init") else {}) is not None:
+                    self.bases[pid] = [x + arena if b["role"] == "compute" and i not in d else x
+                                       for i, (x, b) in enumerate(zip(self.bases[pid], p["buffers"]))]
             for pid in share:
                 self.bases[pid] = list(self.bases[share[pid]])
         if any('"gemm"' in json.dumps(p.get("actions")) for p in plans.values()):
@@ -420,9 +519,9 @@ class Runtime:
                 self.allocs = [a for a in self.allocs if a not in addrs]
                 self.ck(cu.cuDevicePrimaryCtxRetain(C.byref(C.c_void_p()), self.dev), "context")   # the held weights' own hold
                 _HELD.update(key=wkey, addrs=addrs, dev=self.dev, cost=cost)
-        for pid, p in plans.items():           # init actions (e.g. a weight relaid for another kernel): once, after the weights
-            keep = []
-            for a in p.get("init", ()):
+        for pid in run_init:                   # init actions (e.g. a weight relaid for another kernel): each distinct one once, after
+            keep = []                          # the weights
+            for a in run_init[pid]:
                 self._issue(a, keep, self.bases[pid])
             self.ck(cu.cuStreamSynchronize(self.st), "init")
 
