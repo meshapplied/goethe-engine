@@ -61,6 +61,15 @@ class PackError(Refused):
     """Any mismatch between a pack, its blobs, the weights and the device: the pack is not loaded."""
 
 
+class DoesNotFit(PackError, OutOfMemory):
+    """The device's memory cannot hold the pack's plans at the streams they need: the one fit rule's result (gc_plan._fit_streams),
+    for every caller to handle by type. need, free: bytes; streams: what free holds; needed: what the plans need"""
+
+    def __init__(self, msg, need, free, streams, needed):
+        super().__init__(msg)
+        self.need, self.free, self.streams, self.needed = need, free, streams, needed
+
+
 def semver(s):
     m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", s or "")
     if not m:

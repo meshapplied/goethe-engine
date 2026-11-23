@@ -300,14 +300,22 @@ def _derived(p):
     return out
 
 
+_PAGE = 2 << 20     # the driver's allocation granularity: a cuMemAlloc takes whole 2 MiB pages (Qwen3.8 P512's 378 init outputs:
+#                     413 of the 502 MiB measured past the bytes asked for; the rest, modules and graphs, is the slack's)
+
+
+def _pg(n):
+    return -(-max(n, 1) // _PAGE) * _PAGE
+
+
 def _device_parts(p):
-    """({(init action key, rank): bytes}, arena bytes, own bytes): plan p's compute buffers as a Runtime holds them: the outputs of
-    its init actions (one copy per distinct action, shared by every bucket), the rest carved from the arena, or all its own when
-    its init is not shareable"""
+    """({(init action key, rank): bytes}, arena bytes, own bytes): plan p's compute buffers as a Runtime holds them (each allocation
+    in whole pages): the outputs of its init actions (one copy per distinct action, shared by every bucket), the rest carved from
+    the arena, or all its own when its init is not shareable"""
     d = _derived(p) if p.get("init") else {}
     if d is None:
-        return {}, 0, sum(b["size"] for b in p["buffers"] if b["role"] == "compute")
-    return ({kr: p["buffers"][b]["size"] for b, kr in d.items()},
+        return {}, 0, sum(_pg(b["size"]) for b in p["buffers"] if b["role"] == "compute")
+    return ({kr: _pg(p["buffers"][b]["size"]) for b, kr in d.items()},
             sum(-(-max(b["size"], 1) // 4096) * 4096 for i, b in enumerate(p["buffers"]) if b["role"] == "compute" and i not in d), 0)
 
 
@@ -321,22 +329,46 @@ def _device_bytes(plans, share=None):
             q, a, o = _device_parts(p)
             pool.update(q)
             arena, own = max(arena, a), own + o
-    return sum(pool.values()), arena, own
+    return sum(pool.values()), arena and _pg(arena), own
+
+
+def _account(plans, free, share=None, dev=None):
+    """the device bytes a Runtime of the plans takes in free bytes: weights, compute (dev, else _device_bytes: derived, arena,
+    own), a slack of 1 GiB + free/50 (cuBLAS, modules, graphs) and a page per cache buffer (its rounding), stream (one stream's
+    caches); nseq: the streams recorded"""
+    first = next(iter(plans.values()))
+    nseq = first["nseq"]
+    der, arena, own = dev or _device_bytes(plans, share)
+    caches = first.get("caches", {}).values()
+    return dict(weights=sum(_pg(b["size"]) for b in first["buffers"] if b["role"] == "weights"), derived=der, arena=arena, own=own,
+                slack=(1 << 30) + free // 50 + _PAGE * len({b for b, _, _ in caches}), stream=sum(n // nseq for _, _, n in caches),
+                nseq=nseq)
 
 
 def _streams(plans, free, share=None, dev=None):
-    """the streams free device bytes hold beside the weights, the compute (dev, else _device_bytes) and a slack of 1 GiB + free/50
-    (cuBLAS, graphs, allocator), at most the recorded nseq: the one fit rule of the Runtime and of a compiler choosing what a pack
-    carries"""
-    first = next(iter(plans.values()))
-    nseq = first["nseq"]
-    per = sum(n // nseq for _, _, n in first.get("caches", {}).values())
-    weights = sum(b["size"] for b in first["buffers"] if b["role"] == "weights")
-    dev = dev or _device_bytes(plans, share)
-    return min(nseq, (free - weights - sum(dev) - (1 << 30) - free // 50) // per) if per else nseq
+    """the streams free device bytes hold beside everything else of _account, at most the recorded nseq: the one fit rule of the
+    Runtime and of a compiler choosing what a pack carries"""
+    a = _account(plans, free, share, dev)
+    fixed = a["weights"] + a["derived"] + a["arena"] + a["own"] + a["slack"]
+    return min(a["nseq"], (free - fixed) // a["stream"]) if a["stream"] else a["nseq"]
 
 
-def _fit_streams(plans, free, min_streams=0, share=None):
+def does_not_fit(plans, free, needed=2, share=None, dev=None, where="this GPU"):
+    """None where free device bytes hold the plans at `needed` streams (_streams), else the DoesNotFit naming every term: the
+    one test a Runtime and a compiler deciding whether a pack kind ships make"""
+    have = _streams(plans, free, share, dev)
+    if have >= needed:
+        return None
+    a = _account(plans, free, share, dev)
+    M = lambda v: f"{v >> 20}"
+    need = a["weights"] + a["derived"] + a["arena"] + a["own"] + a["slack"] + needed * a["stream"]
+    why = "" if a["nseq"] >= needed else f" (the pack records {a['nseq']})"
+    return P.DoesNotFit(f"does not fit {where}: {needed} streams{why} need {M(need)} MiB (weights {M(a['weights'])}, init outputs "
+                        f"{M(a['derived'])}, arena {M(a['arena'])}, unshared scratch {M(a['own'])}, {needed} x {M(a['stream'])} a "
+                        f"stream, slack {M(a['slack'])}), {M(free)} MiB free holds {max(have, 0)}", need, free, max(have, 0), needed)
+
+
+def _fit_streams(plans, free, min_streams=0, share=None, where="this GPU"):
     """the plans with their caches held for as many streams as this device's memory takes beside the weights and the largest
     bucket's scratch (at most the recorded nseq; GOETHE_NSEQ forces one): every cache keeps its per-stream bytes and order, the
     caches of a buffer packed after one another, and every reference into a cache buffer (launch pointers, copies, GEMM operands,
@@ -345,12 +377,13 @@ def _fit_streams(plans, free, min_streams=0, share=None):
     ladder reads nseq). A pack recorded on a large GPU thus runs on a smaller one, with fewer sequences at once."""
     first = next(iter(plans.values()))
     nseq = first["nseq"]
-    want = int(os.environ["GOETHE_NSEQ"]) if os.environ.get("GOETHE_NSEQ") else _streams(plans, free, share)
-    weights = sum(b["size"] for b in first["buffers"] if b["role"] == "weights")
-    der, arena, own = _device_bytes(plans, share)
-    P.need(want >= 2, f"gc-plan: {free >> 20} MiB free holds the weights ({weights >> 20} MiB), init outputs ({der >> 20}), arena "
-                      f"({arena >> 20}) and unshared scratch ({own >> 20}) but not two streams")
-    P.need(min(want, nseq) >= min_streams, f"{min(want, nseq)} streams fit this GPU, the bucket needs {min_streams}")
+    if os.environ.get("GOETHE_NSEQ"):
+        want = int(os.environ["GOETHE_NSEQ"])
+        P.need(min(want, nseq) >= max(2, min_streams), f"GOETHE_NSEQ={want}: {min(want, nseq)} streams, the plans need {max(2, min_streams)}")
+    else:
+        want = _streams(plans, free, share)
+        if min(want, nseq) < max(2, min_streams):
+            raise does_not_fit(plans, free, max(2, min_streams), share, where=where)
     if want >= nseq:
         return plans
     out = {}
@@ -392,6 +425,10 @@ def _fit_streams(plans, free, min_streams=0, share=None):
         q["nseq"] = want
         out[pid] = q
     return out
+
+
+class DeviceOutOfMemory(P.OutOfMemory, RuntimeError):
+    """CUDA_ERROR_OUT_OF_MEMORY (2) from the driver: an allocation, a module load or a launch past the device's memory"""
 
 
 _HELD = {}       # one model's uploaded weights kept across Runtimes in this process: key, device addresses, device, bytes
@@ -443,7 +480,15 @@ class Runtime:
         free = self._free_bytes() + (_HELD["cost"] if held else 0)     # (as if this Runtime uploaded them itself)
         share = share or {}
         _IA.clear()
-        plans = _fit_streams(plans, free, min_streams, share)   # the cache capacity this device holds (a pack is GPU-agnostic)
+        name = (C.c_char * 256)()
+        self.ck(cu.cuDeviceGetName(name, 256, dev), "device name")
+        try:                                 # the cache capacity this device holds (a pack is GPU-agnostic)
+            plans = _fit_streams(plans, free, min_streams, share, where=name.value.decode())
+        except P.PackError:                  # (refused before any allocation: the stream and context hold released)
+            cu.cuStreamDestroy_v2(self.st)
+            cu.cuDevicePrimaryCtxRelease(dev)
+            self.ctx = None
+            raise
         # weights and caches (kv) are shared by every bucket, by role and order (one model, one cache layout); scratch (compute)
         # buffers are each bucket's own (llama.cpp's allocator sizes and splits them per graph)
         first = next(iter(plans.values()))
@@ -537,7 +582,7 @@ class Runtime:
         if rc:
             s = C.c_char_p()
             self.cu.cuGetErrorString(rc, C.byref(s))
-            raise RuntimeError(f"{what}: CUDA {rc} {s.value.decode() if s.value else ''}")
+            raise (DeviceOutOfMemory if rc == 2 else RuntimeError)(f"{what}: CUDA {rc} {s.value.decode() if s.value else ''}")
 
     def _weights(self, bind, files, base, chunk=1 << 28):
         """every tensor the plan binds, from the weight files by name (raw bytes: the plan reads them as llama.cpp does), through
