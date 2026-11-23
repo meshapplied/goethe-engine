@@ -275,6 +275,8 @@ class Engine:
                                  [ss[k].nout for k in ex], [ss[k].grammar.mask() if ss[k].grammar else None for k in ex])
                     for k, t in zip(ex, got):
                         toks[k] = t
+            toks = [s.params.forced[s.nout % len(s.params.forced)] if s.params.forced and t is not None and t >= 0 else t
+                    for s, t in zip(ss, toks)]          # teacher forcing: the request's fixed stream in place of the sample
             nxt = []
             for e, s, t in zip(active, ss, toks):
                 it, o, ri, u, pth, kids = e[:6]
