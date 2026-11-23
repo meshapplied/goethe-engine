@@ -27,23 +27,40 @@ class StructureError(Exception):
 
 
 class _Rd:
+    """a cursor over a file's bytes (mmap: one mapping, no read call per field; a tokenizer's 262k strings were 2.5M reads)"""
     def __init__(self, f):
-        self.f = f
+        import mmap
+        self.f, self.o = f, 0
+        self.b = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
     def take(self, n):
-        b = self.f.read(n)
-        if len(b) != n:
+        if self.o + n > len(self.b):
             raise StructureError("truncated header")
-        return b
+        self.o += n
+        return self.b[self.o - n:self.o]
 
     def get(self, fmt):
-        return struct.unpack("<" + fmt, self.take(struct.calcsize(fmt)))[0]
+        s = struct.calcsize(fmt)
+        if self.o + s > len(self.b):
+            raise StructureError("truncated header")
+        self.o += s
+        return struct.unpack_from("<" + fmt, self.b, self.o - s)[0]
+
+    def many(self, fmt, n):
+        s = struct.calcsize(fmt) * n
+        if self.o + s > len(self.b):
+            raise StructureError("truncated header")
+        self.o += s
+        return list(struct.unpack_from(f"<{n}{fmt}", self.b, self.o - s))
 
     def str(self):
         n = self.get("Q")
         if n > MAX_HEADER:
             raise StructureError("bad string length")
         return self.take(n).decode("utf-8", "replace")
+
+    def tell(self):
+        return self.o
 
 
 _SCALARS = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -58,7 +75,7 @@ def _value(r, t):
         et, n = r.get("I"), r.get("Q")
         if et == 9 or n > MAX_HEADER:
             raise StructureError("unsupported array")
-        return [_value(r, et) for _ in range(n)]
+        return r.many(_SCALARS[et], n) if et in _SCALARS else [_value(r, et) for _ in range(n)]
     raise StructureError(f"unknown metadata type {t}")
 
 
@@ -87,6 +104,36 @@ def gguf_header(path):
     return kv, tens
 
 
+def gguf_offsets(path):
+    """{tensor name: absolute file offset of its data} of a GGUF file (general.alignment, default 32): where a runtime reads a
+    tensor's bytes; sizes come from what reads them."""
+    return _cached("offsets", [path], lambda: _gguf_offsets(path))
+
+
+def _gguf_offsets(path):
+    with open(path, "rb") as f:
+        r = _Rd(f)
+        if r.take(4) != b"GGUF" or r.get("I") not in (2, 3):
+            raise StructureError(f"{path}: not a GGUF v2/v3 file")
+        nt, nkv = r.get("Q"), r.get("Q")
+        kv = {}
+        for _ in range(nkv):
+            k = r.str()
+            kv[k] = _value(r, r.get("I"))
+        rel = {}
+        for _ in range(nt):
+            name, nd = r.str(), r.get("I")
+            if nd > 8:
+                raise StructureError(f"{path}: tensor rank")
+            for _ in range(nd):
+                r.get("Q")
+            r.get("I")
+            rel[name] = r.get("Q")
+        al = int(kv.get("general.alignment", 32))
+        start = -(-r.tell() // al) * al
+    return {n: start + o for n, o in rel.items()}
+
+
 def st_header(path):
     """[(name, shape, dtype)] of a safetensors file: header only."""
     with open(path, "rb") as f:
@@ -105,9 +152,47 @@ def _dig(d, path):
     return d
 
 
+_MEMO = {}
+
+
+def _cached(kind, files, make):
+    """make() memoized by the files' (real path, size, mtime) in this process and on disk (GOETHE_STRUCT_CACHE, default
+    ~/.cache/goethe/structure; "0" off): a model's headers are parsed once per file state, by any process (gq --prep fills it)"""
+    import pickle
+    try:
+        key = hashlib.sha256(repr((kind, [(os.path.realpath(f), os.stat(f).st_size, os.stat(f).st_mtime_ns) for f in files])).encode()).hexdigest()
+    except OSError:
+        return make()
+    if key in _MEMO:
+        return _MEMO[key]
+    d = os.environ.get("GOETHE_STRUCT_CACHE", os.path.expanduser("~/.cache/goethe/structure"))
+    f = os.path.join(d, key + ".pickle")
+    try:
+        with open(f, "rb") as fh:
+            _MEMO[key] = pickle.load(fh)
+        return _MEMO[key]
+    except (OSError, EOFError, pickle.UnpicklingError):
+        pass
+    _MEMO[key] = v = make()
+    if d != "0":
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(f + f".{os.getpid()}", "wb") as fh:
+                pickle.dump(v, fh, pickle.HIGHEST_PROTOCOL)
+            os.replace(f + f".{os.getpid()}", f)
+        except OSError:
+            pass
+    return v
+
+
 def table(paths):
     """{"kv": {key: value}, "config": {...}, "tensors": sorted [(name, shape, type)], "quant": ...} of a model directory or file list."""
     paths = [paths] if isinstance(paths, str) else list(paths)
+    files = sorted(glob.glob(os.path.join(paths[0], "*"))) if len(paths) == 1 and os.path.isdir(paths[0]) else paths
+    return _cached("table", files, lambda: _table(paths))
+
+
+def _table(paths):
     if len(paths) == 1 and os.path.isdir(paths[0]):
         d = paths[0]
         paths = sorted(glob.glob(os.path.join(d, "*.safetensors"))) or sorted(glob.glob(os.path.join(d, "*.gguf")))

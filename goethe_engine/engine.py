@@ -63,6 +63,9 @@ class Engine:
             self.cols = np.array([c for k in need for c in at[k]])
         self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages, bounded)
         self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size)
+        self.sched.unmixed = bool(getattr(backend, "batches_all_live", False))
+        self.sched.align = int(getattr(backend, "prefill_align", 1))
+        self.sched.share = getattr(backend, "prefill_share", None)
         self.inbox, self.live, self.counter = deque(), {}, 0
         self.m = dict(steps=0, prompt_tokens=0, generation_tokens=0, prefix_hit_tokens=0, aborted=0, errors=0,
                       spec_drafted=0, spec_accepted=0, spec_invalid=0)
@@ -272,6 +275,8 @@ class Engine:
                                  [ss[k].nout for k in ex], [ss[k].grammar.mask() if ss[k].grammar else None for k in ex])
                     for k, t in zip(ex, got):
                         toks[k] = t
+            toks = [s.params.forced[s.nout % len(s.params.forced)] if s.params.forced and t is not None and t >= 0 else t
+                    for s, t in zip(ss, toks)]          # teacher forcing: the request's fixed stream in place of the sample
             nxt = []
             for e, s, t in zip(active, ss, toks):
                 it, o, ri, u, pth, kids = e[:6]

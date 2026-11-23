@@ -152,3 +152,17 @@ def test_parallel_sampling_forks_with_cow():
     ref = alone(prompt(6), p)
     assert got == {("a", i): ref[("r", i)] for i in range(3)}
     assert len(eng.kv.pool.free) + eng.metrics()["kv_tree_blocks"] == 64
+
+
+def test_forced_tokens_replace_the_sample_and_feed_the_next_step():
+    f = (7, 3, 9)
+    eng, be = make(blocks=64, bs=4)
+    eng.add_request("a", prompt(6), P(max_tokens=5, forced=f))
+    eng.add_request("b", prompt(6, 9), P(max_tokens=4))
+    out = toks(run(eng))
+    assert out[("a", 0)] == [7, 3, 9, 7, 3] and out[("b", 0)] == alone(prompt(6, 9), P(max_tokens=4))[("r", 0)]
+    sid = be.steps[0][0].sid                     # (a: added first)
+    fed = [w.tokens for st in be.steps for w in st if w.sid == sid]
+    assert [t[0] for t in fed[1:]] == [7, 3, 9, 7]
+    with pytest.raises(ValueError):
+        P(temperature=1.0, forced=f).validate()

@@ -19,6 +19,7 @@ class SamplingParams:
     grammar: tuple | None = None  # (kind, spec), see grammar.py
     priority: int = 0
     accept: str = "exact"  # speculative acceptance at temperature > 0: exact (seeded sample match) | rejection
+    forced: tuple = ()  # teacher forcing: output token i is forced[i % len] (greedy computed and discarded; equal inputs across builds)
 
     def validate(self):
         if not (self.temperature >= 0 and self.temperature < float("inf")):
@@ -37,6 +38,8 @@ class SamplingParams:
             raise ValueError("empty stop sequence")
         if self.accept not in ("exact", "rejection"):
             raise ValueError("accept must be exact or rejection")
+        if self.forced and (self.temperature != 0 or self.n != 1 or self.grammar is not None):
+            raise ValueError("forced tokens need temperature 0, n 1 and no grammar")
 
 
 def mix(seed, i):

@@ -54,6 +54,14 @@ def test_v4_stages_from_the_store_and_opens(tmp_path, key, mocklib):
     be.close()
 
 
+def test_v4_store_blobs_closed_after_extraction(tmp_path, key, mocklib):
+    pack, store, _ = v4(str(tmp_path), key, mocklib)
+    fds = lambda: {os.path.realpath(f"/proc/self/fd/{x}") for x in os.listdir("/proc/self/fd")}
+    st = P.stage(pack, trusted=(key.kid,), store=store)          # a pack of more blobs than the open-file limit stages too
+    assert not {f for f in fds() if f.startswith(os.path.realpath(store))} and len(st.files) == 1
+    st.close()
+
+
 def test_v4_overlay_merges(tmp_path, key, mocklib):
     pack, store, _ = v4(str(tmp_path), key, mocklib)
     ovl = overlay(str(tmp_path), key, pack, mocklib)                # an abi 4 overlay in a v4 container, its blobs in the store

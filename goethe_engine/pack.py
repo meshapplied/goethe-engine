@@ -41,7 +41,7 @@ DOMAIN = b"gc-pack-3\n"             # signed digest = sha256(DOMAIN + manifest b
 ABI4, MAGIC4, DOMAIN4 = "4.0.0", b"GCPACK4\n", b"gc-pack-4\n"   # pack 4: the same framing, blobs by hash from a store
 MAX_HEADER = 64 << 20               # bytes of container header JSON
 SCHEMA = "gc-pack"
-RUNTIMES = {"gc-c": (1,)}           # runtime kinds this loader runs, with their versions
+RUNTIMES = {"gc-c": (1,), "gc-plan": (1,)}   # runtime kinds this loader runs, with their versions (gc-plan: gc_plan.py)
 MAX_RAW = 4 << 30                   # bytes: no blob inflates past this (xz bombs are refused as the output grows)
 XZ_MEM = 64 << 20                   # bytes: xz decoder memory limit
 MAX_JSON = 16 << 20                 # bytes: larger manifests are refused before parsing
@@ -59,6 +59,15 @@ MODEL_TYPE = "decoder"                  # model.type of a manifest without the f
 
 class PackError(Refused):
     """Any mismatch between a pack, its blobs, the weights and the device: the pack is not loaded."""
+
+
+class DoesNotFit(PackError, OutOfMemory):
+    """The device's memory cannot hold the pack's plans at the streams they need: the one fit rule's result (gc_plan._fit_streams),
+    for every caller to handle by type. need, free: bytes; streams: what free holds; needed: what the plans need"""
+
+    def __init__(self, msg, need, free, streams, needed):
+        super().__init__(msg)
+        self.need, self.free, self.streams, self.needed = need, free, streams, needed
 
 
 def semver(s):
@@ -284,56 +293,59 @@ class Staged:
             dst = os.path.join(self.dir, "blobs", bh)
             if os.path.exists(dst):
                 continue
-            if bh not in self.src and self.store is not None:
-                got = self.store.open(bh)
-                if got:
-                    self.files.append(got[0])
-                    self.src[bh] = (got[0], 0, got[1][1], got[1])
-            need(bh in self.src, f"blob {bh} missing from the pack" + (" and the store" if self.store is not None else ""))
-            f, base, total, e = self.src[bh]
-            off, ln, codec = blob_entry(e, bh)
-            _section(off, ln, total - base, f"blob {bh}")
-            f.seek(base + off)
-            hh, left = hashlib.sha256(), ln
-            dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
-            pin = self.manifest.get("blob_raw", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
-            need(pin is not None or not codec, f"blob {bh}: xz without a raw size pinned in the signed manifest (refused)")
-            cap = MAX_RAW if pin is None else min(pin, MAX_RAW)
-            out = 0
+            got = self.store.open(bh) if bh not in self.src and self.store is not None else None
+            need(bh in self.src or got, f"blob {bh} missing from the pack" + (" and the store" if self.store is not None else ""))
+            try:                                  # (a store blob's file open only while it is extracted: a pack of many blobs)
+                self._extract(bh, dst, *(self.src[bh] if got is None else (got[0], 0, got[1][1], got[1])))
+            finally:
+                if got is not None:
+                    got[0].close()
 
-            def put(o, b):
-                nonlocal out
-                out += len(b)
-                need(out <= cap, f"blob {bh}: inflates past {cap} bytes (refused)")
-                hh.update(b)
-                o.write(b)
-            try:
-                with _create(dst) as o:
-                    while left:
-                        chunk = f.read(min(left, 4 << 20))
-                        need(chunk, f"blob {bh}: pack truncated or a hole")
-                        left -= len(chunk)
-                        if not dec:
-                            put(o, chunk)
-                            continue
-                        try:
-                            b = dec.decompress(chunk, min(1 << 20, cap + 1 - out))
-                            while True:
-                                put(o, b)
-                                if dec.needs_input or dec.eof:
-                                    break
-                                b = dec.decompress(b"", min(1 << 20, cap + 1 - out))
-                        except (lzma.LZMAError, EOFError) as e:
-                            raise PackError(f"blob {bh}: xz: {e}")
-                    need(not dec or (dec.eof and not dec.unused_data and not left), f"blob {bh}: xz stream truncated or followed by data")
-                need(pin is None or out == pin, f"blob {bh}: {out} raw bytes, the manifest pins {pin}")
-            except PackError:
-                if os.path.exists(dst):
-                    os.unlink(dst)
-                raise
-            if hh.hexdigest() != bh:
+    def _extract(self, bh, dst, f, base, total, e):
+        """blob bh from container f into dst, hash-checked; a failed one leaves no file"""
+        off, ln, codec = blob_entry(e, bh)
+        _section(off, ln, total - base, f"blob {bh}")
+        f.seek(base + off)
+        hh, left = hashlib.sha256(), ln
+        dec = lzma.LZMADecompressor(lzma.FORMAT_XZ, memlimit=XZ_MEM) if codec else None
+        pin = self.manifest.get("blob_raw", {}).get(bh)       # the signed raw size of the blob (absent: only MAX_RAW bounds it)
+        need(pin is not None or not codec, f"blob {bh}: xz without a raw size pinned in the signed manifest (refused)")
+        cap = MAX_RAW if pin is None else min(pin, MAX_RAW)
+        out = 0
+
+        def put(o, b):
+            nonlocal out
+            out += len(b)
+            need(out <= cap, f"blob {bh}: inflates past {cap} bytes (refused)")
+            hh.update(b)
+            o.write(b)
+        try:
+            with _create(dst) as o:
+                while left:
+                    chunk = f.read(min(left, 4 << 20))
+                    need(chunk, f"blob {bh}: pack truncated or a hole")
+                    left -= len(chunk)
+                    if not dec:
+                        put(o, chunk)
+                        continue
+                    try:
+                        b = dec.decompress(chunk, min(1 << 20, cap + 1 - out))
+                        while True:
+                            put(o, b)
+                            if dec.needs_input or dec.eof:
+                                break
+                            b = dec.decompress(b"", min(1 << 20, cap + 1 - out))
+                    except (lzma.LZMAError, EOFError) as e:
+                        raise PackError(f"blob {bh}: xz: {e}")
+                need(not dec or (dec.eof and not dec.unused_data and not left), f"blob {bh}: xz stream truncated or followed by data")
+            need(pin is None or out == pin, f"blob {bh}: {out} raw bytes, the manifest pins {pin}")
+        except PackError:
+            if os.path.exists(dst):
                 os.unlink(dst)
-                raise PackError(f"blob {bh} does not hash to its name")
+            raise
+        if hh.hexdigest() != bh:
+            os.unlink(dst)
+            raise PackError(f"blob {bh} does not hash to its name")
 
 
 def blob_entry(e, what):
