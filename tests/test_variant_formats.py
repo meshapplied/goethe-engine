@@ -1,27 +1,15 @@
 """One pack, a GGUF variant and a safetensors checkpoint variant: the user's files choose the branch by structure (header reads)."""
 import json
 import os
-import struct
 
 import pytest
 
 from goethe_engine import pack as P, structure
-from toypack import gguf, toy_pack
+from toypack import gguf, safetensors, toy_pack
 
 CK = {"a.weight": ("U8", [8, 32]), "a.weight_scale": ("F32", [8]), "b.weight": ("BF16", [64])}
 
 
-def safetensors(path, tensors):
-    """tensors {name: (dtype, shape)}, zero data."""
-    h, off = {}, 0
-    for n, (dt, sh) in tensors.items():
-        nb = {"BF16": 2, "F32": 4, "U8": 1}[dt]
-        for x in sh:
-            nb *= x
-        h[n] = dict(dtype=dt, shape=sh, data_offsets=[off, off + nb])
-        off += nb
-    hb = json.dumps(h).encode()
-    open(path, "wb").write(struct.pack("<Q", len(hb)) + hb + b"\0" * off)
 
 
 def checkpoint(d, algo="NVFP4"):
@@ -56,3 +44,21 @@ def test_gguf_and_checkpoint_variants_of_one_pack(tmp_path, key, mocklib):
     gguf(str(tmp_path / "x.gguf"), [("a.weight", [64, 8], 8), ("b.weight", [64], 0)])   # another GGUF type table: no variant
     with pytest.raises(P.PackError, match="not a model this pack was compiled for"):
         P.pick_variant(m, [str(tmp_path / "x.gguf")])
+
+
+def test_a_checkpoint_with_its_mtp_drafter_in_one_folder_binds_both(tmp_path, key, mocklib, monkeypatch, capsys):
+    # A downloaded repo keeps model shards and mtp.safetensors side by side: the shards bind the target, mtp.safetensors the drafter.
+    from goethe_engine import sign
+    d = tmp_path / "m"
+    d.mkdir()
+    safetensors(str(d / "model-00001-of-00001.safetensors"), {"a.weight": ("BF16", [64, 8]), "b.weight": ("BF16", [64])})
+    safetensors(str(d / "mtp.safetensors"), {"mtp.weight": ("BF16", [32, 8])})
+
+    def st(m):
+        m["variants"]["q4"]["structure"] = structure.describe([str(d / "model-00001-of-00001.safetensors")], [])
+        m["variants"]["d"]["structure"] = structure.describe([str(d / "mtp.safetensors")], [])
+    pack, _, _ = toy_pack(str(tmp_path / "p"), key, mocklib, spec=True, mutate=st)
+    monkeypatch.setattr(sign, "TRUSTED_KEY_IDS", (key.kid,))
+    P.main(["verify", pack, "--partial", "--model-dir", str(d)])
+    out = json.loads(capsys.readouterr().out)
+    assert (out["weights"], out["drafter"]) == (["model-00001-of-00001.safetensors"], ["mtp.safetensors"])

@@ -40,7 +40,7 @@ def main(argv=None):
     if a[:2] == ["index", "verify"] or a[:2] == ["pack", "match"]:
         from . import index
         return index.main(a[1:])
-    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["need"], ["runs"], ["-h"], ["--help"]):
+    if a[:1] == ["pack"] and a[1:2] in (["verify"], ["show"], ["need"], ["runs"], ["plan"], ["build"], ["-h"], ["--help"]):
         from . import pack
         pack.main(a[1:])
         return 0

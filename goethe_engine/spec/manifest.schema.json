@@ -3,7 +3,7 @@
  "title": "gc-pack manifest (pack ABI 3.x / 4.x)",
  "description": "Versioning: abi is MAJOR.MINOR.PATCH; a minor only adds optional fields and enum values (readers ignore unknown fields and skip buckets with unknown enum values); a major may change anything and a reader refuses another major. model.name is required from minor 1. Signed: the digest is sha256(domain + manifest bytes), domain gc-pack-3 or gc-pack-4 by the container magic.",
  "type": "object",
- "required": ["schema", "abi", "compiler", "model", "arch", "cuda", "hw", "runtime", "contracts", "buckets", "variants"],
+ "required": ["schema", "abi", "compiler", "model", "arch", "cuda", "runtime", "contracts", "buckets", "variants"],
  "properties": {
   "schema": {"enum": ["gc-pack"]},
   "abi": {"type": "string", "pattern": "[0-9]+\\.[0-9]+\\.[0-9]+"},
@@ -36,6 +36,7 @@
                    "properties": {"sha256": {"type": "string", "pattern": "[0-9a-f]{64}"}, "keys": {"type": "array"}, "kv": {"type": "object"},
                                   "tensors": {"type": "array"}}},
      "weights": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+     "source": {"type": "object", "required": ["hf_repo"], "properties": {"hf_repo": {"type": "string", "minLength": 1}, "revision": {"type": "string"}}},
      "desc": {"type": "object", "properties": {"format": {"type": "string"}, "quant": {"type": "string"}, "registry_key": {"type": "string"},
                                               "broken": {"type": "string"}, "weights_id": {"type": "string", "pattern": "[0-9a-f]{64}"}}},
      "pins": {"type": "object", "properties": {"capture": {}, "reference": {}}}

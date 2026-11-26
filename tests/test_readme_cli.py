@@ -100,4 +100,4 @@ def test_help_exits_0_with_text(cmd, capsys):
 
 
 def test_commands_of_the_choices_are_the_ones_the_dispatcher_routes():
-    assert choices(IDX, "cmd") == ("verify", "match") and choices(PK, "cmd") == ("verify", "show", "need", "runs")
+    assert choices(IDX, "cmd") == ("verify", "match") and choices(PK, "cmd") == ("verify", "show", "need", "runs", "plan", "build")

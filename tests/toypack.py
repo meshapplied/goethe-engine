@@ -35,6 +35,19 @@ class Key:
         P.sign_pack(path, self.priv)
 
 
+def safetensors(path, tensors):
+    """A safetensors file: tensors {name: (dtype, shape)}, zero data."""
+    h, off = {}, 0
+    for n, (dt, sh) in tensors.items():
+        nb = {"BF16": 2, "F16": 2, "F32": 4, "U8": 1}[dt]
+        for x in sh:
+            nb *= x
+        h[n] = dict(dtype=dt, shape=sh, data_offsets=[off, off + nb])
+        off += nb
+    hb = json.dumps(h).encode()
+    open(path, "wb").write(len(hb).to_bytes(8, "little") + hb + b"\0" * off)
+
+
 def parts(pack):
     """(manifest dict, {sha256: raw bytes}) of a toy pack (it stores its blobs raw)."""
     with open(pack, "rb") as f:

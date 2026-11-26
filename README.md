@@ -46,6 +46,8 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `pack show` | one line per bucket of a pack | 0, 1, 2 |
 | `pack need` | byte ranges to download for a model directory | 0, 1, 2 |
 | `pack runs` | does the visible device run this pack | 0, 1, 2, 3 |
+| `pack plan` | what each variant downloads, from a pack's first bytes | 0, 1, 2 |
+| `pack build` | build a pack from a declarative pack spec | 0, 1, 2 |
 
 ### `serve`
 
@@ -89,7 +91,8 @@ Prints the best index entry whose structure the files of `--model-dir` have, for
 ### `pack verify`
 
 Without `--partial`, extracts and hash-checks every blob. With `--partial`, checks the manifest signature and only the blobs the branch
-chosen by `--model-dir` needs, and adds `"weights"` (the model files to pass to `serve` as weights). Prints
+chosen by `--model-dir` needs, and adds `"weights"` (the model files to pass to `serve` as weights) and, when the folder holds the
+pack's drafter (an MTP file beside the checkpoint, for example), `"drafter"`. Prints
 `{"ok", "manifest_sha256", "keyid", "abi", "arch", "runtime", "buckets", "variants"}`. Exit 1: signature missing or bad, key not pinned,
 container malformed, blob missing or not hashing to its name, ABI major not 3 or 4, runtime not run here, `--arch` differs, no variant has the model's structure.
 
@@ -125,6 +128,30 @@ Exit 0 runs, 3 no SKU runs, 1 pack refused.
 
     goethe-engine pack runs model.gcpack; echo $?
 
+
+### `pack plan`
+
+Reads a PREFIX file (the first bytes of a pack: 16 bytes, header, manifest) and prints `{"manifest_sha256", "variants": [{"id", "role",
+"quant", "source", "files": [{"name", "bytes"}], "max_ctx", "runs", "why"}]}`: per variant the model files a download fetches and from where
+(`source` {hf_repo, revision}), its longest context, and whether the visible device runs one of its SKUs (`runs` null without a visible
+device). No weights are needed; compare `manifest_sha256` with the index entry's. From pack ABI minor 2 every variant carries `desc.quant` and
+`source`. Exit 1: prefix malformed, `--arch` differs.
+
+- `PREFIX`, `--arch sm_XX`
+
+    goethe-engine pack plan model.prefix --arch sm_120a
+
+### `pack build`
+
+Builds a pack from a pack SPEC (JSON, data only; the format is in `goethe_engine/build.py`): SKUs with their built library and
+`requires`, variants with `quant`, `source` and their model files, plan blobs, bucket templates (expanded per SKU), speculative pairs and
+measured bench rows. The builder reads what a build can read: structure from the model files, weight sizes, `cuda` from `nvcc`; `step_us`
+and the hw record hash only from `measured`. It writes through `pack.write` and prints `{"manifest_sha256", "out", "variants", "buckets"}`.
+Exit 1: a library not built, a manifest `pack.write` refuses, no `nvcc`.
+
+- `SPEC`, `--out F` (required), `--key PEM` (sign), `--store DIR` (pack 4)
+
+    goethe-engine pack build pack.json --out model.gcpack --key pack_key.pem
 ### Numerics tiers
 
 `--numerics` on `serve`, `pack verify` and `pack need` (default `invariant`). A tier picks the buckets whose measured contract matches.

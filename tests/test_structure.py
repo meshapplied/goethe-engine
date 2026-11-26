@@ -4,6 +4,7 @@ import struct
 import pytest
 
 from goethe_engine import structure as S
+from toypack import safetensors
 
 
 def _s(b):
@@ -25,17 +26,6 @@ def gguf(path, kv, tensors, align=32, pad=0):
     open(path, "wb").write(out)
 
 
-def safetensors(path, tensors):
-    """tensors {name: (dtype, shape)}, zero data."""
-    h, off = {}, 0
-    for n, (dt, sh) in tensors.items():
-        nb = 2 if dt == "BF16" else 4
-        for x in sh:
-            nb *= x
-        h[n] = dict(dtype=dt, shape=sh, data_offsets=[off, off + nb])
-        off += nb
-    hb = json.dumps(h).encode()
-    open(path, "wb").write(struct.pack("<Q", len(hb)) + hb + b"\0" * off)
 
 
 KV = {"general.architecture": "llama", "llama.rope.freq_base": 10000.0, "llama.block_count": 2, "tokenizer.ggml.model": "gpt2"}

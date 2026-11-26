@@ -87,7 +87,7 @@ def validate(m, loader_abi=ABI):
          f"not a pack manifest (schema {m.get('schema') if isinstance(m, dict) else None!r})")
     pv, la = semver(m.get("abi")), semver(loader_abi)
     need(pv[0] == la[0], f"pack abi {m['abi']} is major {pv[0]}; this loader ({loader_abi}) reads major {la[0]} (refused)")
-    for k in ("compiler", "model", "arch", "cuda", "hw", "runtime", "contracts", "buckets"):
+    for k in ("compiler", "model", "arch", "cuda", "runtime", "contracts", "buckets"):
         need(k in m, f"manifest lacks {k}")
     ws = m["model"].get("weights")
     need(isinstance(ws, list) and ws and all(isinstance(w, dict) and isinstance(w.get("file"), str) for w in ws),
@@ -105,7 +105,11 @@ def validate(m, loader_abi=ABI):
              and isinstance(st.get("kv"), dict) and isinstance(st.get("tensors"), list), f"variant {vid}: structure needs sha256, keys, kv and tensors")
         need(isinstance(v.get("weights"), list) and v["weights"] and all(isinstance(i, int) and 0 <= i < len(ws) for i in v["weights"]),
              f"variant {vid}: weights indices")
-    need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
+        src = v.get("source")
+        need(pv[1] < 2 or isinstance((v.get("desc") or {}).get("quant"), str) and v["desc"]["quant"] and isinstance(src, dict)
+             and isinstance(src.get("hf_repo"), str) and src["hf_repo"] and isinstance(src.get("revision", ""), str),
+             f"pack abi {m['abi']}: variant {vid} needs desc.quant and source {{hf_repo, revision}} from minor 2 (3.2, 4.2)")
+    need(isinstance(m.get("hw", {}), dict) and all(HEX.match(h or "") for h in m.get("hw", {}).values()), "hw record hashes must be sha256")
     raw = m.get("blob_raw", {})
     need(isinstance(raw, dict) and all(HEX.match(h) and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_RAW
                                        for h, n in raw.items()), "manifest blob_raw: {sha256: raw bytes <= 4 GiB}")
@@ -115,7 +119,7 @@ def validate(m, loader_abi=ABI):
             need(k in b, f"bucket {b.get('id')} lacks {k}")
         need(b["id"] not in ids, f"bucket id {b['id']} twice")
         ids.add(b["id"])
-        need(b["sku"] in m["hw"], f"bucket {b['id']}: sku {b['sku']} has no hw record hash")
+        need("step_us" not in b or b["sku"] in m.get("hw", {}), f"bucket {b['id']}: a measured step_us needs the hw record hash of sku {b['sku']}")
         need(b["lib"] in b["files"] and b.get("plan", b["lib"]) in b["files"], f"bucket {b['id']}: lib / plan not in its files")
         need(b["requires"]["arch"] in arches(m), f"bucket {b['id']}: arch {b['requires']['arch']} not in {sorted(arches(m))}")
         need(isinstance(b.get("bodies", {}), dict), f"bucket {b['id']}: bodies is not a map")
@@ -954,6 +958,25 @@ def pick_variant(m, files, role="target", allow_broken=False):
                     "or overlay")
 
 
+def plan(m, dev=None):
+    """Per variant: {id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}: the files a download of that variant fetches,
+    its longest context, and whether dev (a device record; None: not asked) runs one of its SKUs. Manifest only. O(variants x buckets)."""
+    roles, lim, out = {b["variant"]: b["role"] for b in m["buckets"]}, ctx_limit(m), []
+    for vid in sorted(roles):
+        v, bs = m["variants"][vid], [b for b in m["buckets"] if b["variant"] == vid]
+        runs = why = None
+        if dev is not None and roles[vid] == "target":
+            try:
+                pick_sku(dict(m, buckets=bs), dev)
+                runs = True
+            except PackError as e:
+                runs, why = False, str(e)
+        out.append(dict(id=vid, role=roles[vid], quant=(v.get("desc") or {}).get("quant"), source=v.get("source"),
+                        files=[dict(name=m["model"]["weights"][i]["file"], bytes=m["model"]["weights"][i].get("bytes")) for i in v["weights"]],
+                        max_ctx=min([max(b["maxctx"] for b in bs)] + ([lim[0]] if lim else [])), runs=runs, why=why))
+    return out
+
+
 def ctx_limit(m, ctx=None):
     """(maxctx, why) of the model's tightest limit (model.limits), or None; refuses a requested ctx beyond it with its why text."""
     lim = min(m["model"].get("limits") or [], key=lambda x: x["maxctx"], default=None)
@@ -1002,6 +1025,22 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     bs = [b for b in mv["buckets"] if b["sku"] == sku and want(b)]
     need(bs, f"no bucket of variant {v} for sku {sku} with numerics={numerics} act={act} kv={kv}")
     return v, bs
+
+
+def drafter_branch(m, sets, taken, skus, *, numerics="invariant", act="auto", kv="auto"):
+    """(drafter files, buckets) of the drafter variant a file set without the target's files (taken) has, for skus; ([], []) when the
+    pack has no drafter or the folder holds none. O(sets) header reads."""
+    if not any(b["role"] == "drafter" for b in m["buckets"]):
+        return [], []
+    want = wanted(numerics, act, kv)
+    for fs in sets:
+        if taken.isdisjoint(fs):
+            try:
+                v = pick_variant(m, fs, "drafter")
+            except PackError:
+                continue
+            return fs, [b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)]
+    return [], []
 
 
 PRICE_CACHE = {}       # (device uuid, driver, manifest sha, library sha) -> cost constants blob (gc_probe)
@@ -1091,8 +1130,12 @@ Exit 0 ok; 1 refused (signature missing or bad, key id not pinned, container mal
 ABI major not 3, runtime not run here, --arch differs, no variant has the model's structure), reason on stderr.
 runs (signature and manifest only: no blob, no weights, no model load) asks whether the visible device runs one of the pack's SKUs and
 prints {"runs": true|false, "sku": the SKU it would run or null, "device": name, "sms": N, "why": the reason or null}: exit 0 runs, 3 not.
+build reads a pack SPEC (JSON, data only; goethe_engine/build.py) and writes the pack to --out, signed with --key when given; it prints
+{"manifest_sha256", "out", "variants", "buckets"}.
+plan reads a PREFIX file and prints {"manifest_sha256", "variants": [{id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}]}:
+what each variant downloads and whether the visible device runs it (runs null without a visible device); no weights needed.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need", "runs"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1104,6 +1147,8 @@ prints {"runs": true|false, "sku": the SKU it would run or null, "device": name,
     ap.add_argument("--numerics", default="invariant", choices=NK.CHOICES)
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
+    ap.add_argument("--out", help="build: the pack file to write")
+    ap.add_argument("--key", help="build: the private key PEM to sign it with")
     return ap
 
 
@@ -1123,10 +1168,29 @@ def main(a):
                     last = e
             if bs:
                 chosen[:] = [os.path.basename(f) for f in fs]
-                return bs
+                dfs, dbs = drafter_branch(m, sets, set(fs), {b["sku"] for b in bs}, numerics=o.numerics, act=o.act, kv=o.kv)
+                drafter[:] = [os.path.basename(f) for f in dfs]
+                return bs + dbs
         raise last
-    chosen = []
+    chosen, drafter = [], []
     try:
+        if o.cmd == "build":
+            from .build import build
+            need(o.out, "build takes --out")
+            raw = build(o.file, o.out, o.key, store=o.store)
+            m = json.loads(raw)
+            print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), out=o.out, variants=sorted(m["variants"]), buckets=len(m["buckets"]))))
+            return
+        if o.cmd == "plan":
+            with open(o.file, "rb") as f:
+                v, _, _, raw, _ = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
+            m = check_manifest(raw, ABI4 if v == 4 else ABI, o.arch)
+            try:
+                dev = device()
+            except (OSError, subprocess.CalledProcessError, PackError):
+                dev = None
+            print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), variants=plan(m, dev))))
+            return
         if o.cmd == "need":
             with open(o.file, "rb") as f:
                 v, blobs, base, raw, end = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
@@ -1164,7 +1228,8 @@ def main(a):
                 st.ensure(None)
             print(json.dumps(dict(ok=True, manifest_sha256=st.manifest_sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
                                   **({"overlays": st.overlays, "arches": sorted(arches(m))} if st.overlays else {}),
-                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}))))
+                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}),
+                                  **({"drafter": drafter} if drafter else {}))))
         else:
             for b in m["buckets"]:
                 print(f"{b['id']:40s} {b['variant']:10s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
