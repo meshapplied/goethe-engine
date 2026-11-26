@@ -87,7 +87,7 @@ def validate(m, loader_abi=ABI):
          f"not a pack manifest (schema {m.get('schema') if isinstance(m, dict) else None!r})")
     pv, la = semver(m.get("abi")), semver(loader_abi)
     need(pv[0] == la[0], f"pack abi {m['abi']} is major {pv[0]}; this loader ({loader_abi}) reads major {la[0]} (refused)")
-    for k in ("compiler", "model", "arch", "cuda", "hw", "runtime", "contracts", "buckets"):
+    for k in ("compiler", "model", "arch", "cuda", "runtime", "contracts", "buckets"):
         need(k in m, f"manifest lacks {k}")
     ws = m["model"].get("weights")
     need(isinstance(ws, list) and ws and all(isinstance(w, dict) and isinstance(w.get("file"), str) for w in ws),
@@ -109,7 +109,7 @@ def validate(m, loader_abi=ABI):
         need(pv[1] < 2 or isinstance((v.get("desc") or {}).get("quant"), str) and v["desc"]["quant"] and isinstance(src, dict)
              and isinstance(src.get("hf_repo"), str) and src["hf_repo"] and isinstance(src.get("revision", ""), str),
              f"pack abi {m['abi']}: variant {vid} needs desc.quant and source {{hf_repo, revision}} from minor 2 (3.2, 4.2)")
-    need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
+    need(isinstance(m.get("hw", {}), dict) and all(HEX.match(h or "") for h in m.get("hw", {}).values()), "hw record hashes must be sha256")
     raw = m.get("blob_raw", {})
     need(isinstance(raw, dict) and all(HEX.match(h) and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_RAW
                                        for h, n in raw.items()), "manifest blob_raw: {sha256: raw bytes <= 4 GiB}")
@@ -119,7 +119,7 @@ def validate(m, loader_abi=ABI):
             need(k in b, f"bucket {b.get('id')} lacks {k}")
         need(b["id"] not in ids, f"bucket id {b['id']} twice")
         ids.add(b["id"])
-        need(b["sku"] in m["hw"], f"bucket {b['id']}: sku {b['sku']} has no hw record hash")
+        need("step_us" not in b or b["sku"] in m.get("hw", {}), f"bucket {b['id']}: a measured step_us needs the hw record hash of sku {b['sku']}")
         need(b["lib"] in b["files"] and b.get("plan", b["lib"]) in b["files"], f"bucket {b['id']}: lib / plan not in its files")
         need(b["requires"]["arch"] in arches(m), f"bucket {b['id']}: arch {b['requires']['arch']} not in {sorted(arches(m))}")
         need(isinstance(b.get("bodies", {}), dict), f"bucket {b['id']}: bodies is not a map")
@@ -1130,10 +1130,12 @@ Exit 0 ok; 1 refused (signature missing or bad, key id not pinned, container mal
 ABI major not 3, runtime not run here, --arch differs, no variant has the model's structure), reason on stderr.
 runs (signature and manifest only: no blob, no weights, no model load) asks whether the visible device runs one of the pack's SKUs and
 prints {"runs": true|false, "sku": the SKU it would run or null, "device": name, "sms": N, "why": the reason or null}: exit 0 runs, 3 not.
+build reads a pack SPEC (JSON, data only; goethe_engine/build.py) and writes the pack to --out, signed with --key when given; it prints
+{"manifest_sha256", "out", "variants", "buckets"}.
 plan reads a PREFIX file and prints {"manifest_sha256", "variants": [{id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}]}:
 what each variant downloads and whether the visible device runs it (runs null without a visible device); no weights needed.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1145,6 +1147,8 @@ what each variant downloads and whether the visible device runs it (runs null wi
     ap.add_argument("--numerics", default="invariant", choices=NK.CHOICES)
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
+    ap.add_argument("--out", help="build: the pack file to write")
+    ap.add_argument("--key", help="build: the private key PEM to sign it with")
     return ap
 
 
@@ -1170,6 +1174,13 @@ def main(a):
         raise last
     chosen, drafter = [], []
     try:
+        if o.cmd == "build":
+            from .build import build
+            need(o.out, "build takes --out")
+            raw = build(o.file, o.out, o.key, store=o.store)
+            m = json.loads(raw)
+            print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), out=o.out, variants=sorted(m["variants"]), buckets=len(m["buckets"]))))
+            return
         if o.cmd == "plan":
             with open(o.file, "rb") as f:
                 v, _, _, raw, _ = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked

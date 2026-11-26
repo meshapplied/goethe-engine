@@ -47,6 +47,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `pack need` | byte ranges to download for a model directory | 0, 1, 2 |
 | `pack runs` | does the visible device run this pack | 0, 1, 2, 3 |
 | `pack plan` | what each variant downloads, from a pack's first bytes | 0, 1, 2 |
+| `pack build` | build a pack from a declarative pack spec | 0, 1, 2 |
 
 ### `serve`
 
@@ -139,6 +140,18 @@ device). No weights are needed; compare `manifest_sha256` with the index entry's
 - `PREFIX`, `--arch sm_XX`
 
     goethe-engine pack plan model.prefix --arch sm_120a
+
+### `pack build`
+
+Builds a pack from a pack SPEC (JSON, data only; the format is in `goethe_engine/build.py`): SKUs with their built library and
+`requires`, variants with `quant`, `source` and their model files, plan blobs, bucket templates (expanded per SKU), speculative pairs and
+measured bench rows. The builder reads what a build can read: structure from the model files, weight sizes, `cuda` from `nvcc`; `step_us`
+and the hw record hash only from `measured`. It writes through `pack.write` and prints `{"manifest_sha256", "out", "variants", "buckets"}`.
+Exit 1: a library not built, a manifest `pack.write` refuses, no `nvcc`.
+
+- `SPEC`, `--out F` (required), `--key PEM` (sign), `--store DIR` (pack 4)
+
+    goethe-engine pack build pack.json --out model.gcpack --key pack_key.pem
 ### Numerics tiers
 
 `--numerics` on `serve`, `pack verify` and `pack need` (default `invariant`). A tier picks the buckets whose measured contract matches.

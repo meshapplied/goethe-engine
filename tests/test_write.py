@@ -41,7 +41,7 @@ def test_written_packs_stage_and_open(tmp_path, key, mocklib):
 @pytest.mark.parametrize("bad, why", [
     (lambda m, b: (m, b[:-1]), "blobs missing"),
     (lambda m, b: (m, b + [b"stray"]), "no bucket names"),
-    (lambda m, b: ({k: v for k, v in m.items() if k != "hw"}, b), "lacks hw"),
+    (lambda m, b: ({k: v for k, v in m.items() if k != "cuda"}, b), "lacks cuda"),
     (lambda m, b: (dict(m, abi="5.0.0"), b), "pack 3 and 4"),
     (lambda m, b: (dict(m, abi="4.0.0"), b), "pass store"),
 ])
