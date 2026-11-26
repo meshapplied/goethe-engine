@@ -559,7 +559,7 @@ def parser():
                     help="reference: bitwise llama.cpp, one stream; invariant: independent of the batch (invariant-hp: 16-bit "
                          "activations); tolerance: deterministic until a tolerance bucket exists; old names exact | deterministic warn")
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
-    ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
+    ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16 when the pack has it, else fp8)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
     ap.add_argument("--ref-type", choices=("decoder", "embedding", "encoder-decoder"), default="decoder", help="model type of the --ref model")
     ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")

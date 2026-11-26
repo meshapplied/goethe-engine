@@ -730,6 +730,11 @@ def feature(b, k):
     return b[k]
 
 
+def auto_kv(bs, kv):
+    """kv=auto: only the f16 buckets when there are any (what select runs, so what a download fetches), else bs."""
+    return ([b for b in bs if feature(b, "kv") == "f16"] or bs) if kv == "auto" else bs
+
+
 def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     """The bucket predicate of a request: numerics exact | deterministic (batch_invariant; exact also serves a handle of one
     sequence, which has no batch to depend on) | fast (tolerance buckets preferred by select, else deterministic), act auto
@@ -1037,8 +1042,7 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     need(sku is not None, f"several SKUs in this pack {skus}: name one")
     want = wanted(numerics, act, kv)
     bs = [b for b in mv["buckets"] if b["sku"] == sku and want(b)]
-    if kv == "auto":
-        bs = [b for b in bs if feature(b, "kv") == "f16"] or bs
+    bs = auto_kv(bs, kv)
     need(bs, f"no bucket of variant {v} for sku {sku} with numerics={numerics} act={act} kv={kv}")
     return v, bs
 
@@ -1055,10 +1059,7 @@ def drafter_branch(m, sets, taken, skus, *, numerics="invariant", act="auto", kv
                 v = pick_variant(m, fs, "drafter")
             except PackError:
                 continue
-            dbs = [b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)]
-            if kv == "auto":
-                dbs = [b for b in dbs if feature(b, "kv") == "f16"] or dbs
-            return fs, dbs
+            return fs, auto_kv([b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)], kv)
     return [], []
 
 

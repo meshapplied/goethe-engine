@@ -21,7 +21,7 @@ class Config:
     policy: str = "lpm"  # "fcfs" | "lpm"
     prefix_cache: bool | None = None  # None: on where the backend can share KV pages (paged, no recurrent state), else off
     spec_k: int = 0
-    kv_dtype: str = "f16"  # "fp8" only as an explicit opt-in
+    kv_dtype: str = "f16"  # api.Model sets the backend's: fp8 when asked, or with kv=auto on a pack that has only fp8 KV
 
 
 class Sequence:

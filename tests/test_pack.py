@@ -472,11 +472,11 @@ def test_numerics_request_selects_by_capability_records():
 
     # kv=auto prefers f16 when both exist and falls back to fp8 on fp8-only packs; explicit kv stays strict
     m_both = dict(contracts=["Hh"], runtime=dict(kind="gc-c", version=1),
-                  buckets=[bk("h_fp8", "Hh", 1, "batch_invariant", "a16", batch=False, kv="fp8"),
-                           bk("h_f16", "Hh", 1, "batch_invariant", "a16", batch=False, kv="f16")])
-    assert P.select(m_both, sku="s", B=1, want=P.wanted(kv="auto", single=True))["id"] == "h_f16"
-    assert P.single_stream(m_both, sku="s", want=P.wanted(kv="auto", single=True))["id"] == "h_f16"
-    assert P.select(m_both, sku="s", B=1, want=P.wanted(kv="fp8", single=True))["id"] == "h_fp8"
+                  buckets=[bk("a_fp8", "Hh", 1, "batch_invariant", "a16", batch=False, kv="fp8"),
+                           bk("z_f16", "Hh", 1, "batch_invariant", "a16", batch=False, kv="f16")])   # fp8 first by id and order
+    assert P.select(m_both, sku="s", B=1, want=P.wanted(kv="auto", single=True))["id"] == "z_f16"
+    assert P.single_stream(m_both, sku="s", want=P.wanted(kv="auto", single=True))["id"] == "z_f16"
+    assert P.select(m_both, sku="s", B=1, want=P.wanted(kv="fp8", single=True))["id"] == "a_fp8"
     m_fp8 = dict(contracts=["Hh"], runtime=dict(kind="gc-c", version=1),
                  variants=dict(v=dict(structure=dict(kv={}, tensors=[]), weights=[0])),
                  buckets=[dict(bk("h_fp8", "Hh", 1, "batch_invariant", "a16", batch=False, kv="fp8"), variant="v")])
@@ -484,6 +484,9 @@ def test_numerics_request_selects_by_capability_records():
     assert P.single_stream(m_fp8, sku="s", want=P.wanted(kv="auto", single=True))["id"] == "h_fp8"
     with pytest.raises(P.PackError, match="kv=f16.*the pack has"):
         P.need_bucket(m_fp8, "s", P.wanted(kv="f16"), "kv=f16")
+    both = m_both["buckets"]
+    assert [b["id"] for b in P.auto_kv(both, "auto")] == ["z_f16"], "kv=auto fetches only what select runs"
+    assert P.auto_kv(m_fp8["buckets"], "auto") == m_fp8["buckets"] and P.auto_kv(both, "fp8") == both
 
 
 
