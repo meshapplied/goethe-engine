@@ -1155,7 +1155,7 @@ build reads a pack SPEC (JSON, data only; goethe_engine/build.py) and writes the
 plan reads a PREFIX file and prints {"manifest_sha256", "variants": [{id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}]}:
 what each variant downloads and whether the visible device runs it (runs null without a visible device); no weights needed.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build", "sign"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1168,7 +1168,7 @@ what each variant downloads and whether the visible device runs it (runs null wi
     ap.add_argument("--act", default="auto")
     ap.add_argument("--kv", default="auto")
     ap.add_argument("--out", help="build: the pack file to write")
-    ap.add_argument("--key", help="build: the private key PEM to sign it with")
+    ap.add_argument("--key", help="build, sign: the private key PEM to sign it with")
     return ap
 
 
@@ -1200,6 +1200,10 @@ def main(a):
             raw = build(o.file, o.out, o.key, store=o.store)
             m = json.loads(raw)
             print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), out=o.out, variants=sorted(m["variants"]), buckets=len(m["buckets"]))))
+            return
+        if o.cmd == "sign":
+            need(o.key, "sign takes --key")
+            print(json.dumps(dict(sig=o.file + ".sig", keyid=sign_pack(o.file, o.key))))
             return
         if o.cmd == "plan":
             with open(o.file, "rb") as f:

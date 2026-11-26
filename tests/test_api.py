@@ -119,3 +119,13 @@ def test_fp8_only_pack_kv_auto_and_explicit(tmp_path, key, mocklib, monkeypatch)
         api.open(pack, w, B=2, sku="mock", kv="fp8", config={"kv_dtype": "f16"}, trusted=(key.kid,))
     with pytest.raises(P.PackError, match="kv=f16"):
         api.open(pack, w, B=2, sku="mock", kv="f16", trusted=(key.kid,))
+
+
+def test_a_checkpoint_dir_stands_for_the_files_its_index_names(tmp_path):
+    # An MTP drafter beside the checkpoint is not one of its weights; without an index every *.safetensors is.
+    for f in ("model-00001-of-00001.safetensors", "mtp.safetensors"):
+        (tmp_path / f).write_bytes(b"x")
+    assert api.files(str(tmp_path)) == [str(tmp_path / f) for f in ("model-00001-of-00001.safetensors", "mtp.safetensors")]
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {"a": "model-00001-of-00001.safetensors"}}')
+    assert api.files(str(tmp_path)) == [str(tmp_path / "model-00001-of-00001.safetensors")]
+    assert api.files([str(tmp_path / "mtp.safetensors")]) == [str(tmp_path / "mtp.safetensors")]
