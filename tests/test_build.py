@@ -44,12 +44,14 @@ def test_a_built_pack_opens_and_carries_only_what_was_measured(tmp_path, key, mo
     m = json.loads(B.build(sp, out, key.priv, cuda="12.8"))
     assert {b["id"] for b in m["buckets"]} == {"target.mock.K1.2.256", "target.mock.K1.8.256"}
     assert m["hw"] == {} and not any("step_us" in b for b in m["buckets"])
-    assert m["variants"]["q4"]["desc"]["quant"] == "q4_k_m" and m["model"]["weights"][0]["bytes"] == os.path.getsize(tmp_path / "s" / "w.gguf")
+    w = str(tmp_path / "s" / "w.gguf")
+    assert m["variants"]["q4"]["desc"]["quant"] == "q4_k_m" and m["model"]["weights"][0] == dict(file="w.gguf", bytes=os.path.getsize(w),
+                                                                                               sha256=hashlib.sha256(open(w, "rb").read()).hexdigest())
     be = GcBackend(out, str(tmp_path / "s" / "w.gguf"), sku="mock", trusted=(key.kid,), B=8)
     assert be.bucket["ncol"] == 8
     be.close()
     dev = dict(name="toy", cc="12.0", sms=170, smem_block=101376, uuid="u")
-    sp2 = spec_dir(str(tmp_path / "t"), mocklib, measured=dict(mock=dict(device=dev, step_us={"8.256": 950.0})))
+    sp2 = spec_dir(str(tmp_path / "t"), mocklib, measured=dict(mock=dict(device=dev, step_us={"K1.8.256": 950.0})))
     m2 = json.loads(B.build(sp2, str(tmp_path / "t.gcpack"), cuda="12.8"))
     us = {b["id"]: b.get("step_us") for b in m2["buckets"]}
     assert us == {"target.mock.K1.2.256": None, "target.mock.K1.8.256": 950.0}
@@ -77,3 +79,24 @@ def test_pack_build_cli_writes_a_signed_pack(tmp_path, key, mocklib, monkeypatch
     j = json.loads(capsys.readouterr().out)
     assert (j["out"], j["variants"], j["buckets"]) == (out, ["d", "q4"], 2) and os.path.exists(out + ".sig")
     assert P.verify(out, trusted=(key.kid,))
+
+
+def test_templates_are_named_by_contract_and_suffix_and_never_twice(tmp_path, mocklib):
+    # Two contracts may share a suffix (8v.4096 under K1 and K1_fast): spec pairs and bench rows name contract.suffix, a repeat is refused.
+    sp = spec_dir(str(tmp_path / "s"), mocklib, measured=dict(mock=dict(device={}, step_us={"K2.8.256": 1.0})))
+    spec = json.load(open(sp))
+    spec["contracts"] = ["K1", "K2"]
+    spec["buckets"] += [dict(spec["buckets"][1], contract="K2")]
+    spec["buckets"][1].update(io=dict(accept=True))
+    spec["buckets"][2].update(io=dict(accept=True))
+    spec["buckets"].append(dict(spec["buckets"][0], suffix="1.256", role="drafter", variant="d", ncol=1, batch=False))
+    spec["spec"] = [dict(name="ar", target="K2.8.256", drafter="K1.1.256", policy=dict(kind="ar", K="3"))]
+    json.dump(spec, open(sp, "w"))
+    m = B.manifest(json.load(open(sp)), str(tmp_path / "s"), cuda="12.8")[0]
+    P.validate(m, m["abi"])
+    assert m["spec"][0]["target"] == "target.mock.K2.8.256"
+    assert {b["id"]: b.get("step_us") for b in m["buckets"]}["target.mock.K2.8.256"] == 1.0
+    spec["buckets"].append(dict(spec["buckets"][0]))
+    json.dump(spec, open(sp, "w"))
+    with pytest.raises(P.PackError, match="named twice"):
+        B.manifest(json.load(open(sp)), str(tmp_path / "s"), cuda="12.8")
