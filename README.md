@@ -41,6 +41,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `serve` | OpenAI-compatible server for a pack and its weights | 0, 1, 2 |
 | `worker` | worker protocol v1 over a unix socket | 0, 2 |
 | `index verify` | check a signed pack index | 0, 1, 2 |
+| `index build` | write and sign a pack index from signed packs | 0, 1, 2 |
 | `pack match` | pick the pack for a model directory from an index | 0, 1, 2, 3 |
 | `pack verify` | check a pack's signature and blobs | 0, 1, 2 |
 | `pack show` | one line per bucket of a pack | 0, 1, 2 |
@@ -79,6 +80,19 @@ Exit 1: bad signature, key not pinned, schema, `serial < --last-serial`, expired
 
     goethe-engine index verify --index index.json --sig index.sig --last-serial 7
 
+
+### `index build`
+
+Writes `index.json` and `index.sig` into `--out` for the signed packs given with `--pack` (each with `PACK.sig` beside it), signed with
+`--key`: one entry per (arch, target variant). An entry's `model` is that variant's `source` and files (name, bytes, sha256), its
+`structure` that variant's fingerprint, and `model.with` the drafters its speculative pairs name, each with its own source and files.
+The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two formats in
+one variant.
+
+- `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--tier T` (default
+  base), `--min-engine V` (default this engine's version)
+
+    goethe-engine index build --pack model.gcpack --serial 9 --expires 2027-03-01T00:00:00Z --key index_key.pem --out site/
 ### `pack match`
 
 Prints the best index entry whose structure the files of `--model-dir` have, for `--arch`, ABI major 3, a runtime this engine runs and

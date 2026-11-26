@@ -85,7 +85,7 @@ def manifest(spec, base, cuda=None):
             P.need(x["target"] in by_name and x["drafter"] in by_name, f"spec {x.get('name')}: {x['target']} / {x['drafter']} name no bucket template")
             spec_out.append(dict(x, target=by_name[x["target"]], drafter=by_name[x["drafter"]]))
     m = dict(schema=P.SCHEMA, abi=spec["abi"], compiler=dict(name="goethe-engine pack build", version=__version__), model=dict(spec["model"], weights=weights),
-             arch=spec["skus"][0]["arch"], cuda=cuda or nvcc_version(), hw=hw, runtime=spec["runtime"], contracts=spec["contracts"],
+             arch=spec["skus"][0]["arch"], arches={s["arch"]: dict(platform="cuda", cc=s["cc"]) for s in spec["skus"]}, cuda=cuda or nvcc_version(), hw=hw, runtime=spec["runtime"], contracts=spec["contracts"],
              variants=variants, buckets=buckets, spec=spec_out)
     return m, list(blobs.values())
 
