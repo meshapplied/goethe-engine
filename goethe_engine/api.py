@@ -36,10 +36,16 @@ def capabilities(pack):
 
 
 def files(weights):
-    """Weight file paths: a directory stands for its *.safetensors shards (an HF checkpoint), sorted."""
+    """Weight file paths: a directory stands for its HF checkpoint, the files its model.safetensors.index.json names (an MTP drafter
+    beside it is not one of them), else its *.safetensors, sorted."""
     out = []
     for w in [weights] if isinstance(weights, str) else weights:
-        out += sorted(os.path.join(w, f) for f in os.listdir(w) if f.endswith(".safetensors")) if os.path.isdir(w) else [w]
+        if not os.path.isdir(w):
+            out.append(w)
+            continue
+        ix = os.path.join(w, "model.safetensors.index.json")
+        names = set(json.load(io.open(ix))["weight_map"].values()) if os.path.isfile(ix) else [f for f in os.listdir(w) if f.endswith(".safetensors")]
+        out += sorted(os.path.join(w, f) for f in names)
     return out
 
 
