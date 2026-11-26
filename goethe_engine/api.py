@@ -66,7 +66,9 @@ class Model:
                 print(f"goethe-engine: max_model_len {c['max_model_len']} is above this handle's {lim}; using {lim}",
                       file=sys.stderr, flush=True)
                 c["max_model_len"] = lim
-            self.cfg = replace(Config(max_model_len=getattr(be, "max_len", None) or 4096, prefix_cache=getattr(be, "prefix_cache", None)),
+            kv_dtype = be.geometry.dtype if kv == "auto" else kv
+            self.cfg = replace(Config(max_model_len=getattr(be, "max_len", None) or 4096,
+                                      prefix_cache=getattr(be, "prefix_cache", None), kv_dtype=kv_dtype),
                                **{k: v for k, v in c.items() if v is not None})
         self.runner = R.runner(self.backend, self.cfg, **({"eos_ids": eos_ids} if self.type == "decoder" else {}))
 

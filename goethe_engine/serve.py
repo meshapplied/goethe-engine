@@ -525,7 +525,7 @@ def build(args):
                        drafter=args.weights[1] if len(args.weights) > 1 and not media else None,
                        device=args.device, store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act,
                        kv=args.kv, config=dict(max_num_seqs=args.max_running_requests, max_model_len=args.context_length,
-                                               kv_dtype="f16" if args.kv == "auto" else args.kv))
+                                               kv_dtype=None if args.kv == "auto" else args.kv))
         if mo.type == "media":                   # the library tokenizes; the text model GGUF carries the template and the pieces
             return mo.runner, None, args.context_length or mo.backend.bucket["maxctx"]
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
