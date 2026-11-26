@@ -69,6 +69,7 @@ class Engine:
         self._out = {}
         self._sp, self.spec_window = {}, deque(maxlen=64)    # per live sequence [rounds, accepted, drafted]; the last 64 finished requests
         self._async = bool(getattr(backend, "async_step", False))
+        self._spec_chain = bool(getattr(backend, "spec_prev_token", False))   # a spec round with GC_W_PREV_TOKEN takes its token and position from the device
         self._dev_sample = bool(getattr(backend, "device_sample", False))
         self._dev_bitmask = bool(getattr(backend, "device_bitmask", False))
         self._inflight = None        # (items, work, handle) currently executing on device
@@ -244,38 +245,49 @@ class Engine:
     def _can_chain(self, items, work, dev_tok):
         if not (self._async and dev_tok and items) or self.inbox or self.sched.waiting or self._discard:
             return False
-        if self.drafter is not None or self.feats or self.width or self.kv.snaps or self.kv.bsnaps:
+        if self.drafter is not None or self.feats or self.kv.snaps or self.kv.bsnaps:
+            return False
+        if self.width and not (self._spec_chain and len(items) == 1):
             return False
         bs, pool, cache = self.kv.bs, self.kv.pool, self.kv.cache
         need_free = 0
         for it, w in zip(items, work):
             s = it.seq
-            if it.want != 1 or it.spec or it.tree.tokens or s.finished or s.grammar is not None or s.forks or s.restore is not None:
+            if it.want != 1 or it.spec != bool(self.width) or it.tree.tokens or s.finished or s.grammar is not None or s.forks or s.restore is not None:
                 return False
             if not (w.greedy or w.sample) or s.nout + 1 >= s.limit:
                 return False
-            npos = w.pos + len(w.tokens)
-            if npos >= self.cfg.max_model_len:
+            if self.width and (not w.greedy or s.params.stop_sequences):
                 return False
-            if cache and (npos // bs) > s.tpages:
+            pos, rows = self._chain_rows(s, w)
+            if rows > self.cfg.max_model_len:
+                return False
+            if cache and (pos // bs) > s.tpages:
                 return False
             nb = len(s.blocks)
-            need = -(-(npos + 1) // bs)
+            need = -(-rows // bs)
             if need > nb:
                 need_free += need - nb
             elif nb and pool.ref[s.blocks[-1]] > 1:
                 return False
         return need_free <= len(pool.free)
 
+    def _chain_rows(self, s, w):
+        """(placeholder position, rows to reserve); a spec round's commit count is device-side, so bound it by width."""
+        if self.width:
+            return s.computed + 1, s.computed + 2 * self.width
+        npos = w.pos + len(w.tokens)
+        return npos, npos + 1
+
     def _chain_next(self, items, work):
         next_items, next_work = [], []
         for it, w in zip(items, work):
             s = it.seq
-            npos = w.pos + len(w.tokens)
-            pairs = self.kv.reserve(s, npos + 1)
+            pos, rows = self._chain_rows(s, w)
+            pairs = self.kv.reserve(s, rows)
             assert pairs == [], "chained reserve must not copy or fail"
-            next_items.append(Item(s, 1, _EMPTY_TREE))
-            next_work.append(Work(s.sid, [0], npos, s.blocks, 1, w.greedy, False, None, False,
+            next_items.append(Item(s, 1, _EMPTY_TREE, it.spec))
+            next_work.append(Work(s.sid, [0], pos, s.blocks, 1, w.greedy, it.spec, None, False,
                                   w.sample, w.temperature, w.top_p, w.top_k, w.seed, w.step_idx + 1,
                                   None, True, s.blocks_ver))
         return next_items, next_work
