@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-r"""Kernel pack reader (pack ABI 3). A pack is ONE file, NAME.gcpack, for one model and GPU architecture. Layout (stdlib framing):
+r"""Kernel pack reader and writer (pack ABI 3 and 4). A pack is ONE file, NAME.gcpack, for one model; its buckets may target several GPU
+architectures (3.1 arches). write() is the one way to make a pack: it validates the manifest and frames it. Layout (stdlib framing):
 
   b"GCPACK3\n"  u64le N  header (N bytes of JSON {"manifest": [off, len], "blobs": {sha256: [off, len] or [off, len, "xz"]}})  payload
   offsets count from the end of the header; manifest = manifest.json, blobs = every bucket file, named by the sha256 of its raw bytes;
@@ -407,6 +408,63 @@ def read_container_v(f, total):
     return (4 if mg == MAGIC4 else 3), blobs, base, raw, base + mo + ml
 
 
+def frame(path, raw, blobs, major=3):
+    """Write a container whole or not at all: the magic of major, header {manifest, blobs}, manifest bytes raw, then the stored blobs
+    ({sha256: stored bytes, or (stored bytes, "xz")}; {} for pack 4, whose blobs live in a store). Checks nothing: write() is the checked
+    path, tests use this for packs write() refuses. O(total bytes) time, O(1) extra space."""
+    hdr, off, parts = {"manifest": [0, len(raw)], "blobs": {}}, len(raw), [raw]
+    for h, b in blobs.items():
+        b, *codec = b if isinstance(b, tuple) else (b,)
+        hdr["blobs"][h] = [off, len(b), *codec]
+        off += len(b)
+        parts.append(b)
+    hb = json.dumps(hdr).encode()
+    _atomic(path, [(MAGIC4 if major == 4 else MAGIC) + len(hb).to_bytes(8, "little") + hb, *parts])
+
+
+def _atomic(path, chunks):
+    """path holds chunks, whole or not at all (a temp file beside it, then rename)."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".gcpack.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for c in chunks:
+                f.write(c)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def write(path, manifest, blobs, store=None):
+    """Make a pack: manifest (a dict) validated for its own abi major (3 or 4); blobs (bytes, named here by sha256) exactly the ones its
+    buckets name; each stored xz-compressed when that is smaller, every raw size pinned (blob_raw). Pack 3 embeds the blobs; pack 4 puts
+    them in the store directory as <sha256>[.xz]. Returns the manifest bytes (what sign_pack signs). O(total blob bytes) time."""
+    by = {hashlib.sha256(b).hexdigest(): b for b in blobs}
+    major = semver(manifest.get("abi"))[0]
+    need(major in (3, 4), f"pack abi {manifest.get('abi')}: write makes pack 3 and 4")
+    m = validate(dict(manifest), manifest["abi"])
+    named = set(blob_hashes(m["buckets"]))
+    need(named <= set(by), f"blobs missing: {sorted(named - set(by))}")
+    need(set(by) <= named, f"blobs no bucket names: {sorted(set(by) - named)}")
+    need(major == 3 or store, "pack 4 puts its blobs in a store: pass store")
+    m = validate(dict(m, blob_raw={h: len(by[h]) for h in sorted(named)}), m["abi"])   # the reader checks xz and store blobs against these
+    raw = (json.dumps(m, indent=1, sort_keys=True) + "\n").encode()
+    stored = {}
+    for h in sorted(named):
+        z = lzma.compress(by[h])
+        stored[h] = (z, "xz") if len(z) < len(by[h]) else by[h]
+    if major == 3:
+        frame(path, raw, stored)
+        return raw
+    os.makedirs(store, exist_ok=True)
+    for h, b in stored.items():
+        name = os.path.join(store, h + (".xz" if isinstance(b, tuple) else ""))
+        if not os.path.exists(name):                   # content-addressed: the same name is the same bytes, hash-checked on read
+            _atomic(name, [b[0] if isinstance(b, tuple) else b])
+    frame(path, raw, {}, major=4)
+    return raw
+
+
 def _open_signed(path, sig, domain, trusted):
     """(open file, header blobs, base offset, total size, manifest bytes, signer key id, major) of a container whose manifest is signed over
     sha256(domain + manifest bytes) by the detached signature sig (default PATH.sig); domain None: the pack domain its magic fixes."""
@@ -511,6 +569,17 @@ def arch_runs(arch, cc):
     return "" if have[0] == want[0] and have[1] >= want[1] else f"{arch} SASS runs only on cc {want[0]}.Z with Z >= {want[1]}"
 
 
+def arch_distance(arch, cc):
+    """How far code for arch (one arch_runs accepts on cc) is from the device: 0 native SASS, the minor-version gap for older SASS of
+    the family, 100 + the gap for PTX (driver JIT); 0 for a target that is not cuda's. O(1)."""
+    g = re.fullmatch(r"(sm|compute)_(\d+)(\d)([af]?)", arch or "")
+    if not g or not re.fullmatch(r"\d+\.\d+", cc or ""):
+        return 0
+    have = tuple(int(x) for x in cc.split("."))
+    gap = (have[0] - int(g[2])) * 10 + have[1] - int(g[3])
+    return gap if g[1] == "sm" else 100 + gap
+
+
 def cuda_arch_ok(dev, req, m):
     """Why a cuda device cannot run a bucket that requires req in manifest m ("" if it can): the bucket's arch on the device's compute
     capability (arch_runs), the driver's CUDA version against the one the libraries were built with."""
@@ -537,8 +606,9 @@ def fits(dev, req, m):
 
 def pick_sku(m, dev, sku=None):
     """The SKU (variant) of the pack to run on dev: among the SKUs whose requires fit dev (fits), the exact (name, SMs) one, else the
-    least dev["price"](sku, dev) (the pack's gc_probe / gc_price cost model, lib_price; an unpriced SKU ranks after the priced), then the most SMs and smem
-    (fewest idle). No fit: refused with every SKU's reason and what to do instead."""
+    nearest arch (arch_distance: native SASS, then older SASS of the family, then PTX), then the least dev["price"](sku, dev) (the pack's
+    gc_probe / gc_price cost model, lib_price; an unpriced SKU ranks after the priced), then the most SMs and smem (fewest idle). No fit:
+    refused with every SKU's reason and what to do instead."""
     req = {}
     for b in m["buckets"]:
         req.setdefault(b["sku"], b["requires"])
@@ -557,7 +627,8 @@ def pick_sku(m, dev, sku=None):
         return exact[0]
     price = dev.get("price")
     us = {s: price(s, dev) if price else None for s in ok}
-    return min(ok, key=lambda s: (us[s] is None, us[s] or 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
+    near = {s: arch_distance(req[s]["arch"], dev.get("cc")) for s in ok}
+    return min(ok, key=lambda s: (near[s], us[s] is None, us[s] or 0, -req[s]["sms"], -req[s].get("smem_block", 0), s))
 
 
 def device(idx=None):
