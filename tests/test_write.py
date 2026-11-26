@@ -7,19 +7,14 @@ import pytest
 
 from goethe_engine import pack as P
 from goethe_engine.gc_c import GcBackend
-from toypack import toy_pack
+from toypack import parts, toy_pack
 
 
 def toy_parts(d, key, lib):
     """(manifest dict, [blob bytes], weights path) of the toy pack."""
     pack, w, _ = toy_pack(d, key, lib, sign=False)
-    with open(pack, "rb") as f:
-        _, blobs, base, raw, _ = P.read_container_v(f, os.path.getsize(pack))
-        data = []
-        for off, ln, *_ in blobs.values():
-            f.seek(base + off)
-            data.append(f.read(ln))
-    return json.loads(raw), data, w
+    m, data = parts(pack)
+    return m, list(data.values()), w
 
 
 def test_written_packs_stage_and_open(tmp_path, key, mocklib):
@@ -37,6 +32,7 @@ def test_written_packs_stage_and_open(tmp_path, key, mocklib):
     assert sorted(pins.values()) == sorted(len(b) for b in blobs)          # raw sizes pinned from the data, never typed in
     small = [h for h, n in pins.items() if n == 2]                          # the plan blob b"{}": xz would be larger, so stored raw
     assert small and all(os.path.exists(os.path.join(store, h)) for h in small)
+    assert any(n.endswith(".xz") for n in os.listdir(store))              # the library compresses: stored as xz, read back against its pin
     be = GcBackend(p4, w, sku="mock", trusted=(key.kid,), B=8, store=store)
     assert be.bucket["ncol"] == 8
     be.close()

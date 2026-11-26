@@ -35,6 +35,17 @@ class Key:
         P.sign_pack(path, self.priv)
 
 
+def parts(pack):
+    """(manifest dict, {sha256: raw bytes}) of a toy pack (it stores its blobs raw)."""
+    with open(pack, "rb") as f:
+        _, blobs, base, raw, _ = P.read_container_v(f, os.path.getsize(pack))
+        data = {}
+        for h, (off, ln, *_) in blobs.items():
+            f.seek(base + off)
+            data[h] = f.read(ln)
+    return json.loads(raw), data
+
+
 def _str(b):
     return len(b).to_bytes(8, "little") + b
 
