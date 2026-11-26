@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class KVGeometry:
     block_size: int
     num_blocks: int
@@ -16,7 +16,7 @@ class KVGeometry:
         return 2 * self.layers * self.block_size * self.kv_heads * self.head_dim * (1 if self.dtype == "fp8" else 2)
 
 
-@dataclass
+@dataclass(slots=True)
 class Work:
     sid: int  # sequence id, stable while the sequence lives
     tokens: list  # tokens to run; token i writes KV row pos + i
@@ -27,6 +27,15 @@ class Work:
     spec: bool = False  # a decode the backend may advance by a whole speculative round (needs spec_width)
     parents: list | None = None  # tree verify: parent index of each token (-1: the cached prefix); None: a chain
     feats: bool = False  # also return the tap features of every token row (caps taps)
+    sample: bool = False  # ABI 1.3: device-side sampling or masked argmax using fields below
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    seed: int = 0
+    step_idx: int = 0
+    bitmask: object = None  # optional contiguous uint32[ceil(vocab/32)] packed token bitmask
+    prev_token: bool = False  # ABI 1.3 GC_W_PREV_TOKEN: read tokens[0] from device last_token[sid]
+    blocks_ver: int = -1  # monotonic version of blocks (< 0: compare by value)
 
 
 class Backend(Protocol):

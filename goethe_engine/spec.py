@@ -19,7 +19,7 @@ from .sampling import draw, host, mix, uniform
 SALT_ACC, SALT_RES, SALT_DRAFT = 1 << 40, 1 << 41, 1 << 42  # uniform streams: acceptance coins, residual, drafter
 
 
-@dataclass
+@dataclass(slots=True)
 class Tree:
     tokens: list  # drafted tokens: node i + 1
     parents: list  # node of each one's parent: 0 is the anchor, j is tokens[j - 1]
@@ -49,7 +49,7 @@ class Tree:
 
     @property
     def is_chain(self):
-        return self.parents == list(range(len(self.parents)))
+        return not self.parents or self.parents == list(range(len(self.parents)))
 
     def kids(self):
         """Children of every node (node 0 the anchor) in draft order."""

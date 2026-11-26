@@ -270,7 +270,15 @@ def key(tmp_path_factory):
 def mocklib(tmp_path_factory):
     out = str(tmp_path_factory.mktemp("mock") / "libgck.so")
     src = os.path.join(os.path.dirname(__file__), "mock", "gck_mock.c")
-    subprocess.run(["cc", "-std=c99", "-Wall", "-O1", "-shared", "-fPIC", "-o", out, src], check=True)
+    subprocess.run(["cc", "-std=c99", "-Wall", "-O1", "-shared", "-fPIC", "-o", out, src, "-lm"], check=True)
+    return out
+
+
+@pytest.fixture(scope="session")
+def mocklib12(tmp_path_factory):
+    out = str(tmp_path_factory.mktemp("mock12") / "libgck.so")
+    src = os.path.join(os.path.dirname(__file__), "mock", "gck_mock.c")
+    subprocess.run(["cc", "-std=c99", "-Wall", "-O1", "-DGC_MOCK_ABI_12", "-shared", "-fPIC", "-o", out, src, "-lm"], check=True)
     return out
 
 
