@@ -34,7 +34,7 @@ class Work:
     seed: int = 0
     step_idx: int = 0
     bitmask: object = None  # optional contiguous uint32[ceil(vocab/32)] packed token bitmask
-    prev_token: bool = False  # ABI 1.3 GC_W_PREV_TOKEN: read tokens[0] from device last_token[sid]
+    prev_token: bool = False  # ABI 1.3 GC_W_PREV_TOKEN: read tokens[0] from device last_token[sid]; with spec, pos is a lower bound and the backend (spec_prev_token) uses its own
     blocks_ver: int = -1  # monotonic version of blocks (< 0: compare by value)
 
 

@@ -333,6 +333,7 @@ class GcBackend:
         self.device_sample = bool(lo.flags & L_DEVICE_SAMPLE)
         self.device_bitmask = bool(lo.flags & L_DEVICE_BITMASK)
         self.async_step = bool(lo.flags & L_ASYNC) and hasattr(self.L, "gc_step_begin") and hasattr(self.L, "gc_step_wait")
+        self.spec_prev_token = bool(self.async_step and self.spec and (b.get("spec_caps") or {}).get("prev_token"))
         self.flat_batch = bool(lo.flags & L_FLAT)
         self.graph_buckets = tuple(int(lo.graph_buckets[i]) for i in range(min(int(lo.n_graph_buckets), 16)) if lo.graph_buckets[i])
         if lo.flags & L_SPEC:
