@@ -1,12 +1,14 @@
-"""Pack index: which signed pack serves which model on which arch. Verify and match only; offline, fail-closed.
+"""Pack index: which signed pack serves which model on which arch. Build, verify and match; offline, fail-closed.
 
 index.json (signed by index.sig, sign.py scheme, detached over the exact bytes):
   {"schema": "gc-pack-index", "version": 3, "serial": int >= 1 (monotonic), "issued": "YYYY-MM-DDTHH:MM:SSZ",
    "expires": same format,
    "entries": [{"model": {"hf_repo": str, "revision": str, "format": "gguf" | "safetensors",    # hf_repo, revision: informational
                           "structure": [{"variant": str, "sha256": hex, "keys": [str]}],        # one per variant in the pack (structure.py)
-                          "files": [{"name": str, "bytes": int, "sha256": hex}]},               # optional, informational: the model files the pack was
+                          "files": [{"name": str, "bytes": int, "sha256": hex}],                # optional, informational: the model files the pack was
                                                                                                 #   verified on (what a client downloads); never used to match
+                          "with": [{"role": "drafter", "variant": str, "hf_repo": str,        # optional: files a client downloads with the target
+                                    "revision": str, "files": [...]}]},                       #   (its drafter, possibly from another repo)
                 "arch": "sm_120a", "abi_major": 3, "runtime": {"kind": str, "version": int}, "tier": str,
                 "file": "<model>.gcpack",                             # the asset name (ASCII slug), one file per model
                 "manifest_sha256": hex,                               # sha256 of the pack's manifest bytes: what `sig` signs (with the
@@ -15,6 +17,7 @@ index.json (signed by index.sig, sign.py scheme, detached over the exact bytes):
 Unknown extra keys are ignored; any other "version" is refused."""
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -64,6 +67,12 @@ def validate_entry(e, i):
     need(fl is None or (isinstance(fl, list) and all(isinstance(x, dict) and isinstance(x.get("name"), str) and x["name"] and "/" not in x["name"]
                                                      and isinstance(x.get("bytes"), int) and x["bytes"] >= 0 and HEX.match(str(x.get("sha256")))
                                                      for x in fl)), f"{w}: model.files is a list of {{name, bytes, sha256}}")
+    wl = m.get("with")
+    need(wl is None or (isinstance(wl, list) and all(isinstance(x, dict) and x.get("role") == "drafter" and isinstance(x.get("variant"), str)
+                                                     and isinstance(x.get("hf_repo"), str) and x["hf_repo"] and isinstance(x.get("revision", ""), str)
+                                                     and isinstance(x.get("files"), list) and all(isinstance(f, dict) and isinstance(f.get("name"), str)
+                                                     and "/" not in f["name"] and HEX.match(str(f.get("sha256"))) for f in x["files"]) for x in wl)),
+         f"{w}: model.with is a list of {{role drafter, variant, hf_repo, revision, files}}")
     need(isinstance(e.get("arch"), str) and re.fullmatch(r"sm_\d+[a-z]?", e["arch"]), f"{w}: arch is not sm_XX")
     need(e.get("abi_major") == 3, f"{w}: abi_major")
     r = e.get("runtime")
@@ -98,6 +107,56 @@ def verify(raw, sig, last_serial=0, now=None, trusted=None):
     need(ix["serial"] >= last_serial, f"serial {ix['serial']} < last seen {last_serial}: rollback (refused)")
     need((now or datetime.now(timezone.utc)) < exp, f"index expired {ix['expires']} (refused)")
     return ix, kid
+
+
+def source(m, vid):
+    """{hf_repo, revision, format, files [{name, bytes, sha256}]} of variant vid of manifest m: what a client downloads for it."""
+    v = m["variants"][vid]
+    need(isinstance(v.get("source"), dict) and v["source"].get("hf_repo"), f"variant {vid}: no source (pack abi minor 2 or newer)")
+    fs = [m["model"]["weights"][i] for i in v["weights"]]
+    need(all(HEX.match(str(f.get("sha256"))) and isinstance(f.get("bytes"), int) for f in fs), f"variant {vid}: weights without bytes and sha256 (rebuild with pack build)")
+    kinds = {os.path.splitext(f["file"])[1] for f in fs}
+    need(kinds in ({".gguf"}, {".safetensors"}), f"variant {vid}: files {sorted(kinds)} are not one format")
+    return dict(hf_repo=v["source"]["hf_repo"], revision=v["source"].get("revision", ""), format=kinds.pop()[1:],
+                files=[dict(name=f["file"], bytes=f["bytes"], sha256=f["sha256"]) for f in fs])
+
+
+def entries(path, tier="base", min_engine=__version__, trusted=None):
+    """The index entries of the pack at path, its signature (PATH.sig) checked against trusted: one per (arch, target variant), the model
+    being that variant's source, with the drafters its speculative pairs name under model.with. O(variants x buckets)."""
+    f, _, _, size, raw, _, v = pack._open_signed(path, None, None, trusted)
+    f.close()
+    need(v == 3, f"{path}: pack {v}: this index lists pack 3")
+    m = pack.check_manifest(raw)
+    sig = json.loads(pack.read_capped(path + ".sig", sign.MAX_SIG))
+    by, out = {b["id"]: b for b in m["buckets"]}, []
+    for vid in sorted({b["variant"] for b in m["buckets"] if b["role"] == "target"}):
+        drafters = sorted({by[s["drafter"]]["variant"] for s in m.get("spec", []) if s.get("target") in by and s.get("drafter") in by
+                           and by[s["target"]]["variant"] == vid})
+        src, st = source(m, vid), m["variants"][vid]["structure"]
+        model = dict(hf_repo=src["hf_repo"], revision=src["revision"], format=src["format"], files=src["files"],
+                     structure=[dict(variant=vid, sha256=st["sha256"], keys=st["keys"])],
+                     **({"with": [dict(role="drafter", variant=d, **{k: x for k, x in source(m, d).items() if k != "format"}) for d in drafters]}
+                        if drafters else {}))
+        for arch in sorted({b["requires"]["arch"] for b in m["buckets"] if b["variant"] == vid}):
+            out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier, file=os.path.basename(path),
+                            manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine))
+    return out
+
+
+def build(packs, serial, expires, key, out, tier="base", min_engine=__version__, now=None, trusted=None):
+    """Write out/index.json and out/index.sig for the packs (each signed by a key in trusted), signed with key; checked by verify before
+    anything is written. Returns the index dict."""
+    now = now or datetime.now(timezone.utc)
+    ix = dict(schema=SCHEMA, version=VERSION, serial=serial, issued=now.strftime("%Y-%m-%dT%H:%M:%SZ"), expires=expires,
+              entries=[e for p in packs for e in entries(p, tier, min_engine, trusted)])
+    raw = (json.dumps(ix, indent=1, sort_keys=True) + "\n").encode()
+    sigb = sign.sign_digest(hashlib.sha256(raw).hexdigest(), key)
+    verify(raw, sigb, now=now, trusted=(json.loads(sigb)["keyid"],))
+    os.makedirs(out, exist_ok=True)
+    pack._atomic(os.path.join(out, "index.json"), [raw])
+    pack._atomic(os.path.join(out, "index.sig"), [sigb])
+    return ix
 
 
 SHARD = re.compile(r"-\d+-of-\d+\.(gguf|safetensors)$")
@@ -167,9 +226,15 @@ Commands (cmd = verify for `index verify`, match for `pack match`); offline, JSO
 Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last-serial, expired), reason on stderr;
       3 pack match only: valid index, no entry fits; 2 usage.
 """)
-    ap.add_argument("cmd", choices=("verify", "match"))
-    ap.add_argument("--index", required=True)
-    ap.add_argument("--sig", required=True)
+    ap.add_argument("cmd", choices=("verify", "match", "build"))
+    ap.add_argument("--index")
+    ap.add_argument("--sig")
+    ap.add_argument("--pack", action="append", default=[], help="build: a signed pack (PACK.sig beside it); repeatable")
+    ap.add_argument("--serial", type=int, help="build: the index serial (above the last published one)")
+    ap.add_argument("--expires", help="build: YYYY-MM-DDTHH:MM:SSZ")
+    ap.add_argument("--key", help="build: the private key PEM that signs the index")
+    ap.add_argument("--out", help="build: the directory for index.json and index.sig")
+    ap.add_argument("--min-engine", default=__version__, help="build: the oldest engine the packs run on")
     ap.add_argument("--last-serial", type=int, default=0)
     ap.add_argument("--now", help="RFC3339 UTC (tests)")
     ap.add_argument("--arch")
@@ -183,6 +248,12 @@ def main(argv, trusted=None):
     """`index verify` and `pack match`: exit 0 ok, 1 refused (signature, key, schema, rollback, expiry), 3 no pack."""
     a = parser().parse_args(argv)
     try:
+        if a.cmd == "build":
+            need(a.pack and a.serial and a.expires and a.key and a.out, "build needs --pack, --serial, --expires, --key and --out")
+            ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted)
+            print(json.dumps(dict(serial=ix["serial"], expires=ix["expires"], entries=len(ix["entries"]), out=a.out)))
+            return 0
+        need(a.index and a.sig, f"{a.cmd} needs --index and --sig")
         ix, kid = verify(pack.read_capped(a.index), pack.read_capped(a.sig, sign.MAX_SIG) if os.path.lexists(a.sig) else None,
                          a.last_serial, when(a.now, "--now") if a.now else None, trusted)
         if a.cmd == "verify":
