@@ -2,6 +2,7 @@
 the written index verifies and matches; a pack without per-variant sources is refused."""
 import json
 import os
+import shutil
 
 import pytest
 
@@ -85,3 +86,28 @@ def test_a_pack_not_signed_by_a_trusted_key_is_refused(tmp_path, key, mocklib):
     open(pack + ".sig", "w").write("{}")
     with pytest.raises(P.PackError):
         I.entries(pack, trusted=(key.kid,))
+
+
+
+def test_a_current_index_keeps_its_other_entries_and_the_serial_must_go_up(tmp_path, key, mocklib):
+    toy, _ = spec_pack(tmp_path, key, mocklib)
+    other = str(tmp_path / "other.gcpack")
+    for ext in ("", ".sig"):
+        shutil.copy(toy + ext, other + ext)
+    I.build([other, toy], 9, EXPIRES, key.priv, str(tmp_path / "v9"), trusted=(key.kid,))
+    base = tuple(open(tmp_path / "v9" / n, "rb").read() for n in ("index.json", "index.sig"))
+    ix = I.build([toy], 10, EXPIRES, key.priv, str(tmp_path / "v10"), trusted=(key.kid,), base=base)
+    assert sorted(e["file"] for e in ix["entries"]) == ["other.gcpack", "toy.gcpack"], "the rebuilt pack's entry is replaced, the other kept"
+    with pytest.raises(I.IndexError_, match="not above"):
+        I.build([toy], 9, EXPIRES, key.priv, str(tmp_path / "v9b"), trusted=(key.kid,), base=base)
+    with pytest.raises(I.IndexError_):
+        I.build([toy], 11, EXPIRES, key.priv, str(tmp_path / "v11"), trusted=(key.kid,), base=(base[0] + b" ", base[1]))
+    assert not os.path.exists(tmp_path / "v9b") and not os.path.exists(tmp_path / "v11")
+
+
+def test_pack_sign_writes_a_signature_that_verifies(tmp_path, key, mocklib, capsys):
+    toy, _ = spec_pack(tmp_path, key, mocklib)
+    os.remove(toy + ".sig")
+    P.main(["sign", toy, "--key", key.priv])
+    assert json.loads(capsys.readouterr().out)["keyid"] == key.kid
+    P.verify(toy, trusted=(key.kid,))

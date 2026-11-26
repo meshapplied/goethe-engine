@@ -49,6 +49,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `pack runs` | does the visible device run this pack | 0, 1, 2, 3 |
 | `pack plan` | what each variant downloads, from a pack's first bytes | 0, 1, 2 |
 | `pack build` | build a pack from a declarative pack spec | 0, 1, 2 |
+| `pack sign` | sign a pack's manifest (writes `PACK.sig`) | 0, 1, 2 |
 
 ### `serve`
 
@@ -86,11 +87,12 @@ Exit 1: bad signature, key not pinned, schema, `serial < --last-serial`, expired
 Writes `index.json` and `index.sig` into `--out` for the signed packs given with `--pack` (each with `PACK.sig` beside it), signed with
 `--key`: one entry per (arch, target variant). An entry's `model` is that variant's `source` and files (name, bytes, sha256), its
 `structure` that variant's fingerprint, and `model.with` the drafters its speculative pairs name, each with its own source and files.
-The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two formats in
-one variant.
+With `--index F --sig F` (the current index) its entries for other pack files are kept, after it verifies, and `--serial` must be above
+its own. The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two
+formats in one variant, a current index that does not verify, a serial not above it.
 
-- `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--tier T` (default
-  base), `--min-engine V` (default this engine's version)
+- `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--index F --sig F`
+  (the current index), `--tier T` (default base), `--min-engine V` (default this engine's version)
 
     goethe-engine index build --pack model.gcpack --serial 9 --expires 2027-03-01T00:00:00Z --key index_key.pem --out site/
 ### `pack match`
@@ -167,6 +169,15 @@ Exit 1: a library not built, a manifest `pack.write` refuses, no `nvcc`.
 - `SPEC`, `--out F` (required), `--key PEM` (sign), `--store DIR` (pack 4)
 
     goethe-engine pack build pack.json --out model.gcpack --key pack_key.pem
+
+### `pack sign`
+
+Writes `FILE.sig`: the signature over the pack's manifest (its magic fixes the domain), with `--key`; the pack itself is unchanged, so a
+pack built and signed with one key is re-signed with another without a rebuild. Prints `{"sig", "keyid"}`.
+
+- `FILE`, `--key PEM` (required)
+
+    goethe-engine pack sign model.gcpack --key pack_key.pem
 ### Numerics tiers
 
 `--numerics` on `serve`, `pack verify` and `pack need` (default `invariant`). A tier picks the buckets whose measured contract matches.

@@ -144,12 +144,18 @@ def entries(path, tier="base", min_engine=__version__, trusted=None):
     return out
 
 
-def build(packs, serial, expires, key, out, tier="base", min_engine=__version__, now=None, trusted=None):
-    """Write out/index.json and out/index.sig for the packs (each signed by a key in trusted), signed with key; checked by verify before
-    anything is written. Returns the index dict."""
+def build(packs, serial, expires, key, out, tier="base", min_engine=__version__, now=None, trusted=None, base=None):
+    """Write out/index.json and out/index.sig for the packs (each signed by a key in trusted), signed with key; with base (the current
+    index bytes and signature, verified against trusted) its entries for other pack files are kept and serial must be above its own.
+    Checked by verify before anything is written. Returns the index dict."""
     now = now or datetime.now(timezone.utc)
-    ix = dict(schema=SCHEMA, version=VERSION, serial=serial, issued=now.strftime("%Y-%m-%dT%H:%M:%SZ"), expires=expires,
-              entries=[e for p in packs for e in entries(p, tier, min_engine, trusted)])
+    new = [e for p in packs for e in entries(p, tier, min_engine, trusted)]
+    kept = []
+    if base:
+        old, _ = verify(*base, now=now, trusted=trusted)
+        need(serial > old["serial"], f"serial {serial} is not above the current index's {old['serial']}")
+        kept = [e for e in old["entries"] if e["file"] not in {x["file"] for x in new}]
+    ix = dict(schema=SCHEMA, version=VERSION, serial=serial, issued=now.strftime("%Y-%m-%dT%H:%M:%SZ"), expires=expires, entries=kept + new)
     raw = (json.dumps(ix, indent=1, sort_keys=True) + "\n").encode()
     sigb = sign.sign_digest(hashlib.sha256(raw).hexdigest(), key)
     verify(raw, sigb, now=now, trusted=(json.loads(sigb)["keyid"],))
@@ -250,7 +256,8 @@ def main(argv, trusted=None):
     try:
         if a.cmd == "build":
             need(a.pack and a.serial and a.expires and a.key and a.out, "build needs --pack, --serial, --expires, --key and --out")
-            ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted)
+            base = (pack.read_capped(a.index), pack.read_capped(a.sig, sign.MAX_SIG)) if a.index else None
+            ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted, base=base)
             print(json.dumps(dict(serial=ix["serial"], expires=ix["expires"], entries=len(ix["entries"]), out=a.out)))
             return 0
         need(a.index and a.sig, f"{a.cmd} needs --index and --sig")
