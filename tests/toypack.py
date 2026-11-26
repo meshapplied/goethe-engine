@@ -35,19 +35,6 @@ class Key:
         P.sign_pack(path, self.priv)
 
 
-def gcpack(path, manifest, blobs):
-    """Write a .gcpack: manifest bytes and {sha256: bytes, or (stored bytes, codec)}."""
-    hdr, off, parts = dict(blobs={}), len(manifest), [manifest]
-    hdr["manifest"] = [0, len(manifest)]
-    for h, b in blobs.items():
-        b, *codec = b if isinstance(b, tuple) else (b,)
-        hdr["blobs"][h] = [off, len(b), *codec]
-        off += len(b)
-        parts.append(b)
-    hb = json.dumps(hdr).encode()
-    open(path, "wb").write(b"GCPACK3\n" + len(hb).to_bytes(8, "little") + hb + b"".join(parts))
-
-
 def _str(b):
     return len(b).to_bytes(8, "little") + b
 
@@ -99,7 +86,7 @@ def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="3.0.0", arch="sm_1
     caps = dict(verify_widths=[], verify=["linear", "tree"], tree_mask=True, taps=[dict(node="result_norm", n=4)],
                 recurrent_commit=[], accept=[], drafter_roles=[])
 
-    alt_files = dict(files, **{"plan.json": blob(b"alt-plan")})       # the alt branch has a blob of its own; libgck.so is shared
+    alt_files = dict(files, **{"plan.json": blob(b"alt-plan")}) if alt else files   # the alt branch has a blob of its own; libgck.so is shared
 
     def bucket(i, role, nc, batch=True, io=None, variant="q4", wi=None):
         return dict(id=i, role=role, variant=variant, sku="mock", contract="K1", ncol=nc, batch=batch, maxctx=256,
@@ -124,7 +111,7 @@ def toy_pack(d, key, lib, *, spec=False, runtime="gc-c", abi="3.0.0", arch="sm_1
              model=dict(key="t", stage="t", graph_sha256="0" * 64, weights=ws), variants=variants)
     if mutate:
         mutate(m)
-    gcpack(pack, (json.dumps(m, indent=1, sort_keys=True) + "\n").encode(), blobs)
+    P.frame(pack, (json.dumps(m, indent=1, sort_keys=True) + "\n").encode(), blobs)
     if sign:
         key.sign_pack(pack)
     return pack, w, dw

@@ -12,11 +12,6 @@ from test_modular import base_raw, overlay
 from toypack import Key, toy_pack
 
 
-def frame(path, raw, magic=P.MAGIC4, blobs=None):
-    hdr = json.dumps(dict(manifest=[0, len(raw)], blobs=blobs or {})).encode()
-    open(path, "wb").write(magic + len(hdr).to_bytes(8, "little") + hdr + raw)
-
-
 def v4(d, key, lib, *, mutate=None, domain=P.DOMAIN4, magic=P.MAGIC4, signer=None):
     """(v4 pack, store dir, weights): the toy pack's manifest as abi 4.0.0 with every blob pinned, its blobs in the store (the plan
     xz-compressed, the library raw), no blob in the file."""
@@ -39,7 +34,7 @@ def v4(d, key, lib, *, mutate=None, domain=P.DOMAIN4, magic=P.MAGIC4, signer=Non
         mutate(m, store, data)
     raw = (json.dumps(m, indent=1, sort_keys=True) + "\n").encode()
     pack = os.path.join(d, "toy4.gcpack")
-    frame(pack, raw, magic)
+    P.frame(pack, raw, {}, major=4 if magic == P.MAGIC4 else 3)
     open(pack + ".sig", "wb").write((signer or key).sign_digest(hashlib.sha256(domain + raw).hexdigest()))
     return pack, store, w
 
@@ -65,7 +60,7 @@ def test_v4_overlay_merges(tmp_path, key, mocklib):
             f.seek(base + off)
             open(os.path.join(store, h), "wb").write(f.read(ln))
     raw = base_raw(ovl)
-    frame(ovl, raw)
+    P.frame(ovl, raw, {}, major=4)
     open(ovl + ".sig", "wb").write(key.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + raw).hexdigest()))
     st = P.stage([pack, ovl], trusted=(key.kid,), store=store)
     assert {b["sku"] for b in st.manifest["buckets"]} == {"mock", "mock2"}

@@ -58,7 +58,6 @@ def test_missing_and_bad_signature_refused(toy, key):
 
 def _rewrite(pack, edit):
     """Re-write the pack file with (header, manifest bytes, blobs) edited by edit(hdr, manifest, blobs) -> (hdr or None, manifest, blobs)."""
-    from toypack import gcpack
     raw = open(pack, "rb").read()
     n = int.from_bytes(raw[8:16], "little")
     hdr = json.loads(raw[16:16 + n])
@@ -66,7 +65,7 @@ def _rewrite(pack, edit):
     man = raw[base + hdr["manifest"][0]:base + hdr["manifest"][0] + hdr["manifest"][1]]
     blobs = {h: raw[base + o:base + o + l] for h, (o, l, *_) in hdr["blobs"].items()}
     man, blobs = edit(man, blobs)
-    gcpack(pack, man, blobs)
+    P.frame(pack, man, blobs)
 
 
 def test_altered_manifest_refused(toy, key):
@@ -154,8 +153,10 @@ def test_dev_override_is_loud_and_off_by_default(toy, key, monkeypatch, capsys):
     assert "NOT authenticated" in capsys.readouterr().err
 
 
-def test_reader_has_no_writer():
-    assert not any(hasattr(P, n) for n in ("write", "add_blob", "bucket_entry", "bucket_files", "RUNTIME", "load", "blobs"))
+def test_write_is_the_only_writer():
+    # write (checked) and frame (raw container, for tests of refused packs) are the one way to make a pack; no builder-side helpers.
+    assert callable(P.write) and callable(P.frame)
+    assert not any(hasattr(P, n) for n in ("add_blob", "bucket_entry", "bucket_files", "RUNTIME", "load", "blobs"))
 
 
 # --- staging: verify then load the same bytes
