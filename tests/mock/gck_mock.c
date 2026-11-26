@@ -199,7 +199,7 @@ GC_API int gc_layout_get(gc_handle *h, gc_layout *o) {
   l.layers = 1;
   l.kv_heads = 1;
   l.head_dim = 1;
-  l.kv_dtype = GC_KV_F16;
+  l.kv_dtype = getenv("GCK_MOCK_KV_FP8") ? GC_KV_FP8 : GC_KV_F16;
   l.feat_width = FEAT;
   if (h->spec) {
     l.max_seqs = 1;

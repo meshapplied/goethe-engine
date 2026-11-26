@@ -525,7 +525,7 @@ def build(args):
                        drafter=args.weights[1] if len(args.weights) > 1 and not media else None,
                        device=args.device, store=args.store, B=args.max_running_requests or 8, numerics=args.numerics, act=args.act,
                        kv=args.kv, config=dict(max_num_seqs=args.max_running_requests, max_model_len=args.context_length,
-                                               kv_dtype="f16" if args.kv == "auto" else args.kv))
+                                               kv_dtype=None if args.kv == "auto" else args.kv))
         if mo.type == "media":                   # the library tokenizes; the text model GGUF carries the template and the pieces
             return mo.runner, None, args.context_length or mo.backend.bucket["maxctx"]
         tdir = args.tokenizer or os.path.dirname(os.path.abspath(args.weights[0]))
@@ -559,7 +559,7 @@ def parser():
                     help="reference: bitwise llama.cpp, one stream; invariant: independent of the batch (invariant-hp: 16-bit "
                          "activations); tolerance: deterministic until a tolerance bucket exists; old names exact | deterministic warn")
     ap.add_argument("--act", choices=("auto", "a8", "a16"), default="auto", help="activation precision of deterministic buckets")
-    ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16)")
+    ap.add_argument("--kv", choices=("auto", "f16", "fp8"), default="auto", help="KV cache dtype (auto: f16 when the pack has it, else fp8)")
     ap.add_argument("--ref", action="store_true", help="CPU reference model (dev, tests)")
     ap.add_argument("--ref-type", choices=("decoder", "embedding", "encoder-decoder"), default="decoder", help="model type of the --ref model")
     ap.add_argument("--overlay", action="append", metavar="FILE", help="signed overlay of the pack (more arches, formats): repeatable")
