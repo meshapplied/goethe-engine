@@ -100,19 +100,31 @@ def verify(raw, sig, last_serial=0, now=None, trusted=None):
     return ix, kid
 
 
+SHARD = re.compile(r"-\d+-of-\d+\.(gguf|safetensors)$")
+
+
 def model_sets(model_dir):
-    """The file sets of model_dir that can be one model: a checkpoint's shards (all *.safetensors), else each GGUF (a sharded one
-    -0000k-of-0000n.gguf together), then all GGUFs together in both orders (a media model: projector and backbone; later files' metadata
-    wins in a structure table). Header-only readers take these."""
-    st = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-    if st:
-        return [st]
-    sets = {}
-    for p in sorted(glob.glob(os.path.join(model_dir, "*.gguf"))):
-        sets.setdefault(re.sub(r"-\d+-of-\d+\.gguf$", ".gguf", p), []).append(p)
-    out = list(sets.values())
-    every = [p for fs in out for p in fs]
-    return out + [every, every[::-1]] if len(out) > 1 else out
+    """The file sets of model_dir that can be one model or one drafter (header-only readers take these, first match wins): each
+    safetensors shard group (*-0000k-of-0000n, or one file) alone, so a drafter such as mtp.safetensors beside its checkpoint is a set
+    of its own, then all safetensors together; each GGUF with its shards alone, then with each projector GGUF (general.architecture
+    clip) in both orders. O(groups x projectors) sets."""
+    def groups(ext):
+        g = {}
+        for p in sorted(glob.glob(os.path.join(model_dir, "*." + ext))):
+            g.setdefault(SHARD.sub(r".\1", p), []).append(p)
+        return list(g.values())
+    st, gg = groups("safetensors"), groups("gguf")
+    proj = [g for g in gg if projector(g[0])]
+    return (st + ([sum(st, [])] if len(st) > 1 else []) + gg
+            + [s for g in gg if g not in proj for p in proj for s in (g + p, p + g)])
+
+
+def projector(path):
+    """Whether a GGUF is a vision or audio projector (an mmproj file: general.architecture clip); unreadable files are not."""
+    try:
+        return structure.gguf_header(path)[0].get("general.architecture") == "clip"
+    except (structure.StructureError, OSError, ValueError):
+        return False
 
 
 def match_dir(ix, model_dir, arch, engine_version=__version__, tier=None):

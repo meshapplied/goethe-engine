@@ -89,7 +89,8 @@ Prints the best index entry whose structure the files of `--model-dir` have, for
 ### `pack verify`
 
 Without `--partial`, extracts and hash-checks every blob. With `--partial`, checks the manifest signature and only the blobs the branch
-chosen by `--model-dir` needs, and adds `"weights"` (the model files to pass to `serve` as weights). Prints
+chosen by `--model-dir` needs, and adds `"weights"` (the model files to pass to `serve` as weights) and, when the folder holds the
+pack's drafter (an MTP file beside the checkpoint, for example), `"drafter"`. Prints
 `{"ok", "manifest_sha256", "keyid", "abi", "arch", "runtime", "buckets", "variants"}`. Exit 1: signature missing or bad, key not pinned,
 container malformed, blob missing or not hashing to its name, ABI major not 3 or 4, runtime not run here, `--arch` differs, no variant has the model's structure.
 

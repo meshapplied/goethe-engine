@@ -1004,6 +1004,22 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     return v, bs
 
 
+def drafter_branch(m, sets, taken, skus, *, numerics="invariant", act="auto", kv="auto"):
+    """(drafter files, buckets) of the drafter variant a file set without the target's files (taken) has, for skus; ([], []) when the
+    pack has no drafter or the folder holds none. O(sets) header reads."""
+    if not any(b["role"] == "drafter" for b in m["buckets"]):
+        return [], []
+    want = wanted(numerics, act, kv)
+    for fs in sets:
+        if taken.isdisjoint(fs):
+            try:
+                v = pick_variant(m, fs, "drafter")
+            except PackError:
+                continue
+            return fs, [b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)]
+    return [], []
+
+
 PRICE_CACHE = {}       # (device uuid, driver, manifest sha, library sha) -> cost constants blob (gc_probe)
 
 
@@ -1123,9 +1139,11 @@ def main(a):
                     last = e
             if bs:
                 chosen[:] = [os.path.basename(f) for f in fs]
-                return bs
+                dfs, dbs = drafter_branch(m, sets, set(fs), {b["sku"] for b in bs}, numerics=o.numerics, act=o.act, kv=o.kv)
+                drafter[:] = [os.path.basename(f) for f in dfs]
+                return bs + dbs
         raise last
-    chosen = []
+    chosen, drafter = [], []
     try:
         if o.cmd == "need":
             with open(o.file, "rb") as f:
@@ -1164,7 +1182,8 @@ def main(a):
                 st.ensure(None)
             print(json.dumps(dict(ok=True, manifest_sha256=st.manifest_sha256, keyid=st.keyid, abi=m["abi"], arch=m["arch"], runtime=m["runtime"],
                                   **({"overlays": st.overlays, "arches": sorted(arches(m))} if st.overlays else {}),
-                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}))))
+                                  buckets=len(m["buckets"]), variants=sorted(m["variants"]), **({"weights": chosen} if chosen else {}),
+                                  **({"drafter": drafter} if drafter else {}))))
         else:
             for b in m["buckets"]:
                 print(f"{b['id']:40s} {b['variant']:10s} {b['contract']:4s} ncol {b['ncol']:3d} maxctx {b['maxctx']:6d} {len(b['files'])} files")
