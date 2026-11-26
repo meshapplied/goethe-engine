@@ -108,7 +108,12 @@ class Worker:
     def warm(self, r):
         ent = self.get(r.model_id)
         m = ent["model"]
-        if m.kind == "generate":                  # one token through the engine loop: graphs and pools are live afterwards
+        if m.kind == "generate":                  # warm graph buckets + one token through the engine loop
+            if getattr(m.backend, "graph_buckets", ()):
+                ev = threading.Event()
+                m.runner.inbox.append(("warm", ev))
+                ent["server"].wake.set()
+                ev.wait()
             _, q = ent["server"].submit([0], m.sampling(max_tokens=1))
             while not (q.get() or type("E", (), dict(finish_reason="error"))).finish_reason:
                 pass

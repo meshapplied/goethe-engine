@@ -4,8 +4,13 @@
 set -eu
 root=$(git rev-parse --show-toplevel)
 work=$(mktemp -d)
-python -m venv "$work/venv"
-"$work/venv/bin/pip" install -q "$root"
+if command -v uv >/dev/null; then
+    uv venv -q "$work/venv"
+    uv pip install -q --python "$work/venv/bin/python" "$root"
+else
+    python -m venv "$work/venv"
+    "$work/venv/bin/pip" install -q "$root"
+fi
 py="$work/venv/bin/python"
 ge="$work/venv/bin/goethe-engine"
 ! "$py" -c "import torch" 2>/dev/null || { echo "torch is installed: not a minimal host"; exit 1; }

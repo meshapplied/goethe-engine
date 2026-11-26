@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define GC_ABI_MAJOR 1
-#define GC_ABI_MINOR 2
+#define GC_ABI_MINOR 3
 #define GC_ABI_VERSION ((GC_ABI_MAJOR << 16) | GC_ABI_MINOR)
 
 #if defined(__GNUC__)
@@ -94,8 +94,12 @@ enum {
   GC_L_BOUNDED = 1u << 3,      /* 1.1: with GC_L_PAGED, a sequence also holds bounded state (window ring, recurrent state) in a slot the
                                   library assigns at its first step and frees at gc_release: a prefix of it is not shareable by block */
   GC_L_EMBED = 1u << 4,        /* 1.2: an embedding pack: gc_embed runs whole sequences to pooled rows; no KV; gc_step: GC_E_UNSUPPORTED */
-  GC_L_SEQ2SEQ = 1u << 5       /* 1.2: an encoder-decoder pack: gc_encode writes a sequence's cross-attention KV from float frames once,
+  GC_L_SEQ2SEQ = 1u << 5,      /* 1.2: an encoder-decoder pack: gc_encode writes a sequence's cross-attention KV from float frames once,
                                   gc_step then decodes as usual and reads it; gc_release frees both */
+  GC_L_DEVICE_SAMPLE = 1u << 6,/* 1.3: exact device-side splitmix64 temperature/top-k/top-p sampling into out->tokens */
+  GC_L_DEVICE_BITMASK = 1u << 7,/* 1.3: packed uint32_t[ceil(vocab/32)] token bitmask applied on device before argmax/sample */
+  GC_L_ASYNC = 1u << 8,        /* 1.3: exports gc_step_begin/gc_step_wait (up to 2 queued slots FIFO) and GC_W_PREV_TOKEN */
+  GC_L_FLAT = 1u << 9          /* 1.3: accepts flat contiguous CSR batch input via GC_S_FLAT + gc_step_in.flat */
 };
 
 /* gc_layout.embd_pool: how a sequence's rows become its one pooled row */
@@ -126,6 +130,9 @@ typedef struct gc_layout {
   uint32_t embd_pool;          /* 1.2, GC_L_EMBED: GC_POOL_* */
   uint32_t enc_frames;         /* 1.2, GC_L_SEQ2SEQ: most frames one gc_encode takes */
   uint32_t enc_feat;           /* 1.2, GC_L_SEQ2SEQ: floats per frame */
+  uint32_t n_graph_buckets;    /* 1.3: ascending column ladder captured as graphs (0: runtime-internal) */
+  uint32_t graph_buckets[16];  /* 1.3: valid entries [0 .. n_graph_buckets - 1] */
+  uint32_t pad2;
 } gc_layout;
 
 GC_API int gc_layout_get(gc_handle *h, gc_layout *out);
@@ -134,7 +141,10 @@ GC_API int gc_layout_get(gc_handle *h, gc_layout *out);
 enum {
   GC_W_GREEDY = 1u << 0,       /* every wanted row is an unmasked argmax: tokens may be returned instead of logits */
   GC_W_SPEC = 1u << 1,         /* a decode the library may advance by a whole speculative round (GC_L_SPEC) */
-  GC_W_FEATS = 1u << 2         /* also return the tap features of every token row */
+  GC_W_FEATS = 1u << 2,        /* also return the tap features of every token row */
+  GC_W_SAMPLE = 1u << 3,       /* 1.3: sample wanted rows on device via temperature/top_p/top_k/seed/step_idx into out->tokens */
+  GC_W_BITMASK = 1u << 4,      /* 1.3: apply packed LSB-first uint32 bitmask before argmax or sampling */
+  GC_W_PREV_TOKEN = 1u << 5    /* 1.3, GC_L_ASYNC: 1-token decode reads tokens[0] from device last_token[sid] of prior step */
 };
 
 /* One sequence's tokens for a step: a decode (1 token), a prefill chunk (n tokens), or a spec verify (anchor and
@@ -153,20 +163,59 @@ typedef struct gc_work {
   const uint32_t *blocks;      /* block table covering rows 0 .. pos + n_tokens - 1 (paged KV); NULL otherwise */
   uint32_t n_blocks;
   uint32_t want;               /* logits or argmax rows wanted: those of the last `want` tokens */
+  /* 1.3: device sampling and packed bitmask fields (read only when size covers them and GC_W_SAMPLE/GC_W_BITMASK set) */
+  float temperature;           /* > 0: device top-k/top-p sample; 0 with GC_W_BITMASK: device masked argmax */
+  float top_p;                 /* in (0, 1] */
+  uint32_t top_k;              /* 0 = no top-k cutoff */
+  uint32_t bitmask_words;      /* ceil(vocab / 32) uint32 words per wanted row */
+  uint64_t seed;               /* splitmix64 seed */
+  uint64_t step_idx;           /* starting token index (wanted row r uses splitmix64(seed, step_idx + r)) */
+  const uint32_t *bitmask;     /* [want * bitmask_words], LSB-first bit t = allowed(token t) */
 } gc_work;
+
+/* 1.3, GC_L_FLAT: contiguous SoA/CSR representation of a whole batch (avoids per-sequence pointer chasing). */
+typedef struct gc_batch_flat {
+  uint32_t size;
+  uint32_t n_seqs;
+  uint32_t total_tokens;
+  uint32_t total_blocks;
+  uint32_t bitmask_words;      /* ceil(vocab / 32) when bitmasks != NULL, else 0 */
+  uint32_t pad0;
+  const uint64_t *sids;        /* [n_seqs] */
+  const uint32_t *flags;       /* [n_seqs] GC_W_* */
+  const uint32_t *pos;         /* [n_seqs] */
+  const uint32_t *want;        /* [n_seqs] */
+  const uint32_t *tok_offsets; /* [n_seqs + 1] CSR offsets into tokens/parents */
+  const int32_t *tokens;       /* [total_tokens] */
+  const int32_t *parents;      /* [total_tokens], or NULL if every sequence is a chain */
+  const uint32_t *blk_offsets; /* [n_seqs + 1] CSR offsets into blocks, or NULL if unpaged */
+  const uint32_t *blocks;      /* [total_blocks], or NULL if unpaged */
+  /* Optional SoA sampling arrays (NULL when no sequence sets GC_W_SAMPLE) */
+  const float *temperature;    /* [n_seqs] */
+  const float *top_p;          /* [n_seqs] */
+  const uint32_t *top_k;       /* [n_seqs] */
+  const uint64_t *seed;        /* [n_seqs] */
+  const uint64_t *step_idx;    /* [n_seqs] */
+  /* Optional packed bitmasks for wanted rows with GC_W_BITMASK: [total_want * bitmask_words], or NULL */
+  const uint32_t *bitmasks;
+} gc_batch_flat;
 
 /* gc_step_in.flags */
 enum {
   GC_S_HOST_LOGITS = 1u << 0,  /* copy float32 logits to the caller's host buffer instead of exposing a device ptr */
-  GC_S_NORMALIZE = 1u << 1     /* 1.2, gc_embed: each row L2 normalized (sum of squares in double, as llama.cpp common_embd_normalize) */
+  GC_S_NORMALIZE = 1u << 1,    /* 1.2, gc_embed: each row L2 normalized (sum of squares in double, as llama.cpp common_embd_normalize) */
+  GC_S_FLAT = 1u << 2          /* 1.3, GC_L_FLAT: read batch from `flat` instead of `work`/`n_work` */
 };
 
 typedef struct gc_step_in {
   uint32_t size;
   uint32_t flags;              /* GC_S_* */
-  const gc_work *const *work;  /* n_work items */
+  const gc_work *const *work;  /* n_work items (ignored when GC_S_FLAT is set) */
   uint32_t n_work;
   uint32_t pad;
+  uint32_t pad_cols;           /* 1.3: optional target bucket column count (0: runtime picks ceil_bucket) */
+  uint32_t pad1;
+  const gc_batch_flat *flat;   /* 1.3, GC_S_FLAT: contiguous SoA/CSR batch */
 } gc_step_in;
 
 typedef struct gc_step_out {
@@ -190,6 +239,24 @@ typedef struct gc_step_out {
 
 /* Runs the items as one step: decode, chunked prefill, spec verify or a spec round, by the items' shapes. */
 GC_API int gc_step(gc_handle *h, const gc_step_in *in, gc_step_out *out);
+
+/* 1.3, GC_L_ASYNC only: enqueue a step into the handle's FIFO queue (depth <= 2) and synchronize the oldest in-flight
+ * step. The caller must keep out's buffers alive until the matching gc_step_wait returns; input pointers in `in` need
+ * only stay valid until gc_step_begin returns. Exported only by a library that can report GC_L_ASYNC. */
+GC_API int gc_step_begin(gc_handle *h, const gc_step_in *in, gc_step_out *out);
+GC_API int gc_step_wait(gc_handle *h, gc_step_out *out);
+
+/* 1.3, GC_L_DEVICE_SAMPLE RNG contract: matches sampling.py mix(seed, idx) and uniform(seed, idx) bit-for-bit. */
+static inline uint64_t gc_splitmix64(uint64_t seed, uint64_t idx) {
+  uint64_t z = seed + (idx + 1ull) * 0x9E3779B97F4A7C15ull;
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+static inline double gc_uniform(uint64_t seed, uint64_t idx) {
+  return (double)(gc_splitmix64(seed, idx) >> 11) * (1.0 / 9007199254740992.0);
+}
 
 typedef struct gc_embed_out {
   uint32_t size;

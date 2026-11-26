@@ -65,24 +65,69 @@ def _sorted_p(x, t):
     return order, e / e.sum()
 
 
+def _sample_full(x, p, u):
+    order, q = _sorted_p(x, p.temperature)
+    keep = (np.arange(len(q)) < (p.top_k or len(q))) & (np.cumsum(q) - q < p.top_p)
+    c = np.cumsum(q * keep)
+    return int(order[max(min(int((c < u * c[-1]).sum()), int(keep.sum()) - 1), 0)])
+
+
+def _sample_row(x, p, u):
+    """Exact top-k/top-p draw without sorting the full vocabulary when a small head covers the support."""
+    n = len(x)
+    z = x / np.float32(p.temperature)
+    zmax = float(z.max())
+    if not np.isfinite(zmax) or n <= 512 or (p.top_k == 0 and p.top_p >= 1.0):
+        return _sample_full(x, p, u)
+    if p.top_k == 1:
+        return int(z.argmax())
+    k = min(p.top_k, n) if p.top_k else min(256, n)
+    idx = np.argpartition(-z, k - 1)[:k]
+    thresh = float(z[idx].min())
+    cand = np.flatnonzero(z > -np.inf if thresh == -np.inf else z >= thresh)  # ascending ids keep stable ties
+    sub = cand[np.argsort(-z[cand], kind="stable")]
+    if p.top_k:
+        sub = sub[:p.top_k]
+    zmax64 = np.float64(zmax)
+    e_sub = np.exp(z[sub].astype(np.float64) - zmax64)
+    if p.top_p >= 1.0:
+        c = np.cumsum(e_sub)
+        return int(sub[max(min(int((c < u * c[-1]).sum()), len(sub) - 1), 0)])
+    e_sum = float(e_sub.sum()) if thresh == -np.inf else float(np.exp(z.astype(np.float64) - zmax64).sum())
+    q = e_sub / e_sum
+    cs = np.cumsum(q)
+    if not p.top_k and float(cs[-1]) < p.top_p and len(sub) < n:
+        return _sample_full(x, p, u)
+    keep = (cs - q) < p.top_p
+    m = max(int(keep.sum()), 1)
+    c = np.cumsum(q[:m])
+    return int(sub[max(min(int((c < u * c[-1]).sum()), m - 1), 0)])
+
+
 def sample(logits, params, seeds, idxs, masks):
     """Token per row, -1 for a row without a finite choice. A row depends only on its logits, params, seed and token index."""
-    x = np.array(host(logits), dtype=np.float32)
-    bad = np.isnan(x).any(1)
-    for r, m in enumerate(masks):
-        if m is not None:
-            x[r][~host(m).astype(bool)] = -np.inf
-    bad |= ~np.isfinite(x).any(1)
-    out = np.where(bad, 0, np.nan_to_num(x, nan=-np.inf).argmax(1)) if len(x) else np.zeros(0, np.int64)
+    raw = host(logits)
+    has_mask = any(m is not None for m in masks)
+    x = np.array(raw, dtype=np.float32) if has_mask else np.asarray(raw, dtype=np.float32)
+    if not len(x):
+        return []
+    out = [0] * len(x)
     for r, p in enumerate(params):
-        if p.temperature > 0 and not bad[r]:
-            order, q = _sorted_p(x[r], p.temperature)
-            keep = (np.arange(len(q)) < (p.top_k or len(q))) & (np.cumsum(q) - q < p.top_p)
-            c = np.cumsum(q * keep)
-            j = max(min(int((c < uniform(seeds[r], idxs[r]) * c[-1]).sum()), int(keep.sum()) - 1), 0)
-            out[r] = order[j]
-    out[bad] = -1
-    return [int(t) for t in out]
+        row = x[r]
+        m = masks[r]
+        if m is not None:
+            if np.isnan(float(row.max())):  # NaN in raw logits fails closed even when masked out
+                out[r] = -1
+                continue
+            row[~host(m).astype(bool)] = -np.inf
+        rmax = float(row.max())
+        if np.isnan(rmax) or rmax == -np.inf or (rmax == np.inf and not np.isfinite(row).any()):
+            out[r] = -1
+        elif p.temperature > 0:
+            out[r] = _sample_row(row, p, uniform(seeds[r], idxs[r]))
+        else:
+            out[r] = int(row.argmax())
+    return out
 
 
 def dist(logits, p, mask=None):

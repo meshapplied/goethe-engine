@@ -68,3 +68,49 @@ def test_validate():
     for bad in (P(temperature=-1), P(top_p=0), P(top_k=-1), P(max_tokens=0), P(n=2), P(stop_sequences=((),))):
         with pytest.raises(ValueError):
             bad.validate()
+
+
+def test_large_vocab_fast_path_matches_full_sort():
+    import numpy as np
+    from goethe_engine.sampling import _sample_full
+
+    rng = np.random.default_rng(123)
+    # Peaked logits, tied boundary, top-p head, top-p flat fallback, pure top-k, top_k=1, and sparse mask
+    x = rng.standard_normal((7, 2048)).astype(np.float32)
+    x[0, [17, 99, 512]] = [12.0, 11.5, 11.0]
+    x[1, 10:30] = 9.0
+    x[2, :5] = [10.0, 9.5, 9.0, 8.5, 8.0]
+    x[4, [42, 77]] = [11.0, 10.5]
+    x[5, [3, 9]] = [10.0, 10.0]
+    x[6, [11, 22, 33]] = [10.0, 9.5, 9.0]
+    sparse = np.zeros(2048, dtype=bool)
+    sparse[[11, 22, 33]] = True
+    ps = [
+        P(temperature=0.8, top_k=50, top_p=0.9),
+        P(temperature=1.0, top_k=5, top_p=1.0),
+        P(temperature=0.7, top_k=0, top_p=0.9),
+        P(temperature=2.0, top_k=0, top_p=0.9),
+        P(temperature=0.8, top_k=50, top_p=1.0),
+        P(temperature=0.8, top_k=1, top_p=0.9),
+        P(temperature=0.8, top_k=50, top_p=0.9),
+    ]
+    ms = [None, None, None, None, None, None, sparse]
+    for seed in range(25):
+        got = sample(x, ps, [seed] * len(ps), [0] * len(ps), ms)
+        ref = []
+        for r, p in enumerate(ps):
+            row = x[r].copy()
+            if ms[r] is not None:
+                row[~ms[r]] = -np.inf
+            ref.append(_sample_full(row, p, uniform(seed, 0)))
+        assert got == ref
+
+
+def test_nan_and_inf_edge_cases():
+    import numpy as np
+
+    # NaN in raw logits fails closed even when masked out; +inf with finite stays valid; +inf/-inf only fails
+    x = np.array([[1.0, 2.0, np.nan], [1.0, np.inf, -np.inf], [np.inf, -np.inf, -np.inf]], dtype=np.float32)
+    m = np.array([True, True, False])
+    assert sample(x, [P(), P(), P()], [0, 0, 0], [0, 0, 0], [m, None, None]) == [-1, 1, -1]
+    assert sample(np.empty((0, 16), np.float32), [], [], [], []) == []
