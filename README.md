@@ -145,8 +145,9 @@ device). No weights are needed; compare `manifest_sha256` with the index entry's
 
 Builds a pack from a pack SPEC (JSON, data only; the format is in `goethe_engine/build.py`): SKUs with their built library and
 `requires`, variants with `quant`, `source` and their model files, plan blobs, bucket templates (expanded per SKU), speculative pairs and
-measured bench rows. The builder reads what a build can read: structure from the model files, weight sizes, `cuda` from `nvcc`; `step_us`
-and the hw record hash only from `measured`. It writes through `pack.write` and prints `{"manifest_sha256", "out", "variants", "buckets"}`.
+measured bench rows. A template is named `contract.suffix` (its bucket id is `role.sku.contract.suffix`); `spec` and `measured` name
+templates that way, and a name used twice is refused. The builder reads what a build can read: structure from the model files, weight
+sizes and sha256, `cuda` from `nvcc`; `step_us` and the hw record hash only from `measured`. It writes through `pack.write` and prints `{"manifest_sha256", "out", "variants", "buckets"}`.
 Exit 1: a library not built, a manifest `pack.write` refuses, no `nvcc`.
 
 - `SPEC`, `--out F` (required), `--key PEM` (sign), `--store DIR` (pack 4)
