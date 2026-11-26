@@ -1,4 +1,4 @@
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 _LAZY = {"Backend": "backend", "KVGeometry": "backend", "Work": "backend", "Engine": "engine",
          "RequestOutput": "engine", "SamplingParams": "sampling", "Config": "scheduler"}
 
