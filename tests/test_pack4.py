@@ -9,37 +9,20 @@ import pytest
 from goethe_engine import pack as P
 from goethe_engine.gc_c import GcBackend
 from test_modular import base_raw, overlay
-from toypack import Key, toy_pack
-
-
-def frame(path, raw, magic=P.MAGIC4, blobs=None):
-    hdr = json.dumps(dict(manifest=[0, len(raw)], blobs=blobs or {})).encode()
-    open(path, "wb").write(magic + len(hdr).to_bytes(8, "little") + hdr + raw)
+from toypack import Key, parts, toy_pack
 
 
 def v4(d, key, lib, *, mutate=None, domain=P.DOMAIN4, magic=P.MAGIC4, signer=None):
-    """(v4 pack, store dir, weights): the toy pack's manifest as abi 4.0.0 with every blob pinned, its blobs in the store (the plan
-    xz-compressed, the library raw), no blob in the file."""
+    """(v4 pack, store dir, weights): the toy pack written by P.write as abi 4.0.0 (every blob pinned, in the store, xz where smaller),
+    then mutate(manifest, store, blobs), framed with magic and signed over domain."""
     pack3, w, _ = toy_pack(d, key, lib, sign=False)
-    with open(pack3, "rb") as f:
-        _, blobs, base, raw3, _ = P.read_container_v(f, os.path.getsize(pack3))
-        data = {}
-        for h, (off, ln, *_) in blobs.items():
-            f.seek(base + off)
-            data[h] = f.read(ln)
-    m = json.loads(raw3)
-    m["abi"] = "4.0.0"
-    m["blob_raw"] = {h: len(b) for h, b in data.items()}
-    store = os.path.join(d, "store")
-    os.makedirs(store, exist_ok=True)
-    for h, b in data.items():
-        z = lzma.compress(b)
-        open(os.path.join(store, h + ".xz" if b == b"{}" or len(z) < len(b) else h), "wb").write(z if b == b"{}" or len(z) < len(b) else b)
+    m3, data = parts(pack3)
+    store, pack = os.path.join(d, "store"), os.path.join(d, "toy4.gcpack")
+    m = json.loads(P.write(pack, dict(m3, abi="4.0.0"), data.values(), store=store))
     if mutate:
         mutate(m, store, data)
     raw = (json.dumps(m, indent=1, sort_keys=True) + "\n").encode()
-    pack = os.path.join(d, "toy4.gcpack")
-    frame(pack, raw, magic)
+    P.frame(pack, raw, {}, major=4 if magic == P.MAGIC4 else 3)
     open(pack + ".sig", "wb").write((signer or key).sign_digest(hashlib.sha256(domain + raw).hexdigest()))
     return pack, store, w
 
@@ -65,7 +48,7 @@ def test_v4_overlay_merges(tmp_path, key, mocklib):
             f.seek(base + off)
             open(os.path.join(store, h), "wb").write(f.read(ln))
     raw = base_raw(ovl)
-    frame(ovl, raw)
+    P.frame(ovl, raw, {}, major=4)
     open(ovl + ".sig", "wb").write(key.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + raw).hexdigest()))
     st = P.stage([pack, ovl], trusted=(key.kid,), store=store)
     assert {b["sku"] for b in st.manifest["buckets"]} == {"mock", "mock2"}

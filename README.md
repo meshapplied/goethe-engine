@@ -142,6 +142,7 @@ Exit 0 runs, 3 no SKU runs, 1 pack refused.
 
 - `goethe_engine/spec/`: the pack manifest schema, request parameters, error codes and the worker protocol
 - `abi/gc.h`: the C interface a pack's runtime implements
+- `goethe_engine.pack.write`: the one way to make a pack: it validates the manifest, takes exactly the blobs its buckets name, pins their sizes and frames pack 3 or 4 (sign with `pack.sign_pack`)
 - `SPEC.md`: how speculative decoding works
 
 Tests: `pip install -e '.[test]' && python -m pytest -q` (CPU only; needs a C compiler and openssl).

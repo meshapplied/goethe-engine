@@ -7,7 +7,7 @@ import pytest
 
 from goethe_engine import pack as P, registry as R, structure
 from goethe_engine.gc_c import GcBackend
-from toypack import gcpack, gguf, toy_pack
+from toypack import gguf, toy_pack
 
 Q8 = [("a.weight", [64, 8], 8), ("b.weight", [64], 0)]     # the base target's tensors in another format (q8_0)
 
@@ -46,7 +46,7 @@ def overlay(d, key, pack, lib, *, name="ovl", base=None, ids=("target.mock2.K1.2
         o["buckets"].append(b)
     path = os.path.join(d, name + ".gcovl")
     raw_o = (json.dumps(o, indent=1, sort_keys=True) + "\n").encode()
-    gcpack(path, raw_o, blobs)
+    P.frame(path, raw_o, blobs)
     if sign:
         open(path + ".sig", "wb").write(key.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + raw_o).hexdigest()))
     return path
@@ -124,7 +124,7 @@ def test_overlay_refusals(tmp_path, key, mocklib, bad):
         else:
             o["variants"]["q4"] = dict(json.loads(base_raw(pack))["variants"]["q4"], weights=[1])
         raw = (json.dumps(o, indent=1, sort_keys=True) + "\n").encode()
-        gcpack(ovl, raw, {})            # refused at the merge, before any blob is read
+        P.frame(ovl, raw, {})            # refused at the merge, before any blob is read
         open(ovl + ".sig", "wb").write(key.sign_digest(hashlib.sha256(P.OVERLAY_DOMAIN + raw).hexdigest()))
     elif bad == "untrusted":
         from toypack import Key
