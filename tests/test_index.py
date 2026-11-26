@@ -145,14 +145,20 @@ def test_model_files_are_optional_informational_and_never_used_to_match(key, tmp
     assert json.loads(capsys.readouterr().out)["model"]["files"] == files
 
 
-def test_model_sets_try_each_gguf_then_all_together(tmp_path):
-    """A media model's projector and backbone are two GGUFs that only together have the variant's structure."""
+def test_model_sets_give_each_role_its_own_files(tmp_path):
+    """A folder's candidate sets: a safetensors checkpoint without the drafter beside it, the drafter alone, each GGUF quant alone and
+    with the projector; never every GGUF of the folder at once."""
     from goethe_engine.index import model_sets
+    from toypack import gguf, safetensors
+    t = lambda *ns: [str(tmp_path / n) for n in ns]
     for n in ("m-00001-of-00002.gguf", "m-00002-of-00002.gguf"):
-        (tmp_path / n).write_bytes(b"")
-    assert model_sets(str(tmp_path)) == [[str(tmp_path / "m-00001-of-00002.gguf"), str(tmp_path / "m-00002-of-00002.gguf")]]
-    (tmp_path / "mmproj.gguf").write_bytes(b"")
+        gguf(str(tmp_path / n), [("w", [8], 0)])
+    assert model_sets(str(tmp_path)) == [t("m-00001-of-00002.gguf", "m-00002-of-00002.gguf")]
+    gguf(str(tmp_path / "q8.gguf"), [("w", [8], 8)])
+    gguf(str(tmp_path / "mmproj.gguf"), [("v", [8], 0)], kv={"general.architecture": "clip"})
+    m, q8, mm = t("m-00001-of-00002.gguf", "m-00002-of-00002.gguf"), t("q8.gguf"), t("mmproj.gguf")
+    assert model_sets(str(tmp_path)) == [m, mm, q8, m + mm, mm + m, q8 + mm, mm + q8]
+    safetensors(str(tmp_path / "model-00001-of-00001.safetensors"), {"w": ("BF16", [8])})
+    safetensors(str(tmp_path / "mtp.safetensors"), {"mtp.w": ("BF16", [8])})
     s = model_sets(str(tmp_path))
-    assert len(s) == 4 and s[2] == s[0] + s[1] and s[3] == s[2][::-1]
-    (tmp_path / "w.safetensors").write_bytes(b"")
-    assert model_sets(str(tmp_path)) == [[str(tmp_path / "w.safetensors")]]
+    assert s[:3] == [t("model-00001-of-00001.safetensors"), t("mtp.safetensors"), t("model-00001-of-00001.safetensors", "mtp.safetensors")]
