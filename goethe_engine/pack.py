@@ -681,22 +681,33 @@ def usable(m, b):
     return ""
 
 
-def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None):
-    """(target, drafter, policy) of the pack's speculative pair for the device or SKU and contract."""
+def spec_pairs(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
+    """[(target, drafter, policy, name)] of the pack's speculative strategies this loader runs for the device or SKU, contract, ctx
+    and numerics predicate, in preference order (tolerance first when want.prefer == 'tolerance', else manifest order); name = the
+    entry's optional display label, else the policy kind."""
+    ok = want or (lambda b: contract is not None or b.get("determinism") != "tolerance")
     if dev is not None:
-        sku = select(m, dev=dev, contract=contract, verify=True)["sku"]
+        sku = select(m, dev=dev, contract=contract, verify=True, want=ok)["sku"]
     by = {b["id"]: b for b in m["buckets"]}
-    for s in m.get("spec", []):
-        need(rev(by[s["target"]]) == rev(by[s["drafter"]]) or by[s["target"]]["contract"] != by[s["drafter"]]["contract"],
-             f"speculative pair {s['target']} / {s['drafter']}: contract revisions {rev(by[s['target']])} / {rev(by[s['drafter']])}")
-    ps = [(by[s["target"]], by[s["drafter"]], s["policy"]) for s in m.get("spec", [])
-          if s["policy"].get("kind") in POLICIES and not usable(m, by[s["target"]]) and not usable(m, by[s["drafter"]])
-          and "encode" not in (axes(by[s["target"]])[1], axes(by[s["drafter"]])[1])
-          and (sku is None or by[s["target"]]["sku"] == sku) and (contract is None or by[s["target"]]["contract"]
-                                                                 == contract)
-          and (ctx is None or by[s["target"]]["maxctx"] >= ctx)]
+    pairs = [(by[s["target"]], by[s["drafter"]], s["policy"], s.get("name") or s["policy"].get("kind")) for s in m.get("spec", [])
+             if s["policy"].get("kind") in POLICIES and not usable(m, by[s["target"]]) and not usable(m, by[s["drafter"]])
+             and "encode" not in (axes(by[s["target"]])[1], axes(by[s["drafter"]])[1])
+             and (rev(by[s["target"]]) == rev(by[s["drafter"]]) or by[s["target"]]["contract"] != by[s["drafter"]]["contract"])
+             and (sku is None or by[s["target"]]["sku"] == sku) and (contract is None or by[s["target"]]["contract"] == contract)
+             and (ctx is None or by[s["target"]]["maxctx"] >= ctx)
+             and ok(by[s["target"]])]
+    pre = getattr(ok, "prefer", None)
+    if pre:
+        pairs.sort(key=lambda p: p[0].get("determinism") != pre)
+    return pairs
+
+
+def spec_pair(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
+    """(target, drafter, policy) of the pack's preferred speculative pair for the device or SKU, contract and ctx."""
+    ps = spec_pairs(m, sku=sku, dev=dev, contract=contract, ctx=ctx, want=want)
     need(ps, f"no speculative pair for sku {sku}, contract {contract}, ctx {ctx}")
-    return min(ps, key=lambda x: (x[0]["maxctx"], x[0]["id"]))
+    t, d, pol, _ = ps[0]
+    return t, d, pol
 
 
 def ladder(m, b):

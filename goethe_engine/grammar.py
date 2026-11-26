@@ -2,6 +2,7 @@
 
 Matcher: mask() -> bool tensor [vocab] of allowed next tokens; accept(tok) -> bool; done() -> bool.
 Compiler: compile(kind, spec) -> object with new_matcher(). kind is "json_schema", "regex", "ebnf" or "json"."""
+import numpy as np
 import torch
 
 
@@ -43,6 +44,11 @@ class _Matcher:
         self.m.fill_next_token_bitmask(self.bm, 0)
         bits = (self.bm[0][:, None] >> torch.arange(32, dtype=torch.int32)) & 1
         return bits.reshape(-1)[:self.v].bool()
+
+    def bitmask(self):
+        """Contiguous uint32[ceil(vocab/32)] view of the packed LSB-first token bitmask (zero unpack)."""
+        self.m.fill_next_token_bitmask(self.bm, 0)
+        return self.bm[0].numpy().view(np.uint32)
 
     def accept(self, tok):
         return self.m.accept_token(tok)

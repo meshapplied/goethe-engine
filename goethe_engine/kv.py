@@ -234,6 +234,7 @@ class KVManager:
         if self.bsnaps:
             e, seq.computed = self.bsnaps.match(seq.tokens)
             seq.blocks, seq.tpages = (list(e[1]) if e else []), 0
+            seq.blocks_ver += 1
             for b in seq.blocks:
                 self.pool.incref(b)
             seq.restore = e[0] if e else None
@@ -241,8 +242,10 @@ class KVManager:
         if self.snaps:
             seq.restore, seq.computed = self.snaps.match(seq.tokens)
             seq.blocks, seq.tpages = [], 0
+            seq.blocks_ver += 1
             return
         seq.blocks = self.match(seq.tokens, touch=True)
+        seq.blocks_ver += 1
         for b in seq.blocks:
             self.pool.incref(b)
         seq.tpages = len(seq.blocks)
@@ -251,10 +254,13 @@ class KVManager:
     def reserve(self, seq, upto):
         """Make the blocks for rows [seq.computed, upto) writable. Returns the CoW copies (src, dst) or None if the pool is
         short, in which case nothing changed."""
-        bs, pool = self.bs, self.pool
+        bs, pool, blocks = self.bs, self.pool, seq.blocks
+        nb = len(blocks)
         need = -(-upto // bs)
-        cow = [i for i in range(seq.computed // bs, min(len(seq.blocks), need)) if pool.ref[seq.blocks[i]] > 1]
-        fresh = max(0, need - len(seq.blocks))
+        if need == nb and nb and seq.computed // bs == nb - 1 and pool.ref[blocks[-1]] == 1 and seq.restore is None:
+            return []
+        cow = [i for i in range(seq.computed // bs, min(nb, need)) if pool.ref[blocks[i]] > 1]
+        fresh = max(0, need - nb)
         short = len(cow) + fresh - len(pool.free)
         if short > 0 and self.cache:
             self.cache.evict(short)
@@ -265,12 +271,15 @@ class KVManager:
         pairs = []
         for i in cow:
             dst, = pool.take(1)
-            pairs.append((seq.blocks[i], dst))
-            pool.decref(seq.blocks[i])
-            seq.blocks[i] = dst
-        seq.blocks += pool.take(fresh)
+            pairs.append((blocks[i], dst))
+            pool.decref(blocks[i])
+            blocks[i] = dst
+        if fresh:
+            blocks += pool.take(fresh)
+        if cow or fresh:
+            seq.blocks_ver += 1
         if seq.restore is not None and self.snaps:
-            pairs.append((seq.restore, seq.blocks[0]))
+            pairs.append((seq.restore, blocks[0]))
             seq.restore = None
         return pairs
 
@@ -289,16 +298,22 @@ class KVManager:
         A page pack snapshots at the last prompt token (every prompt step ends there) and returns the copies to run."""
         if self.snaps or self.bsnaps:
             return self.snapshot(seq) if seq.computed == seq.nprompt - 1 else []
+        if not self.cache:
+            return []
         nf = seq.computed // self.bs
-        if not self.cache or nf <= seq.tpages:
+        if nf <= seq.tpages:
             return []
         canon = self.cache.insert(seq.tokens, seq.blocks[:nf], seq.tpages)
+        changed = False
         for j, c in enumerate(canon, seq.tpages):
             b = seq.blocks[j]
             if c != b:
                 self.pool.incref(c)
                 self.pool.decref(b)
                 seq.blocks[j] = c
+                changed = True
+        if changed:
+            seq.blocks_ver += 1
         seq.tpages = nf
         return []
 
@@ -306,9 +321,11 @@ class KVManager:
         for b in seq.blocks:
             self.pool.decref(b)
         seq.blocks, seq.computed, seq.tpages, seq.restore = [], 0, 0, None
+        seq.blocks_ver += 1
 
     def fork(self, seq, child):
         child.blocks, child.computed, child.tpages = list(seq.blocks), seq.computed, seq.tpages
+        child.blocks_ver += 1
         for b in child.blocks:
             self.pool.incref(b)
 

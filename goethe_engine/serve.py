@@ -549,7 +549,7 @@ def parser():
     ap.add_argument("--context-length", type=int)
     ap.add_argument("--max-running-requests", type=int)
     ap.add_argument("--served-model-name")
-    ap.add_argument("--api-key")
+    ap.add_argument("--api-key", default=os.environ.get("GOETHE_ENGINE_API_KEY"))
     ap.add_argument("--pack", metavar="FILE", help="signed kernel pack (.gcpack, signature in FILE.sig)")
     ap.add_argument("--weights", nargs="+", metavar="PATH", help="target weights, then a drafter's for a speculative pair (a media model: "
                                                                  "its projector, then its text model)")
