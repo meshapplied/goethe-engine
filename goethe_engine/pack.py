@@ -669,10 +669,12 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     need(sku is not None, "no SKU: pass a device or a SKU")
     ok = want or (lambda b: contract is not None or b.get("determinism") != "tolerance")   # tolerance buckets only when asked for
     # opaque labels: the pack lists its preference order; the first one with a bucket that satisfies the request (a tolerance
-    # request: a contract with tolerance buckets first)
-    pre = getattr(ok, "prefer", None)
-    order = sorted(m["contracts"], key=lambda x: not any(b["contract"] == x and ok(b) and pre and b.get("determinism") == pre
-                                                         for b in m["buckets"]))
+    # request: a contract with tolerance buckets first; kv=auto: f16 over fp8 when both exist)
+    pre, pre_kv = getattr(ok, "prefer", None), getattr(ok, "prefer_kv", None)
+    order = sorted(m["contracts"], key=lambda x: (
+        not any(b["contract"] == x and ok(b) and pre and b.get("determinism") == pre for b in m["buckets"]),
+        not any(b["contract"] == x and ok(b) and pre_kv and b.get("kv") == pre_kv for b in m["buckets"]),
+    ))
     c = contract or next((x for x in order if any(b["contract"] == x and ok(b) for b in m["buckets"])), None) \
         or next((x for x in m["contracts"] if any(b["contract"] == x and ok(b) for b in m["buckets"])), None)
     skip = {b["id"]: usable(m, b) for b in m["buckets"] if usable(m, b)}
@@ -684,6 +686,10 @@ def select(m, *, sku=None, dev=None, contract=None, B=1, ctx=None, role="target"
     need(cand, f"no {role} bucket for sku {sku}, contract {c}, B {B}, ctx {ctx} (skipped, unknown to this loader: "
          f"{skip or 'none'}; have "
          f"{sorted((b['sku'], b['contract'], b['ncol'], b['maxctx']) for b in m['buckets'] if b['role'] == role)})")
+    if pre:
+        cand = [b for b in cand if b.get("determinism") == pre] or cand
+    if pre_kv:
+        cand = [b for b in cand if b.get("kv") == pre_kv] or cand
     top = max(rev(b) for b in cand)       # the newest revision of the contract present
     return min((b for b in cand if rev(b) == top), key=lambda b: (b["ncol"], b["maxctx"], b["id"]))
 
@@ -705,6 +711,11 @@ def single_stream(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
             cs.append(select(m, sku=sku, dev=dev, contract=c, B=1, ctx=ctx, want=want))
         except PackError:
             continue
+    pre, pre_kv = getattr(want, "prefer", None), getattr(want, "prefer_kv", None)
+    if pre:
+        cs = [b for b in cs if b.get("determinism") == pre] or cs
+    if pre_kv:
+        cs = [b for b in cs if b.get("kv") == pre_kv] or cs
     priced = [b for b in cs if "step_us" in b]
     if priced:
         return min(priced, key=lambda b: b["step_us"])
@@ -719,10 +730,16 @@ def feature(b, k):
     return b[k]
 
 
+def auto_kv(bs, kv):
+    """kv=auto: only the f16 buckets when there are any (what select runs, so what a download fetches), else bs."""
+    return ([b for b in bs if feature(b, "kv") == "f16"] or bs) if kv == "auto" else bs
+
+
 def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     """The bucket predicate of a request: numerics exact | deterministic (batch_invariant; exact also serves a handle of one
     sequence, which has no batch to depend on) | fast (tolerance buckets preferred by select, else deterministic), act auto
-    (a16 where a bucket has it: the pack's contract order) | a8 | a16 (exact buckets carry no act), kv auto (f16) | f16 | fp8."""
+    (a16 where a bucket has it: the pack's contract order) | a8 | a16 (exact buckets carry no act), kv auto (f16 when present,
+    else fp8 for fp8-only packs) | f16 | fp8."""
     numerics, act = NK.resolve(numerics, act)
     det = {"exact": {"exact"}, "deterministic": {"batch_invariant"} | ({"exact"} if single else set()),
            "fast": {"tolerance", "batch_invariant"} | ({"exact"} if single else set())}
@@ -732,8 +749,10 @@ def wanted(numerics="invariant", act="auto", kv="auto", single=False):
     # an exact bucket that declares batch_invariant (one sequence per graph) also serves a deterministic request
     f = lambda b: ((feature(b, "determinism") in det[numerics] or (numerics == "deterministic" and feature(b, "determinism") == "exact"
                                                                    and b.get("batch_invariant") is True))
-                   and (act == "auto" or feature(b, "act") in (None, act)) and feature(b, "kv") == ("f16" if kv == "auto" else kv))
+                   and (act == "auto" or feature(b, "act") in (None, act))
+                   and (feature(b, "kv") in ("f16", "fp8") if kv == "auto" else feature(b, "kv") == kv))
     f.prefer = "tolerance" if numerics == "fast" else None
+    f.prefer_kv = "f16" if kv == "auto" else None
     return f
 
 
@@ -1023,6 +1042,7 @@ def branch(m, model_files, *, sku=None, numerics="invariant", act="auto", kv="au
     need(sku is not None, f"several SKUs in this pack {skus}: name one")
     want = wanted(numerics, act, kv)
     bs = [b for b in mv["buckets"] if b["sku"] == sku and want(b)]
+    bs = auto_kv(bs, kv)
     need(bs, f"no bucket of variant {v} for sku {sku} with numerics={numerics} act={act} kv={kv}")
     return v, bs
 
@@ -1039,7 +1059,7 @@ def drafter_branch(m, sets, taken, skus, *, numerics="invariant", act="auto", kv
                 v = pick_variant(m, fs, "drafter")
             except PackError:
                 continue
-            return fs, [b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)]
+            return fs, auto_kv([b for b in m["buckets"] if b["role"] == "drafter" and b["variant"] == v and b["sku"] in skus and want(b)], kv)
     return [], []
 
 

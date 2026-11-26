@@ -99,3 +99,23 @@ def test_a_failed_request_raises(tmp_path, key, mocklib):
         m.backend.step = boom
         with pytest.raises(RuntimeError, match="out of memory"):
             m.generate([[1, 2, 3]], 4)
+
+
+def test_fp8_only_pack_kv_auto_and_explicit(tmp_path, key, mocklib, monkeypatch):
+    """An fp8-KV-only pack verifies with default kv=auto and opens through api.open under both kv=auto and kv=fp8; explicit
+    mismatched kv_dtype or kv=f16 still fails closed."""
+    def mut(mm):
+        for b in mm["buckets"]:
+            b["kv"] = "fp8"
+    pack, w, _ = toy_pack(str(tmp_path), key, mocklib, mutate=mut)
+    m_ver = P.verify(pack, trusted=(key.kid,))
+    assert P.branch(m_ver, [w], sku="mock")[1]
+    monkeypatch.setenv("GCK_MOCK_KV_FP8", "1")
+    for kv in ("auto", "fp8"):
+        with api.open(pack, w, B=2, sku="mock", kv=kv, trusted=(key.kid,)) as m:
+            assert m.cfg.kv_dtype == "fp8"
+            assert m.generate([[1, 2, 3]], 4) == [fake_greedy([1, 2, 3], 4)]
+    with pytest.raises(ValueError, match="backend KV dtype fp8 != config f16"):
+        api.open(pack, w, B=2, sku="mock", kv="fp8", config={"kv_dtype": "f16"}, trusted=(key.kid,))
+    with pytest.raises(P.PackError, match="kv=f16"):
+        api.open(pack, w, B=2, sku="mock", kv="f16", trusted=(key.kid,))
