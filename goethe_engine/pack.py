@@ -105,6 +105,10 @@ def validate(m, loader_abi=ABI):
              and isinstance(st.get("kv"), dict) and isinstance(st.get("tensors"), list), f"variant {vid}: structure needs sha256, keys, kv and tensors")
         need(isinstance(v.get("weights"), list) and v["weights"] and all(isinstance(i, int) and 0 <= i < len(ws) for i in v["weights"]),
              f"variant {vid}: weights indices")
+        src = v.get("source")
+        need(pv[1] < 2 or isinstance((v.get("desc") or {}).get("quant"), str) and v["desc"]["quant"] and isinstance(src, dict)
+             and isinstance(src.get("hf_repo"), str) and src["hf_repo"] and isinstance(src.get("revision", ""), str),
+             f"pack abi {m['abi']}: variant {vid} needs desc.quant and source {{hf_repo, revision}} from minor 2 (3.2, 4.2)")
     need(all(HEX.match(h or "") for h in m["hw"].values()), "hw record hashes must be sha256")
     raw = m.get("blob_raw", {})
     need(isinstance(raw, dict) and all(HEX.match(h) and isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_RAW
@@ -954,6 +958,25 @@ def pick_variant(m, files, role="target", allow_broken=False):
                     "or overlay")
 
 
+def plan(m, dev=None):
+    """Per variant: {id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}: the files a download of that variant fetches,
+    its longest context, and whether dev (a device record; None: not asked) runs one of its SKUs. Manifest only. O(variants x buckets)."""
+    roles, lim, out = {b["variant"]: b["role"] for b in m["buckets"]}, ctx_limit(m), []
+    for vid in sorted(roles):
+        v, bs = m["variants"][vid], [b for b in m["buckets"] if b["variant"] == vid]
+        runs = why = None
+        if dev is not None and roles[vid] == "target":
+            try:
+                pick_sku(dict(m, buckets=bs), dev)
+                runs = True
+            except PackError as e:
+                runs, why = False, str(e)
+        out.append(dict(id=vid, role=roles[vid], quant=(v.get("desc") or {}).get("quant"), source=v.get("source"),
+                        files=[dict(name=m["model"]["weights"][i]["file"], bytes=m["model"]["weights"][i].get("bytes")) for i in v["weights"]],
+                        max_ctx=min([max(b["maxctx"] for b in bs)] + ([lim[0]] if lim else [])), runs=runs, why=why))
+    return out
+
+
 def ctx_limit(m, ctx=None):
     """(maxctx, why) of the model's tightest limit (model.limits), or None; refuses a requested ctx beyond it with its why text."""
     lim = min(m["model"].get("limits") or [], key=lambda x: x["maxctx"], default=None)
@@ -1107,8 +1130,10 @@ Exit 0 ok; 1 refused (signature missing or bad, key id not pinned, container mal
 ABI major not 3, runtime not run here, --arch differs, no variant has the model's structure), reason on stderr.
 runs (signature and manifest only: no blob, no weights, no model load) asks whether the visible device runs one of the pack's SKUs and
 prints {"runs": true|false, "sku": the SKU it would run or null, "device": name, "sms": N, "why": the reason or null}: exit 0 runs, 3 not.
+plan reads a PREFIX file and prints {"manifest_sha256", "variants": [{id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}]}:
+what each variant downloads and whether the visible device runs it (runs null without a visible device); no weights needed.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need", "runs"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan"))
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1145,6 +1170,16 @@ def main(a):
         raise last
     chosen, drafter = [], []
     try:
+        if o.cmd == "plan":
+            with open(o.file, "rb") as f:
+                v, _, _, raw, _ = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked
+            m = check_manifest(raw, ABI4 if v == 4 else ABI, o.arch)
+            try:
+                dev = device()
+            except (OSError, subprocess.CalledProcessError, PackError):
+                dev = None
+            print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), variants=plan(m, dev))))
+            return
         if o.cmd == "need":
             with open(o.file, "rb") as f:
                 v, blobs, base, raw, end = read_container_v(f, os.fstat(f.fileno()).st_size + (1 << 40))   # a prefix: sections are not range-checked

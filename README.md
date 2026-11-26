@@ -46,6 +46,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `pack show` | one line per bucket of a pack | 0, 1, 2 |
 | `pack need` | byte ranges to download for a model directory | 0, 1, 2 |
 | `pack runs` | does the visible device run this pack | 0, 1, 2, 3 |
+| `pack plan` | what each variant downloads, from a pack's first bytes | 0, 1, 2 |
 
 ### `serve`
 
@@ -126,6 +127,18 @@ Exit 0 runs, 3 no SKU runs, 1 pack refused.
 
     goethe-engine pack runs model.gcpack; echo $?
 
+
+### `pack plan`
+
+Reads a PREFIX file (the first bytes of a pack: 16 bytes, header, manifest) and prints `{"manifest_sha256", "variants": [{"id", "role",
+"quant", "source", "files": [{"name", "bytes"}], "max_ctx", "runs", "why"}]}`: per variant the model files a download fetches and from where
+(`source` {hf_repo, revision}), its longest context, and whether the visible device runs one of its SKUs (`runs` null without a visible
+device). No weights are needed; compare `manifest_sha256` with the index entry's. From pack ABI minor 2 every variant carries `desc.quant` and
+`source`. Exit 1: prefix malformed, `--arch` differs.
+
+- `PREFIX`, `--arch sm_XX`
+
+    goethe-engine pack plan model.prefix --arch sm_120a
 ### Numerics tiers
 
 `--numerics` on `serve`, `pack verify` and `pack need` (default `invariant`). A tier picks the buckets whose measured contract matches.

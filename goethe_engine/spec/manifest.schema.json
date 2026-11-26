@@ -36,6 +36,7 @@
                    "properties": {"sha256": {"type": "string", "pattern": "[0-9a-f]{64}"}, "keys": {"type": "array"}, "kv": {"type": "object"},
                                   "tensors": {"type": "array"}}},
      "weights": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+     "source": {"type": "object", "required": ["hf_repo"], "properties": {"hf_repo": {"type": "string", "minLength": 1}, "revision": {"type": "string"}}},
      "desc": {"type": "object", "properties": {"format": {"type": "string"}, "quant": {"type": "string"}, "registry_key": {"type": "string"},
                                               "broken": {"type": "string"}, "weights_id": {"type": "string", "pattern": "[0-9a-f]{64}"}}},
      "pins": {"type": "object", "properties": {"capture": {}, "reference": {}}}
