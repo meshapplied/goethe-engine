@@ -3,11 +3,16 @@ wraps a Hugging Face tokenizer directory through transformers (optional dependen
 import json
 import os
 
+# One row per model family's turn format: the token that opens a message, the one that ends it, and per part the token that says
+# what the part is. A tokenizer whose vocabulary holds every marker of a row as one token reads its model's output by that row.
+TURNS = (dict(head="<|message_model|>", end="<|end_message|>",
+              parts={"<|content_thinking|>": "reasoning", "<|content_text|>": "content", "<|content_invoke_tool_json|>": "tool"}),)
+
 
 class ByteTokenizer:
     """Ids 0..255 are bytes; 256 is the end token."""
 
-    vocab_size, eos_ids = 257, (256,)
+    vocab_size, eos_ids, turn = 257, (256,), None
 
     def encode(self, text):
         return list(text.encode())
@@ -15,7 +20,9 @@ class ByteTokenizer:
     def embed_input(self, text):
         return self.encode(text)
 
-    def chat(self, messages):
+    def chat(self, messages, tools=None, **kw):
+        if tools or kw:
+            raise ValueError("the byte tokenizer has no chat template for tools or template options")
         return self.encode("".join(f"<|{m['role']}|>{m['content']}\n" for m in messages) + "<|assistant|>")
 
     def decode(self, ids):
@@ -45,6 +52,10 @@ class HFTokenizer:
         # A generation ends on the tokenizer's eos and on every stop id the model declares.
         ids = ([] if e is None else [e]) + model_stop_ids(path)
         self.vocab_size, self.eos_ids = len(self.t), tuple(dict.fromkeys(ids))
+        tid = {s: self.t.convert_tokens_to_ids(s) for r in TURNS for s in (r["head"], r["end"], *r["parts"])}
+        ok = lambda s: isinstance(tid[s], int) and tid[s] != self.t.unk_token_id
+        self.turn = next((dict(head=tid[r["head"]], end=tid[r["end"]], parts={tid[k]: v for k, v in r["parts"].items()})
+                          for r in TURNS if all(map(ok, (r["head"], r["end"], *r["parts"])))), None)
 
     def encode(self, text):
         return self.t.encode(text, add_special_tokens=False)
@@ -53,10 +64,15 @@ class HFTokenizer:
         """An embedding model's input: the text with the tokenizer's special tokens (cls / sep, bos / eos) as the model was trained."""
         return self.t.encode(text, add_special_tokens=True)
 
-    def chat(self, messages):
+    def chat(self, messages, tools=None, **kw):
+        """Prompt ids of messages (and tools, and template options such as reasoning_effort) by the model's own chat template."""
         if not getattr(self.t, "chat_template", None):
             raise ValueError("the tokenizer has no chat template: use /v1/completions")
-        r = self.t.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+        from jinja2 import TemplateError
+        try:
+            r = self.t.apply_chat_template(messages, tools=tools, add_generation_prompt=True, tokenize=True, **kw)
+        except TemplateError as e:
+            raise ValueError(f"the chat template refused the request: {e}")
         return list(r["input_ids"] if hasattr(r, "keys") else r)   # transformers 5 returns a mapping
 
     def decode(self, ids):
@@ -79,7 +95,58 @@ class TextStream:
         return ""
 
     def flush(self):
+        """The text still held back (a trailing partial character)."""
         old = self.tok.decode(self.ids[self.prefix:self.read])
         cur = self.tok.decode(self.ids[self.prefix:])
         self.prefix = self.read = len(self.ids)
         return cur[len(old):]
+
+
+class Turn:
+    """A model turn's ids as parts: ("reasoning" | "content", text) as it streams, ("tool", {name, arguments}) once a call is whole.
+    fmt: a resolved TURNS row, None reads every id as content. The ids between a message's head and its part token (the sender's
+    name) are dropped when the part opens, and are content when none does. A call that is not {"name": str, "args": {...}} is
+    content, never dropped. O(1) per id."""
+
+    def __init__(self, tok, fmt=None):
+        self.tok, self.fmt = tok, fmt
+        self._reset()
+
+    def _reset(self):
+        self.kind, self.head, self.ts, self.call = None if self.fmt else "content", [], TextStream(self.tok), ""
+
+    def feed(self, ids, final=False):
+        out, f = [], self.fmt
+        for t in ids:
+            if f and (t == f["head"] or t == f["end"] or t in f["parts"]):
+                if t in f["parts"] and self.kind is None:
+                    self.head = []
+                self._close(out)
+                self.kind = f["parts"].get(t)
+            elif self.kind is None:
+                self.head.append(t)
+            else:
+                self._put(out, self.ts.feed([t]))
+        if final:
+            self._close(out)
+        return [p for p in out if p[1]]
+
+    def _put(self, out, s):
+        if self.kind == "tool":
+            self.call += s
+        else:
+            out.append((self.kind, s))
+
+    def _close(self, out):
+        if self.kind is None:
+            out.append(("content", self.tok.decode(self.head)))
+        else:
+            self._put(out, self.ts.flush())
+        if self.kind == "tool":
+            try:
+                j = json.loads(self.call)
+                ok = isinstance(j, dict) and isinstance(j.get("name"), str) and isinstance(j.get("args", {}), dict)
+            except ValueError:
+                ok = False
+            out.append(("tool", dict(name=j["name"], arguments=json.dumps(j.get("args", {}), ensure_ascii=False))) if ok else ("content", self.call))
+        self._reset()

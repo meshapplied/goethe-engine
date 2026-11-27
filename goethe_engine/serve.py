@@ -18,14 +18,14 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import numerics_kw as NK, pack as P_
-from .tokenizer import ByteTokenizer, HFTokenizer, TextStream
+from .tokenizer import ByteTokenizer, HFTokenizer, Turn
 
 MAX_BODY = 8 << 20
-UNSUPPORTED = ("tools", "tool_choice", "functions", "function_call", "logprobs", "top_logprobs", "logit_bias",
-               "suffix", "best_of", "echo")
+UNSUPPORTED = ("functions", "function_call", "logprobs", "top_logprobs", "logit_bias", "suffix", "best_of", "echo")
+CHAT_ONLY = ("tools", "tool_choice", "parallel_tool_calls", "reasoning_effort")
 # The body fields each route reads; any other non-null field is refused (unsupported_parameter), never silently ignored.
 FIELDS = {"generate": ("model", "messages", "prompt", "stream", "stream_options", "user", "max_tokens", "max_completion_tokens", "temperature",
-                       "top_p", "top_k", "seed", "n", "stop", "frequency_penalty", "presence_penalty", "response_format") + UNSUPPORTED,
+                       "top_p", "top_k", "seed", "n", "stop", "frequency_penalty", "presence_penalty", "response_format") + UNSUPPORTED + CHAT_ONLY,
           "embed": ("model", "input", "encoding_format", "user", "normalize", "dimensions", "truncation")}
 
 
@@ -47,26 +47,82 @@ class ApiError(Exception):
 
 
 class Choice:
-    """One output sequence: detokenizer and text-level stop strings (with the holdback a split stop string needs)."""
+    """One output sequence: its turn's parts (Turn) and text-level stop strings on its content (with the holdback a split stop
+    string needs). one_call: keep the first tool call only (parallel_tool_calls false)."""
 
-    def __init__(self, tok, stops):
-        self.ts, self.stops, self.held, self.text, self.stopped, self.finish = TextStream(tok), stops, "", "", False, None
-        self.ntok = 0
+    def __init__(self, tok, stops, fmt=None, one_call=False):
+        self.turn, self.stops, self.one_call, self.held, self.text, self.reasoning = Turn(tok, fmt), stops, one_call, "", "", ""
+        self.calls, self.stopped, self.finish, self.ntok = [], False, None, 0
 
     def feed(self, ids, final=False):
-        """Text that is safe to send now; sets stopped when a stop string completes (text before it is kept)."""
+        """[(part, text or call)] safe to send now; sets stopped when a stop string completes in the content (text before it is kept)."""
         if self.stopped:
-            return ""
+            return []
         self.ntok += len(ids)
-        self.held += self.ts.feed(ids) + (self.ts.flush() if final else "")
+        out = []
+        for k, v in self.turn.feed(ids, final):
+            if k == "content":
+                self.held += v
+            elif k == "reasoning":
+                self.reasoning += v
+                out.append((k, v))
+            elif not (self.one_call and self.calls):
+                self.calls.append(dict(id="call_" + uuid.uuid4().hex[:24], type="function", function=v))
+                out.append((k, dict(index=len(self.calls) - 1, **self.calls[-1])))
         cut = min((i for i in (self.held.find(s) for s in self.stops) if i >= 0), default=-1)
         if cut >= 0:
-            out, self.held, self.stopped, self.finish = self.held[:cut], "", True, "stop"
+            text, self.held, self.stopped, self.finish = self.held[:cut], "", True, "stop"
         else:
             keep = 0 if final else max((len(s) - 1 for s in self.stops), default=0)
-            out, self.held = self.held[:len(self.held) - keep], self.held[len(self.held) - keep:]
-        self.text += out
+            text, self.held = self.held[:len(self.held) - keep], self.held[len(self.held) - keep:]
+        if text:
+            self.text += text
+            out.append(("content", text))
         return out
+
+
+def message(m):
+    """An OpenAI chat message as a chat template takes it: text content (text parts joined, null as empty), and an assistant's tool
+    calls with their arguments parsed into an object (clients send a JSON string)."""
+    bad = lambda why: ApiError(400, why, code="invalid_parameter", param="messages")
+    if not isinstance(m, dict) or not isinstance(m.get("role"), str):
+        raise bad("each message needs a role")
+    c = m.get("content")
+    if isinstance(c, list):
+        c = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
+    if not isinstance(c, str) and c is not None:
+        raise bad("message content must be text")
+    out = dict(role=m["role"], content=c or "", **{k: m[k] for k in ("name", "tool_call_id", "reasoning_content") if isinstance(m.get(k), str)})
+    calls = m.get("tool_calls") or []
+    if not isinstance(calls, list):
+        raise bad("tool_calls must be a list")
+    for tc in calls:
+        f = tc.get("function") if isinstance(tc, dict) else None
+        a = f.get("arguments") if isinstance(f, dict) else None
+        try:
+            a = json.loads(a) if isinstance(a, str) and a.strip() else a or {}
+        except ValueError:
+            raise bad("a tool call's arguments are not JSON")
+        if not (isinstance(f, dict) and isinstance(f.get("name"), str) and isinstance(a, dict)):
+            raise bad("a tool call needs function.name and object arguments")
+        out.setdefault("tool_calls", []).append(dict(id=tc.get("id"), type="function", function=dict(name=f["name"], arguments=a)))
+    return out
+
+
+def chat_options(body, tok):
+    """Template keyword arguments of a chat request: its tools (refused when the engine cannot read this model's calls back) and
+    reasoning_effort."""
+    tools, choice = body.get("tools"), body.get("tool_choice")
+    if choice not in (None, "auto", "none"):
+        raise ApiError(400, "tool_choice must be auto or none", code="unsupported_parameter", param="tool_choice")
+    if tools is not None and not (isinstance(tools, list) and all(isinstance(t, dict) for t in tools)):
+        raise ApiError(400, "tools must be a list of tool objects", code="invalid_parameter", param="tools")
+    if tools and tok.turn is None:
+        raise ApiError(400, "tools are not supported: the engine cannot read this model's tool calls", code="unsupported_parameter", param="tools")
+    kw = dict(tools=tools if tools and choice != "none" else None)
+    if body.get("reasoning_effort") is not None:
+        kw["reasoning_effort"] = body["reasoning_effort"]
+    return kw
 
 
 KIND_WORD = {"decoder": "text", "embedding": "embedding", "encoder-decoder": "speech", "media": "speech"}   # the words customers see
@@ -369,15 +425,10 @@ class Handler(BaseHTTPRequestHandler):
                 ms = body.get("messages")
                 if not isinstance(ms, list) or not ms:
                     raise ApiError(400, "messages must be a non-empty list", code="invalid_parameter", param="messages")
-                msgs = []
-                for m in ms:
-                    c = m.get("content")
-                    if isinstance(c, list):
-                        c = "".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
-                    if not isinstance(c, str) or not isinstance(m.get("role"), str):
-                        raise ApiError(400, "each message needs a role and text content", code="invalid_parameter", param="messages")
-                    msgs.append(dict(role=m["role"], content=c))
-                return tok.chat(msgs)
+                return tok.chat([message(m) for m in ms], **chat_options(body, tok))
+            k = next((k for k in CHAT_ONLY if body.get(k) is not None), None)
+            if k:
+                raise ApiError(400, f"{k} is a chat parameter: use /v1/chat/completions", code="unsupported_parameter", param=k)
             p = body.get("prompt")
             if isinstance(p, list) and len(p) == 1 and isinstance(p[0], str):
                 p = p[0]
@@ -402,11 +453,17 @@ class Handler(BaseHTTPRequestHandler):
         obj = "text_completion" if not chat else "chat.completion.chunk" if stream else "chat.completion"
         mk = lambda ch, **kw: dict(id=cid, object=obj, created=int(time.time()), model=s.name, choices=ch, **kw)
 
-        def choice(i, text, fin=None):
-            if chat:
-                return dict(index=i, finish_reason=fin, **({"delta": {"content": text}} if stream else
-                                                           {"message": {"role": "assistant", "content": text}}))
-            return dict(index=i, text=text, finish_reason=fin)
+        def delta(i, k, v):
+            if not chat:
+                return dict(index=i, text=v, finish_reason=None)
+            return dict(index=i, finish_reason=None, delta={"tool_calls": [v]} if k == "tool" else {"reasoning_content" if k == "reasoning" else "content": v})
+
+        def final(i, c):
+            if not chat:
+                return dict(index=i, text=c.text, finish_reason=c.finish)
+            msg = dict(role="assistant", content=c.text if c.text or not c.calls else None)
+            msg.update({k: v for k, v in (("reasoning_content", c.reasoning), ("tool_calls", c.calls)) if v})
+            return dict(index=i, finish_reason=c.finish, message=msg)
 
         chs, closed, engine_done = {}, set(), set()
         try:
@@ -430,17 +487,17 @@ class Handler(BaseHTTPRequestHandler):
                     engine_done.add(o.index)
                 if o.index in closed:
                     continue
-                c = chs.setdefault(o.index, Choice(s.tok, stops))
-                text = c.feed(o.token_ids, final=o.finished)
+                c = chs.setdefault(o.index, Choice(s.tok, stops, s.tok.turn if chat else None, body.get("parallel_tool_calls") is False))
+                parts = c.feed(o.token_ids, final=o.finished)
                 if o.finished and not c.finish:
-                    c.finish = "length" if o.finish_reason == "length" else "stop"
+                    c.finish = "length" if o.finish_reason == "length" else "tool_calls" if c.calls else "stop"
                 if c.finish:
                     closed.add(o.index)
                 if stream:
-                    if text:
-                        self._sse(mk([choice(o.index, text)]))
+                    for k, v in parts:
+                        self._sse(mk([delta(o.index, k, v)]))
                     if c.finish:
-                        self._sse(mk([choice(o.index, "", c.finish)]))
+                        self._sse(mk([dict(delta(o.index, "content", ""), finish_reason=c.finish)]))
             if len(engine_done) < params.n:
                 s.cancel(rid)   # a stop string ended the choices early: free the engine's work
             u = dict(prompt_tokens=len(prompt), completion_tokens=sum(c.ntok for c in chs.values()))
@@ -452,7 +509,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
             else:
-                self._json(200, mk([choice(i, chs[i].text, chs[i].finish) for i in sorted(chs)], usage=u))
+                self._json(200, mk([final(i, chs[i]) for i in sorted(chs)], usage=u))
         except (BrokenPipeError, ConnectionResetError):
             s.cancel(rid)
             self.close_connection = True
