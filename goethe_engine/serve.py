@@ -47,15 +47,14 @@ class ApiError(Exception):
 
 
 class Choice:
-    """One output sequence: its turn's parts (Turn) and text-level stop strings on its content (with the holdback a split stop
-    string needs). one_call: keep the first tool call only (parallel_tool_calls false)."""
+    """One output sequence: its turn's parts, stop strings on its content, the first tool call only when one_call."""
 
     def __init__(self, tok, stops, fmt=None, one_call=False):
         self.turn, self.stops, self.one_call, self.held, self.text, self.reasoning = Turn(tok, fmt), stops, one_call, "", "", ""
         self.calls, self.stopped, self.finish, self.ntok = [], False, None, 0
 
     def feed(self, ids, final=False):
-        """[(part, text or call)] safe to send now; sets stopped when a stop string completes in the content (text before it is kept)."""
+        """The parts safe to send now; a completed stop string ends the content before it."""
         if self.stopped:
             return []
         self.ntok += len(ids)
@@ -82,8 +81,7 @@ class Choice:
 
 
 def message(m):
-    """An OpenAI chat message as a chat template takes it: text content (text parts joined, null as empty), and an assistant's tool
-    calls with their arguments parsed into an object (clients send a JSON string)."""
+    """An OpenAI chat message as a template takes it: text content, tool call arguments parsed from their JSON string."""
     bad = lambda why: ApiError(400, why, code="invalid_parameter", param="messages")
     if not isinstance(m, dict) or not isinstance(m.get("role"), str):
         raise bad("each message needs a role")
@@ -110,8 +108,7 @@ def message(m):
 
 
 def chat_options(body, tok):
-    """Template keyword arguments of a chat request: its tools (refused when the engine cannot read this model's calls back) and
-    reasoning_effort."""
+    """Template arguments of a chat request; tools are refused when the engine cannot read the model's calls back."""
     tools, choice = body.get("tools"), body.get("tool_choice")
     if choice not in (None, "auto", "none"):
         raise ApiError(400, "tool_choice must be auto or none", code="unsupported_parameter", param="tool_choice")

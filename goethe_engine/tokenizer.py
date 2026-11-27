@@ -3,8 +3,7 @@ wraps a Hugging Face tokenizer directory through transformers (optional dependen
 import json
 import os
 
-# One row per model family's turn format: the token that opens a message, the one that ends it, and per part the token that says
-# what the part is. A tokenizer whose vocabulary holds every marker of a row as one token reads its model's output by that row.
+# Turn formats, one row per model family: a vocabulary holding a row's markers as single tokens reads its output by that row.
 TURNS = (dict(head="<|message_model|>", end="<|end_message|>",
               parts={"<|content_thinking|>": "reasoning", "<|content_text|>": "content", "<|content_invoke_tool_json|>": "tool"}),)
 
@@ -65,7 +64,6 @@ class HFTokenizer:
         return self.t.encode(text, add_special_tokens=True)
 
     def chat(self, messages, tools=None, **kw):
-        """Prompt ids of messages (and tools, and template options such as reasoning_effort) by the model's own chat template."""
         if not getattr(self.t, "chat_template", None):
             raise ValueError("the tokenizer has no chat template: use /v1/completions")
         from jinja2 import TemplateError
@@ -95,7 +93,6 @@ class TextStream:
         return ""
 
     def flush(self):
-        """The text still held back (a trailing partial character)."""
         old = self.tok.decode(self.ids[self.prefix:self.read])
         cur = self.tok.decode(self.ids[self.prefix:])
         self.prefix = self.read = len(self.ids)
@@ -103,10 +100,7 @@ class TextStream:
 
 
 class Turn:
-    """A model turn's ids as parts: ("reasoning" | "content", text) as it streams, ("tool", {name, arguments}) once a call is whole.
-    fmt: a resolved TURNS row, None reads every id as content. The ids between a message's head and its part token (the sender's
-    name) are dropped when the part opens, and are content when none does. A call that is not {"name": str, "args": {...}} is
-    content, never dropped. O(1) per id."""
+    """Turn ids as (reasoning | content, text) pieces and whole (tool, call) parts; a call that does not parse stays content. O(1) per id."""
 
     def __init__(self, tok, fmt=None):
         self.tok, self.fmt = tok, fmt
