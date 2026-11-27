@@ -116,24 +116,41 @@ def test_pack_sign_writes_a_signature_that_verifies(tmp_path, key, mocklib, caps
 
 
 
-def attest(pack, failures=()):
-    """A pack check record for every arch of the pack, as pack check writes it on each arch's device."""
+def attest(pack, failures=(), arches=None):
+    """A pack check record for each arch of the pack (or those given), as pack check writes it on each arch's device."""
     import hashlib
     raw = P.read_container_v(open(pack, "rb"), os.path.getsize(pack))[3]
     m = json.loads(raw)
-    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]}
+    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]
+           if arches is None or b["requires"]["arch"] in arches}
     open(pack + ".check.json", "w").write(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec)))
 
 
-def test_a_spec_pack_publishes_only_with_a_passing_check_of_its_manifest(tmp_path, key, mocklib):
-    pack, _ = spec_pack(tmp_path, key, mocklib, attested=False)
+def test_a_spec_pack_is_listed_only_on_the_arches_its_check_passed(tmp_path, key, mocklib):
+    pack, _ = spec_pack(tmp_path, key, mocklib, arches=(("a", "sm_120a", "12.0"), ("b", "sm_89", "8.9")), attested=False)
     for fails in (None, ["t: seeds give the same tokens"]):
         if fails:
             attest(pack, fails)
-        with pytest.raises(I.IndexError_, match="no passing pack check"):
+        with pytest.raises(I.IndexError_, match="no target has a passing pack check"):
             I.entries(pack, trusted=(key.kid,))
-    attest(pack)
-    assert I.entries(pack, trusted=(key.kid,))
+    attest(pack, arches=("sm_120a",))
+    left = []
+    assert [e["arch"] for e in I.entries(pack, trusted=(key.kid,), left=left)] == ["sm_120a"] and left == [("q4", "sm_89")]
+
+
+def test_a_dropped_pack_leaves_the_index_and_a_drop_must_name_one_of_it(tmp_path, key, mocklib):
+    old, _ = spec_pack(tmp_path / "o", key, mocklib)
+    new, _ = spec_pack(tmp_path / "n", key, mocklib)
+    os.rename(new, str(tmp_path / "n" / "new.gcpack"))
+    for ext in (".sig", ".check.json"):
+        os.rename(new + ext, str(tmp_path / "n" / "new.gcpack") + ext)
+    new = str(tmp_path / "n" / "new.gcpack")
+    I.build([old], 9, EXPIRES, key.priv, str(tmp_path / "v9"), trusted=(key.kid,))
+    base = tuple(open(tmp_path / "v9" / n, "rb").read() for n in ("index.json", "index.sig"))
+    ix = I.build([new], 10, EXPIRES, key.priv, str(tmp_path / "v10"), trusted=(key.kid,), base=base, drop=["toy.gcpack"])
+    assert {e["file"] for e in ix["entries"]} == {"new.gcpack"}
+    with pytest.raises(I.IndexError_, match="not in the current index"):
+        I.build([new], 10, EXPIRES, key.priv, str(tmp_path / "v10b"), trusted=(key.kid,), base=base, drop=["nope.gcpack"])
 
 
 @pytest.mark.parametrize("mode,ok", [("sample", True), ("argmax", False), (None, False)])
