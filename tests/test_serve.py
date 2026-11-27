@@ -210,3 +210,56 @@ def test_wrong_task_names_the_model_kinds_customers_see(srv):
     assert "this model is a text model, not an embedding model" in r["error"]["message"]
     st, r = call(srv[0], "/v1/models")
     assert r["data"][0]["kind"] == "text"
+
+
+class _Chars:
+    """Ids below 1000 are characters; 1001 .. are a turn format's markers."""
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids if i < 1000)
+
+
+FMT = dict(parts={1001: ("head", None), 1003: ("reasoning", 1002), 1004: ("content", 1002), 1005: ("tool", 1002)}, args="args")
+PAIRS = dict(parts={1006: ("reasoning", 1007), 1008: ("tool", 1009)}, args="arguments")     # open/close pairs, text between is content
+_s = lambda x: [ord(c) for c in x]
+
+
+@pytest.mark.parametrize("fmt,ids,want", [
+    (FMT, [1001, 1003, *_s("hm"), 1002, 1001, 1004, *_s("hi"), 1002], [("reasoning", "hm"), ("content", "hi")]),
+    (FMT, [1001, *_s("f"), 1005, *_s('{"name":"f","args":{"a":1}}'), 1002], [("tool", {"name": "f", "arguments": '{"a": 1}'})]),
+    (FMT, [1001, 1005, *_s('{"args":1}'), 1002], [("content", '{"args":1}')]),        # not a call: kept as text, never dropped
+    (FMT, _s("no markers"), [("content", "no markers")]),
+    (PAIRS, [1006, *_s("hm"), 1007, *_s("ok "), 1008, *_s('{"name":"g","arguments":{}}'), 1009],
+     [("reasoning", "hm"), ("content", "ok "), ("tool", {"name": "g", "arguments": "{}"})]),
+])
+def test_a_turn_reads_reasoning_content_and_whole_tool_calls_alike_streamed_or_not(fmt, ids, want):
+    from goethe_engine.tokenizer import Turn
+    join = lambda ps: [(k, "".join(v for _, v in g)) if k != "tool" else (k, next(g)[1])
+                       for k, g in __import__("itertools").groupby(ps, key=lambda p: p[0])]
+    t = Turn(_Chars(), fmt)
+    assert join(Turn(_Chars(), fmt).feed(ids, True)) == join(sum((t.feed([i]) for i in ids), []) + t.feed([], True)) == want
+
+
+def test_a_choice_stops_on_content_only_and_keeps_one_call_when_asked():
+    calls = [1001, 1005, *_s('{"name":"f","args":{}}'), 1002] * 2
+    c = serve.Choice(_Chars(), ("hm",), FMT, one_call=True)
+    c.feed([1001, 1003, *_s("hm"), 1002, *calls, 1001, 1004, *_s("ahmb"), 1002], final=True)
+    assert (c.reasoning, [x["function"]["name"] for x in c.calls], c.text, c.finish) == ("hm", ["f"], "a", "stop")
+
+
+def test_messages_are_parsed_once_at_the_boundary():
+    m = serve.message(dict(role="assistant", content=None, tool_calls=[dict(id="c", function=dict(name="f", arguments='{"x": 1}'))]))
+    assert m == dict(role="assistant", content="", tool_calls=[dict(id="c", type="function", function=dict(name="f", arguments={"x": 1}))])
+    for bad in (dict(role="user", content=3), dict(role="assistant", tool_calls=[dict(function=dict(name="f", arguments="{x"))])):
+        with pytest.raises(serve.ApiError):
+            serve.message(bad)
+
+
+def test_tools_are_refused_where_the_engine_cannot_read_calls_back(srv):
+    base, _ = srv
+    tool = dict(type="function", function=dict(name="f", parameters={}))
+    for path, body in (("/v1/chat/completions", dict(messages=[{"role": "user", "content": "x"}], tools=[tool])),
+                       ("/v1/chat/completions", dict(messages=[{"role": "user", "content": "x"}], tool_choice="required")),
+                       ("/v1/completions", dict(prompt="x", tools=[tool]))):
+        st, j = call(base, path, body)
+        assert st == 400 and j["error"]["code"] == "unsupported_parameter", (body, j)
