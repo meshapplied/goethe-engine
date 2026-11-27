@@ -24,6 +24,8 @@ def test_plan_lists_each_variant_with_its_files_context_and_device_fit(tmp_path,
     assert {k: [f["name"] for f in v["files"]] for k, v in by.items()} == {"q4": ["w.gguf"], "d": ["d.gguf"], "alt": ["alt.gguf"]}
     assert all(f["bytes"] > 0 for v in by.values() for f in v["files"])
     assert by["q4"]["max_ctx"] == 256 and by["q4"]["runs"] is True and by["d"]["runs"] is None
+    assert by["q4"]["lanes"] == 1, "a variant with a speculative pair: the streams its single-stream verify target serves"
+    assert by["alt"]["lanes"] == max(P.lanes(b) for b in m["buckets"] if b["variant"] == "alt"), "else its widest batch"
     slow = next(v for v in P.plan(m, dict(DEV, cc="9.0")) if v["id"] == "q4")
     assert slow["runs"] is False and "cc 9.0" in slow["why"]
     assert all(v["runs"] is None for v in P.plan(m))                       # no device asked: no answer, never a guess
