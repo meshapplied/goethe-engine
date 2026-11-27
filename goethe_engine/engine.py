@@ -161,7 +161,7 @@ class Engine:
         if s.finished:
             return
         s.finished = reason
-        if reason in ("stop", "length"):
+        if reason in ("stop", "length") and s.sid not in self._inflight_sids:
             self._copy(self.kv.snapshot(s))
         if s.sid in self._inflight_sids:
             for q in (self.sched.waiting, self.sched.running):
@@ -245,7 +245,7 @@ class Engine:
     def _can_chain(self, items, work, dev_tok):
         if not (self._async and dev_tok and items) or self.inbox or self.sched.waiting or self._discard:
             return False
-        if self.drafter is not None or self.feats or self.kv.snaps or self.kv.bsnaps:
+        if self.drafter is not None or self.feats:
             return False
         if self.width and not (self._spec_chain and len(items) == 1):
             return False
@@ -266,10 +266,10 @@ class Engine:
                 return False
             nb = len(s.blocks)
             need = -(-rows // bs)
+            if any(pool.ref[s.blocks[i]] > 1 for i in range(s.computed // bs, min(nb, need))):
+                return False
             if need > nb:
                 need_free += need - nb
-            elif nb and pool.ref[s.blocks[-1]] > 1:
-                return False
         return need_free <= len(pool.free)
 
     def _chain_rows(self, s, w):
