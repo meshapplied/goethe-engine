@@ -30,7 +30,8 @@ class Engine:
         g = backend.geometry
         linear = bool(getattr(backend, "spec_width", 0))   # a spec pair runs one stream; page packs run many (a block is a sequence page)
         bounded = bool(getattr(backend, "bounded", False))
-        snaps = 0 if linear or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
+        shut = linear and not caps_of(backend)["state_restore"]   # a pair keeps snapshot pages only when its pack restores them
+        snaps = 0 if shut or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
         if cfg.max_num_seqs is None or cfg.prefix_cache is None:   # unset knobs follow what the backend can do; explicit ones are checked below
             cfg = replace(cfg, max_num_seqs=(1 if linear else min(64, backend.max_seqs)) if cfg.max_num_seqs is None else cfg.max_num_seqs,
                           prefix_cache=(snaps > 0 if bounded or not getattr(backend, "paged", True) else not linear and not caps_of(backend)["recurrent"] and getattr(backend, "prefix_cache", True)) if cfg.prefix_cache is None else cfg.prefix_cache)
@@ -42,7 +43,7 @@ class Engine:
             raise ValueError("token budget below one verify step")
         self.backend, self.cfg, self.grammar, self.eos = backend, cfg, grammar, set(eos_ids)
         self.width = getattr(backend, "spec_width", 0)
-        pages = 0 if self.width or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
+        pages = 0 if shut or (getattr(backend, "paged", True) and not bounded) else getattr(backend, "state_pages", 0)
         if cfg.prefix_cache and not pages and (self.width or bounded or not getattr(backend, "paged", True)):
             raise ValueError("backend has no prefix cache: no paged KV and no snapshot pages")
         if cfg.max_model_len > getattr(backend, "max_len", cfg.max_model_len):
@@ -257,7 +258,7 @@ class Engine:
                 return False
             if not (w.greedy or w.sample) or s.nout + 1 >= s.limit:
                 return False
-            if self.width and (not w.greedy or s.params.stop_sequences):
+            if self.width and (not (w.greedy or (w.sample and self.caps["round_step"])) or s.params.stop_sequences):
                 return False
             pos, rows = self._chain_rows(s, w)
             if rows > self.cfg.max_model_len:
@@ -288,7 +289,8 @@ class Engine:
             assert pairs == [], "chained reserve must not copy or fail"
             next_items.append(Item(s, 1, _EMPTY_TREE, it.spec))
             next_work.append(Work(s.sid, [0], pos, s.blocks, 1, w.greedy, it.spec, None, False,
-                                  w.sample, w.temperature, w.top_p, w.top_k, w.seed, w.step_idx + 1,
+                                  w.sample, w.temperature, w.top_p, w.top_k, w.seed,
+                                  pos - s.nprompt + 1 if self.width else w.step_idx + 1,   # a pair's step follows its placeholder position
                                   None, True, s.blocks_ver))
         return next_items, next_work
 

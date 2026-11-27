@@ -88,12 +88,13 @@ Exit 1: bad signature, key not pinned, schema, `serial < --last-serial`, expired
 Writes `index.json` and `index.sig` into `--out` for the signed packs given with `--pack` (each with `PACK.sig` beside it), signed with
 `--key`: one entry per (arch, target variant). An entry's `model` is that variant's `source` and files (name, bytes, sha256), its
 `structure` that variant's fingerprint, and `model.with` the drafters its speculative pairs name, each with its own source and files.
-With `--index F --sig F` (the current index) its entries for other pack files are kept, after it verifies, and `--serial` must be above
-its own. The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two
+With `--index F --sig F` (the current index) its entries for other pack files are kept, after it verifies, except those of each
+`--drop F` pack, and `--serial` must be above its own. A paired target is listed only on the arches its pack check passed, and a variant
+only when its sources pin a revision; what is left out is named in the output (`left_out`), and a pack with nothing to list is refused. The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two
 formats in one variant, a current index that does not verify, a serial not above it.
 
 - `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--index F --sig F`
-  (the current index), `--tier T` (default base), `--min-engine V` (default this engine's version)
+  (the current index), `--drop F` (repeatable, with `--index`), `--tier T` (default base), `--min-engine V` (default this engine's version)
 
     goethe-engine index build --pack model.gcpack --serial 9 --expires 2027-03-01T00:00:00Z --key index_key.pem --out site/
 ### `pack match`
@@ -183,9 +184,12 @@ pack built and signed with one key is re-signed with another without a rebuild. 
 ### `pack check`
 
 Runs, on the visible device, each speculative pair of a signed pack the loader serves (per numerics tier) at temperature 1 with seeds 1, 2
-and 3: a pair passes when each seed samples what its target alone samples and the seeds differ. Records the result per arch in
-`FILE.check.json`, bound to the manifest's sha256 (a run on another arch's device adds that arch). `index build` refuses a paired
-target on an arch without a passing record. Prints `{"pairs", "failures"}`; exit 1 when a pair fails.
+and 3: a pair passes when each seed samples what its target alone samples and the seeds differ. It also proves, at invariant numerics,
+that a prompt continues the same prefilled whole and in 16-token chunks, and, for an invariant pair whose bucket declares `spec_caps.state_restore`,
+that a turn restored from its snapshot (after the turn before ran on past it) continues as a cold one. A pair whose bucket declares
+`spec_caps.round_step` has its sampled rounds chained, so the seed check proves those too. Records the result per arch in
+`FILE.check.json`, bound to the manifest's sha256 (a run on another arch's device adds that arch). `index build` lists a paired
+target only on arches with a passing record. Prints `{"pairs", "failures"}`; exit 1 when a pair fails.
 
 - `FILE`, `--weights TARGET DRAFTER` (required), `--sku S`
 
