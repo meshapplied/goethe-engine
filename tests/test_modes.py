@@ -49,6 +49,34 @@ def test_spec_round_backend_tokens_equal_greedy_and_truncate_at_stops(width):
     assert len(toks(run(e))[("l", 0)]) == 5
 
 
+class SnapSpec(FakeSpec):
+    """A pair whose stream state is lost on release and comes back from a snapshot page (a pack declaring state_restore)."""
+
+    bounded, state_pages, caps = True, 2, {"state_restore": True}
+
+    def __init__(self):
+        super().__init__(4)
+        self.saved, self.restores = {}, 0
+
+    def save_state(self, sid, snap):
+        self.saved[snap] = list(self.buf)
+
+    def restore_state(self, snap, sid):
+        self.buf, self.restores = list(self.saved[snap]), self.restores + 1
+
+    def release(self, sid):
+        self.buf = []
+
+
+def test_a_pair_that_restores_snapshots_serves_the_next_turn_from_its_prefix():
+    e = Engine(SnapSpec(), Config(max_model_len=150))
+    t1, t2 = prompt(20), prompt(20) + prompt(8, 33)
+    for rid, p in (("t1", t1), ("t2", t2)):
+        e.add_request(rid, p, P(max_tokens=6))
+        assert toks(run(e))[(rid, 0)] == fake_greedy(p, 6)
+    assert e.backend.restores == 1 and e.metrics()["prefix_hit_tokens"] == len(t1) - 1
+
+
 def test_linear_stream_backend_config_is_checked():
     for cfg in (Config(max_num_seqs=2, prefix_cache=False, max_model_len=100), Config(max_num_seqs=1, prefix_cache=True, max_model_len=100)):
         with pytest.raises(ValueError):

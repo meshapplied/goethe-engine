@@ -4,8 +4,9 @@ from dataclasses import replace
 
 import pytest
 
-from conftest import FakeSpec, fake_greedy
+from conftest import FakeSpec, alone, fake_greedy, fold, row
 from goethe_engine import Config, Engine, SamplingParams as P
+from goethe_engine.sampling import sample
 
 W = 4
 MML = 100
@@ -33,6 +34,7 @@ class AsyncSpec(FakeSpec):
                 assert w.pos <= pos, "placeholder position above the device position"
                 assert pos + self.spec_width <= MML, "chained round writes rows past max_model_len"
             assert pos <= len(buf)
+            step = w.step_idx + (pos - w.pos)     # the step a round samples at, from the device position (spec_caps.round_step)
             self.begun.append((w, pos))
             buf[pos:] = tok
             if not w.want:
@@ -40,7 +42,7 @@ class AsyncSpec(FakeSpec):
                 continue
             k = self.ks[self.round % len(self.ks)] if w.spec else 1
             self.round += w.spec
-            out = fake_greedy(buf, k)
+            out = fake_sample(buf, k, P(temperature=w.temperature, top_p=w.top_p, top_k=w.top_k), w.seed, step) if w.sample else fake_greedy(buf, k)
             buf += out[:-1] if w.spec else []
             self.last[w.sid] = out[-1]
             res.append(out)
@@ -49,6 +51,32 @@ class AsyncSpec(FakeSpec):
 
     def step_wait(self, handle):
         return self.q.pop(0)
+
+
+def fake_sample(tokens, k, p, seed, step):
+    """k tokens sampled from the fake model's rows at steps step .. step + k - 1, as the logits path draws them."""
+    h, out, toks = 7, [], list(tokens)
+    for q, t in enumerate(toks):
+        h = fold(h, t, q)
+    for i in range(k):
+        t = sample(row(h)[None], [p], [seed], [step + i], [None])[0]
+        out.append(t)
+        h = fold(h, t, len(toks))
+        toks.append(t)
+    return out
+
+
+class StepSpec(AsyncSpec):
+    caps = {"round_step": True}
+
+
+def test_a_pack_that_steps_on_the_device_chains_sampled_rounds_exactly():
+    sp = P(temperature=1.0, seed=5, max_tokens=30)
+    for be, chained in ((StepSpec(), True), (AsyncSpec(), False)):
+        e = engine(be)
+        e.add_request("a", [1, 2, 3], sp)
+        assert run_all(e, be)[0]["a"] == alone([1, 2, 3], sp)[("r", 0)]
+        assert any(w.prev_token and w.sample for w, _ in be.begun) == chained, "sampled rounds chain only on a pack that steps on the device"
 
 
 def engine(be=None, **kw):
@@ -188,7 +216,8 @@ def test_batch_and_non_greedy_run_unchained_and_exact():
         for i in range(seqs):
             e.add_request("abc"[i], [1, 2, 3 + i], P(max_tokens=12, **kw))
         got, _, _ = run_all(e, be, check=False)
-        assert all(got["abc"[i]] == fake_greedy([1, 2, 3 + i], 12) for i in range(seqs)), kw
+        want = lambda p: alone(p, P(max_tokens=12, **kw))[("r", 0)] if kw.get("temperature") else fake_greedy(p, 12)
+        assert all(got["abc"[i]] == want([1, 2, 3 + i]) for i in range(seqs)), kw
         chained = [n for (w, _), n in zip(be.begun, be.sizes) if w.prev_token]
         assert chained == ([1] * len(chained) if seqs == 2 else []), kw   # a lone survivor of a batch may chain, a pair never
         assert (2 in be.sizes) == (seqs == 2), kw

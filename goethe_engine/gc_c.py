@@ -325,7 +325,8 @@ class GcBackend:
         self.paged = bool(lo.flags & L_PAGED)
         self.state_pages = lo.state_pages   # snapshot pages: ids num_blocks ..., only copy_blocks addresses them
         self.bounded = bool(lo.flags & L_BOUNDED)   # window ring or recurrent state in the sequence's slot: a prefix is not shareable by block
-        self.prefix_cache = not self.spec and ((self.paged and not self.bounded) or self.state_pages > 0)
+        restore = (b.get("spec_caps") or {}).get("state_restore") is True   # a pair whose pack declares snapshot restore keeps a prefix cache
+        self.prefix_cache = (not self.spec or restore) and ((self.paged and not self.bounded) or self.state_pages > 0)
         self.vocab_size, self.max_seqs, self.max_len, self.feat_width = lo.vocab, lo.max_seqs, lo.max_ctx, lo.feat_width
         self.geometry = KVGeometry(lo.block_size, lo.num_blocks, lo.layers, lo.kv_heads, lo.head_dim,
                                    KV_DTYPE.get(lo.kv_dtype, "f16"))
