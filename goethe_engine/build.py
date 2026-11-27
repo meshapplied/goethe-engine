@@ -96,7 +96,7 @@ SEEDS = (1, 2, 3)
 def check(pack, weights, drafter, trusted=None, n=32, sku=None):
     """{arch, pairs, failures} on this device, each a claim the pack makes proved by running it: a speculative pair the loader serves (per
     numerics) samples at temperature 1 what its target alone samples, seed by seed, and the seeds differ; at invariant numerics a prompt
-    continues the same whole and chunked; a pair that declares state_restore continues a restored turn as a cold one. O(pairs x seeds x n) steps."""
+    continues the same whole and chunked, and a pair that declares state_restore continues a restored turn as a cold one. O(pairs x seeds x n) steps."""
     from .api import Model
     # ponytail: the pairs the loader picks per numerics, not every pair of the arch; check each when a pack serves a pair by policy
     pairs, failures, arch = [], [], None
@@ -118,19 +118,20 @@ def check(pack, weights, drafter, trusted=None, n=32, sku=None):
                     except RuntimeError as e:
                         found.append((b["id"], e))
                     arch = b["requires"]["arch"]
-                    if d and mo.backend.caps["state_restore"]:
+                    restored = None
+                    if d and numerics == "invariant" and mo.backend.caps["state_restore"]:   # exact only where prefill is chunk invariant
                         t1 = prompt(mo, 512)
                         t2 = t1 + t1[:16]
                         try:
                             mo.generate([t1], 2 * n, temperature=0.0)   # turn 1 runs on past its snapshot
-                            warm = runs(mo, t2, (None, 1))
-                            with model(d, numerics, prefix_cache=False) as cold:
-                                ok = warm == runs(cold, t2, (None, 1))
+                            restored = (t2, runs(mo, t2, (None, 1)))
                         except RuntimeError as e:
-                            ok = False
-                            warm = e
-                        if not ok:
-                            failures.append(f"{b['id']}: a turn restored from its snapshot continues unlike a cold one (state_restore){': ' + str(warm) if isinstance(warm, Exception) else ''}")
+                            restored = (t2, e)
+                if restored:                     # the cold turn on a handle of its own, once the warm one is closed (one model on the device at a time)
+                    with model(d, numerics, prefix_cache=False) as cold:
+                        if restored[1] != runs(cold, restored[0], (None, 1)):
+                            failures.append(f"{b['id']}: a turn restored from its snapshot continues unlike a cold one (state_restore)"
+                                            + (f": {restored[1]}" if isinstance(restored[1], Exception) else ""))
             except P.PackError:
                 break                    # the pack serves nothing at these numerics on this device
         if numerics == "invariant" and found:
