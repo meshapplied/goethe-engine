@@ -121,11 +121,11 @@ def source(m, vid):
                 files=[dict(name=f["file"], bytes=f["bytes"], sha256=f["sha256"]) for f in fs])
 
 
-def entries(path, tier="base", min_engine=__version__, trusted=None, left=None):
+def entries(path, tier="base", min_engine=__version__, trusted=None, left=None, untested=False):
     """The index entries of the pack at path, its signature (PATH.sig) checked against trusted: one per (arch, target variant), the model
     being that variant's source, with the drafters its speculative pairs name under model.with. Left out, each named in left: a variant
-    whose sources pin no revision (nothing a client could download), a paired target on an arch without a passing pack check. A pack
-    left with no entry is refused. O(variants x buckets)."""
+    whose sources pin no revision (nothing a client could download), a paired target on an arch without a passing pack check (with
+    untested, listed at tier "untested" instead, so a client can say so). A pack left with no entry is refused. O(variants x buckets)."""
     f, _, _, size, raw, _, v = pack._open_signed(path, None, None, trusted)
     f.close()
     need(v == 3, f"{path}: pack {v}: this index lists pack 3")
@@ -147,21 +147,22 @@ def entries(path, tier="base", min_engine=__version__, trusted=None, left=None):
                         if drafters else {}))
         for arch in sorted({b["requires"]["arch"] for b in m["buckets"] if b["variant"] == vid}):
             c = ok.get(arch)
-            if drafters and not (c and c["pairs"] and not c["failures"]):
+            checked = not drafters or (c and c["pairs"] and not c["failures"])
+            if not checked and (not untested or (c and c["failures"])):   # a failed check is never listed
                 left.append(f"{vid} on {arch}: no passing pack check")
                 continue
-            out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier, file=os.path.basename(path),
+            out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier if checked else "untested", file=os.path.basename(path),
                             manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine))
     need(out, f"{path}: nothing to list ({'; '.join(left)}): pin the sources' revisions, or run pack check on a device of an arch")
     return out
 
 
-def build(packs, serial, expires, key, out, tier="base", min_engine=__version__, now=None, trusted=None, base=None, drop=(), left=None):
+def build(packs, serial, expires, key, out, tier="base", min_engine=__version__, now=None, trusted=None, base=None, drop=(), left=None, untested=False):
     """Write out/index.json and out/index.sig for the packs (each signed by a key in trusted), signed with key; with base (the current
     index bytes and signature, verified against trusted) its entries for other pack files are kept and serial must be above its own.
     Checked by verify before anything is written; drop: pack files whose kept entries are removed. Returns the index dict."""
     now = now or datetime.now(timezone.utc)
-    new = [e for p in packs for e in entries(p, tier, min_engine, trusted, left)]
+    new = [e for p in packs for e in entries(p, tier, min_engine, trusted, left, untested)]
     kept = []
     need(not drop or base, "--drop removes entries of the current index: pass --index and --sig")
     if base:
@@ -251,6 +252,7 @@ Exit: 0 ok; 1 refused (bad signature, key id not pinned, schema, serial < --last
     ap.add_argument("--sig")
     ap.add_argument("--pack", action="append", default=[], help="build: a signed pack (PACK.sig beside it); repeatable")
     ap.add_argument("--drop", action="append", default=[], help="build: a pack file of the current index whose entries are removed; repeatable")
+    ap.add_argument("--untested", action="store_true", help="build: list a paired target on an arch without a pack check at tier untested")
     ap.add_argument("--serial", type=int, help="build: the index serial (above the last published one)")
     ap.add_argument("--expires", help="build: YYYY-MM-DDTHH:MM:SSZ")
     ap.add_argument("--key", help="build: the private key PEM that signs the index")
@@ -273,7 +275,7 @@ def main(argv, trusted=None):
             need(a.pack and a.serial and a.expires and a.key and a.out, "build needs --pack, --serial, --expires, --key and --out")
             base = (pack.read_capped(a.index), pack.read_capped(a.sig, sign.MAX_SIG)) if a.index else None
             left = []
-            ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted, base=base, drop=a.drop, left=left)
+            ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted, base=base, drop=a.drop, left=left, untested=a.untested)
             print(json.dumps(dict(serial=ix["serial"], expires=ix["expires"], entries=len(ix["entries"]), out=a.out,
                                   left_out=left)))
             return 0

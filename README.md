@@ -40,6 +40,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 |---|---|---|
 | `serve` | OpenAI-compatible server for a pack and its weights | 0, 1, 2 |
 | `worker` | worker protocol v1 over a unix socket | 0, 2 |
+| `turn` | what a model's turn holds (reasoning, tool calls), by its turn format | 0, 1, 2 |
 | `index verify` | check a signed pack index | 0, 1, 2 |
 | `index build` | write and sign a pack index from signed packs | 0, 1, 2 |
 | `pack match` | pick the pack for a model directory from an index | 0, 1, 2, 3 |
@@ -73,6 +74,15 @@ Worker protocol v1 (`goethe_engine/spec/proto/worker.proto`). Needs `[worker]`.
 
     goethe-engine worker --socket /tmp/ge.sock
 
+### `turn`
+
+Prints `{"reasoning", "tools"}` for a Hugging Face tokenizer directory: whether the turn format the engine reads the model's output by
+(one row per model family) has a reasoning part and a tool-call part; both false when no row matches its vocabulary. Needs `[serve]`.
+
+- `DIR` (required)
+
+    goethe-engine turn ./model
+
 ### `index verify`
 
 Checks the index signature, the pinned key, the schema, expiry and rollback. Prints `{"serial", "expires", "keyid", "entries"}`.
@@ -94,7 +104,7 @@ only when its sources pin a revision; what is left out is named in the output (`
 formats in one variant, a current index that does not verify, a serial not above it.
 
 - `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--index F --sig F`
-  (the current index), `--drop F` (repeatable, with `--index`), `--tier T` (default base), `--min-engine V` (default this engine's version)
+  (the current index), `--drop F` (repeatable, with `--index`), `--untested` (an arch built but never checked is listed at tier `untested`; one whose check failed never is), `--tier T` (default base), `--min-engine V` (default this engine's version)
 
     goethe-engine index build --pack model.gcpack --serial 9 --expires 2027-03-01T00:00:00Z --key index_key.pem --out site/
 ### `pack match`
