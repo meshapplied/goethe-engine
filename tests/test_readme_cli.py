@@ -23,6 +23,7 @@ IDX, PK = index.parser(), pack.parser()
 GROUPS = {
     "serve": ("serve", serve.parser()),
     "worker": ("worker", cli.worker_parser()),
+    "turn": ("turn", cli.turn_parser()),
     "index verify": ("index", IDX),
     "index build": ("index", IDX),
     "pack match": ("index", IDX),
