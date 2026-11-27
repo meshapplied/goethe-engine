@@ -48,8 +48,8 @@ struct gc_handle {
   int32_t *tok;
   int64_t *rpos;
   seqent seqs[MAXSEQ];
-  int32_t buf[SPECCTX];
-  uint32_t nbuf, rounds;
+  int32_t buf[SPECCTX], sbuf[2][SPECCTX];   /* sbuf: snapshot pages of the stream (GCK_MOCK_SPEC_STATE) */
+  uint32_t nbuf, rounds, snb[2];
   async_slot q[MAX_Q];
   int q_head, q_tail, q_len;
   char err[256];
@@ -183,7 +183,7 @@ GC_API int gc_layout_get(gc_handle *h, gc_layout *o) {
   memset(&l, 0, sizeof l);
   l.size = sizeof l;
   l.flags = GC_L_DEVICE_ARGMAX | (h->spec ? GC_L_SPEC : GC_L_PAGED) |
-            (!h->spec && getenv("GCK_MOCK_BOUNDED") ? GC_L_BOUNDED : 0);
+            ((!h->spec && getenv("GCK_MOCK_BOUNDED")) || (h->spec && getenv("GCK_MOCK_SPEC_STATE")) ? GC_L_BOUNDED : 0);
 #ifndef GC_MOCK_ABI_12
   if (h->spec && getenv("GCK_MOCK_SPEC")) l.flags |= GC_L_DEVICE_SAMPLE;
   if (!h->spec) {
@@ -206,7 +206,8 @@ GC_API int gc_layout_get(gc_handle *h, gc_layout *o) {
     l.max_seqs = 1;
     l.max_ctx = SPECCTX;
     l.block_size = SPECCTX;
-    l.num_blocks = 1;
+    l.num_blocks = getenv("GCK_MOCK_SPEC_STATE") ? 2 : 1;
+    l.state_pages = getenv("GCK_MOCK_SPEC_STATE") ? 2 : 0;
     l.spec_width = SPECW;
   } else {
     l.max_seqs = MAXSEQ;
@@ -431,6 +432,7 @@ static int exec_step(gc_handle *h, const gc_step_in *in, gc_step_out *o) {
       }
       if (j + w->want >= w->n_tokens) {
         float lg[VOCAB];
+        if (getenv("GCK_MOCK_CHUNK_SKEW") && w->n_tokens > 1) hh ^= w->n_tokens;   /* a prefill whose result depends on its chunk */
         for (int v = 0; v < VOCAB; v++) lg[v] = rowv(hh, v);
         if (force_nan) lg[0] = NAN;
         if (dev_tok) {
@@ -541,6 +543,7 @@ GC_API int gc_commit(gc_handle *h, uint64_t sid, uint32_t base, const uint32_t *
 }
 
 GC_API int gc_copy_blocks(gc_handle *h, const uint32_t *src, const uint32_t *dst, uint32_t n) {
+  if (h && h->spec && getenv("GCK_MOCK_SPEC_STATE")) return GC_OK;   /* a stream holds its rows per slot: block copies are no-ops */
   if (!h || h->spec) return GC_E_UNSUPPORTED;
   for (uint32_t i = 0; i < n; i++) {
     if (src[i] >= h->nblk || dst[i] >= h->nblk) return fail(h, GC_E_ARG, "block out of pool");
@@ -551,12 +554,23 @@ GC_API int gc_copy_blocks(gc_handle *h, const uint32_t *src, const uint32_t *dst
 }
 
 GC_API int gc_state_save(gc_handle *h, uint64_t sid, uint32_t snap) {
-  (void)sid; (void)snap;
+  (void)sid;
+  if (h && h->spec && getenv("GCK_MOCK_SPEC_STATE") && snap < 2) {
+    memcpy(h->sbuf[snap], h->buf, h->nbuf * 4);
+    h->snb[snap] = h->nbuf;
+    return GC_OK;
+  }
   return h && getenv("GCK_MOCK_BOUNDED") ? GC_OK : GC_E_ARG;
 }
 
 GC_API int gc_state_restore(gc_handle *h, uint32_t snap, uint64_t sid) {
-  (void)sid; (void)snap;
+  (void)sid;
+  if (h && h->spec && getenv("GCK_MOCK_SPEC_STATE") && snap < 2) {
+    memcpy(h->buf, h->sbuf[snap], h->snb[snap] * 4);
+    h->nbuf = h->snb[snap];
+    if (getenv("GCK_MOCK_RESTORE_SKEW") && h->nbuf) h->buf[h->nbuf - 1] ^= 1;   /* a restore that silently corrupts a row */
+    return GC_OK;
+  }
   return h && getenv("GCK_MOCK_BOUNDED") ? GC_OK : GC_E_ARG;
 }
 

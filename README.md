@@ -184,7 +184,10 @@ pack built and signed with one key is re-signed with another without a rebuild. 
 ### `pack check`
 
 Runs, on the visible device, each speculative pair of a signed pack the loader serves (per numerics tier) at temperature 1 with seeds 1, 2
-and 3: a pair passes when each seed samples what its target alone samples and the seeds differ. Records the result per arch in
+and 3: a pair passes when each seed samples what its target alone samples and the seeds differ. It also proves, at invariant numerics,
+that a prompt continues the same prefilled whole and in 16-token chunks, and, for a pair whose bucket declares `spec_caps.state_restore`,
+that a turn restored from its snapshot (after the turn before ran on past it) continues as a cold one. A pair whose bucket declares
+`spec_caps.round_step` has its sampled rounds chained, so the seed check proves those too. Records the result per arch in
 `FILE.check.json`, bound to the manifest's sha256 (a run on another arch's device adds that arch). `index build` lists a paired
 target only on arches with a passing record. Prints `{"pairs", "failures"}`; exit 1 when a pair fails.
 

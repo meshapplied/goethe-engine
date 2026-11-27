@@ -94,29 +94,55 @@ SEEDS = (1, 2, 3)
 
 
 def check(pack, weights, drafter, trusted=None, n=32, sku=None):
-    """{arch, pairs, failures} on this device: each speculative pair the loader serves (per numerics) samples at temperature 1 what its
-    target alone samples, seed by seed, and the seeds differ. O(pairs x seeds x n) steps."""
+    """{arch, pairs, failures} on this device, each a claim the pack makes proved by running it: a speculative pair the loader serves (per
+    numerics) samples at temperature 1 what its target alone samples, seed by seed, and the seeds differ; at invariant numerics a prompt
+    continues the same whole and chunked; a pair that declares state_restore continues a restored turn as a cold one. O(pairs x seeds x n) steps."""
     from .api import Model
     # ponytail: the pairs the loader picks per numerics, not every pair of the arch; check each when a pack serves a pair by policy
     pairs, failures, arch = [], [], None
+    model = lambda d, numerics, **cfg: Model(pack, weights, drafter=d, numerics=numerics, trusted=trusted, sku=sku, config=cfg or None)
+    def runs(mo, prompt, seeds=SEEDS):
+        return [mo.generate([prompt], n, temperature=1.0 if s else 0.0, seed=s)[0] for s in seeds]
+    def prompt(mo, k):   # k varied ids inside the vocabulary and the handle's room for n more tokens
+        return [1 + (i * 131 + 7) % (mo.backend.vocab_size - 2) for i in range(min(k, (mo.backend.max_len - 2 * n) // 2))]
     for numerics in ("invariant", "tolerance"):
-        runs = []
+        found = []
         for d in (drafter, None):
             try:
-                with Model(pack, weights, drafter=d, numerics=numerics, trusted=trusted, sku=sku) as mo:
+                with model(d, numerics) as mo:
                     if d and not mo.backend.spec:
                         break
                     b = mo.backend.bucket
                     try:
-                        runs.append((b["id"], [mo.generate([list(range(1, 9))], n, temperature=1.0, seed=s)[0] for s in SEEDS]))
+                        found.append((b["id"], runs(mo, list(range(1, 9)))))
                     except RuntimeError as e:
-                        runs.append((b["id"], e))
+                        found.append((b["id"], e))
                     arch = b["requires"]["arch"]
+                    if d and mo.backend.caps["state_restore"]:
+                        t1 = prompt(mo, 512)
+                        t2 = t1 + t1[:16]
+                        try:
+                            mo.generate([t1], 2 * n, temperature=0.0)   # turn 1 runs on past its snapshot
+                            warm = runs(mo, t2, (None, 1))
+                            with model(d, numerics, prefix_cache=False) as cold:
+                                ok = warm == runs(cold, t2, (None, 1))
+                        except RuntimeError as e:
+                            ok = False
+                            warm = e
+                        if not ok:
+                            failures.append(f"{b['id']}: a turn restored from its snapshot continues unlike a cold one (state_restore){': ' + str(warm) if isinstance(warm, Exception) else ''}")
             except P.PackError:
                 break                    # the pack serves nothing at these numerics on this device
-        if len(runs) < 2 or runs[0][0] in pairs:
+        if numerics == "invariant" and found:
+            with model(None, numerics, prefix_cache=False, max_num_batched_tokens=4096) as whole:
+                long = prompt(whole, 600)
+                ref = runs(whole, long, (None, 1))
+            with model(None, numerics, prefix_cache=False, max_num_batched_tokens=16) as chunked:
+                if runs(chunked, long, (None, 1)) != ref:
+                    failures.append(f"{found[-1][0]}: a prompt continues differently whole and in 16-token chunks (invariant numerics)")
+        if len(found) < 2 or found[0][0] in pairs:
             continue
-        (t, got), (_, ref) = runs
+        (t, got), (_, ref) = found
         pairs.append(t)
         if isinstance(got, Exception):
             failures.append(f"{t}: a sampled request fails: {got}")

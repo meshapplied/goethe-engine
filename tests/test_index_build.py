@@ -169,3 +169,21 @@ def test_pack_check_passes_a_round_that_samples_and_fails_one_that_ignores_or_re
     p, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True, mutate=alone)
     r = B.check(p, w, dw, trusted=(key.kid,), sku="mock")
     assert r["pairs"] and (not r["failures"]) == ok, r
+
+
+@pytest.mark.parametrize("env,declare,fails", [
+    ({"GCK_MOCK_CHUNK_SKEW": "1"}, False, "16-token chunks"),
+    ({"GCK_MOCK_SPEC_STATE": "1"}, True, None),
+    ({"GCK_MOCK_SPEC_STATE": "1", "GCK_MOCK_RESTORE_SKEW": "1"}, True, "restored"),
+])
+def test_pack_check_proves_a_chunked_prefill_and_a_declared_restore(tmp_path, key, mocklib, monkeypatch, env, declare, fails):
+    for k, v in dict(env, GCK_MOCK_SPEC="sample").items():
+        monkeypatch.setenv(k, v)
+
+    def mutate(m):
+        m["buckets"].append(dict(m["buckets"][0], id="target.mock.K1.2.256", ncol=2, batch=True, io=None))
+        if declare:
+            m["buckets"][0]["spec_caps"] = dict(m["buckets"][0]["spec_caps"], state_restore=True)
+    p, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True, mutate=mutate)
+    f = B.check(p, w, dw, trusted=(key.kid,), sku="mock")["failures"]
+    assert (not f) if fails is None else any(fails in x for x in f), f
