@@ -13,9 +13,9 @@ from toypack import parts, toy_pack
 EXPIRES = "2099-01-01T00:00:00Z"
 
 
-def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaired_target=False, attested=True):
+def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaired_target=False, attested=True, revision=None):
     """A built, signed pack with target q4 (a verify bucket accepting drafts), drafter d and one speculative pair, on arches;
-    unpaired_target adds target q8 with no pair."""
+    unpaired_target adds target q8 with no pair (its source at revision when given)."""
     sp = spec_dir(str(tmp_path / "s"), lib)
     spec = json.load(open(sp))
     spec["skus"] = [dict(spec["skus"][0], sku=s, arch=a, cc=cc) for s, a, cc in arches]
@@ -24,7 +24,8 @@ def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaire
     spec["spec"] = [dict(name="ar", target="K1.8v.256", drafter="K1.1.256", policy=dict(kind="ar", K="3"))]
     if unpaired_target:
         q4 = next(v for v in spec["variants"] if v["id"] == "q4")
-        spec["variants"].append(dict(q4, id="q8", quant="q8_0", files=[q4["files"][0].replace("w.gguf", "w8.gguf")]))
+        spec["variants"].append(dict(q4, id="q8", quant="q8_0", files=[q4["files"][0].replace("w.gguf", "w8.gguf")],
+                                     source=dict(q4["source"], **({} if revision is None else {"revision": revision}))))
         open(os.path.join(tmp_path / "s", spec["variants"][-1]["files"][0]), "wb").write(open(os.path.join(tmp_path / "s", q4["files"][0]), "rb").read() + b"\0")
         spec["buckets"].append(dict(spec["buckets"][0], suffix="8v.256.q8", variant="q8"))
     json.dump(spec, open(sp, "w"))
@@ -116,24 +117,48 @@ def test_pack_sign_writes_a_signature_that_verifies(tmp_path, key, mocklib, caps
 
 
 
-def attest(pack, failures=()):
-    """A pack check record for every arch of the pack, as pack check writes it on each arch's device."""
+def attest(pack, failures=(), arches=None):
+    """A pack check record for each arch of the pack (or those given), as pack check writes it on each arch's device."""
     import hashlib
     raw = P.read_container_v(open(pack, "rb"), os.path.getsize(pack))[3]
     m = json.loads(raw)
-    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]}
+    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]
+           if arches is None or b["requires"]["arch"] in arches}
     open(pack + ".check.json", "w").write(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec)))
 
 
-def test_a_spec_pack_publishes_only_with_a_passing_check_of_its_manifest(tmp_path, key, mocklib):
-    pack, _ = spec_pack(tmp_path, key, mocklib, attested=False)
+def test_a_spec_pack_is_listed_only_on_the_arches_its_check_passed(tmp_path, key, mocklib):
+    pack, _ = spec_pack(tmp_path, key, mocklib, arches=(("a", "sm_120a", "12.0"), ("b", "sm_89", "8.9")), attested=False)
     for fails in (None, ["t: seeds give the same tokens"]):
         if fails:
             attest(pack, fails)
-        with pytest.raises(I.IndexError_, match="no passing pack check"):
+        with pytest.raises(I.IndexError_, match="nothing to list"):
             I.entries(pack, trusted=(key.kid,))
-    attest(pack)
-    assert I.entries(pack, trusted=(key.kid,))
+    attest(pack, arches=("sm_120a",))
+    left = []
+    assert [e["arch"] for e in I.entries(pack, trusted=(key.kid,), left=left)] == ["sm_120a"] and left == ["q4 on sm_89: no passing pack check"]
+
+
+def test_a_variant_whose_source_pins_no_revision_is_left_out(tmp_path, key, mocklib):
+    pack, _ = spec_pack(tmp_path, key, mocklib, unpaired_target=True, revision="")
+    left = []
+    assert [e["model"]["structure"][0]["variant"] for e in I.entries(pack, trusted=(key.kid,), left=left)] == ["q4"]
+    assert left == ["q8: org/toy-GGUF pins no revision"]
+
+
+def test_a_dropped_pack_leaves_the_index_and_a_drop_must_name_one_of_it(tmp_path, key, mocklib):
+    old, _ = spec_pack(tmp_path / "o", key, mocklib)
+    new, _ = spec_pack(tmp_path / "n", key, mocklib)
+    os.rename(new, str(tmp_path / "n" / "new.gcpack"))
+    for ext in (".sig", ".check.json"):
+        os.rename(new + ext, str(tmp_path / "n" / "new.gcpack") + ext)
+    new = str(tmp_path / "n" / "new.gcpack")
+    I.build([old], 9, EXPIRES, key.priv, str(tmp_path / "v9"), trusted=(key.kid,))
+    base = tuple(open(tmp_path / "v9" / n, "rb").read() for n in ("index.json", "index.sig"))
+    ix = I.build([new], 10, EXPIRES, key.priv, str(tmp_path / "v10"), trusted=(key.kid,), base=base, drop=["toy.gcpack"])
+    assert {e["file"] for e in ix["entries"]} == {"new.gcpack"}
+    with pytest.raises(I.IndexError_, match="not in the current index"):
+        I.build([new], 10, EXPIRES, key.priv, str(tmp_path / "v10b"), trusted=(key.kid,), base=base, drop=["nope.gcpack"])
 
 
 @pytest.mark.parametrize("mode,ok", [("sample", True), ("argmax", False), (None, False)])
