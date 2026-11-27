@@ -13,7 +13,7 @@ from toypack import parts, toy_pack
 EXPIRES = "2099-01-01T00:00:00Z"
 
 
-def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaired_target=False):
+def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaired_target=False, attested=True):
     """A built, signed pack with target q4 (a verify bucket accepting drafts), drafter d and one speculative pair, on arches;
     unpaired_target adds target q8 with no pair."""
     sp = spec_dir(str(tmp_path / "s"), lib)
@@ -30,6 +30,8 @@ def spec_pack(tmp_path, key, lib, arches=(("mock", "sm_120a", "12.0"),), unpaire
     json.dump(spec, open(sp, "w"))
     out = str(tmp_path / "toy.gcpack")
     B.build(sp, out, key.priv, cuda="12.8")
+    if attested:
+        attest(out)
     return out, tmp_path / "s"
 
 
@@ -92,7 +94,7 @@ def test_a_pack_not_signed_by_a_trusted_key_is_refused(tmp_path, key, mocklib):
 def test_a_current_index_keeps_its_other_entries_and_the_serial_must_go_up(tmp_path, key, mocklib):
     toy, _ = spec_pack(tmp_path, key, mocklib)
     other = str(tmp_path / "other.gcpack")
-    for ext in ("", ".sig"):
+    for ext in ("", ".sig", ".check.json"):
         shutil.copy(toy + ext, other + ext)
     I.build([other, toy], 9, EXPIRES, key.priv, str(tmp_path / "v9"), trusted=(key.kid,))
     base = tuple(open(tmp_path / "v9" / n, "rb").read() for n in ("index.json", "index.sig"))
@@ -111,3 +113,34 @@ def test_pack_sign_writes_a_signature_that_verifies(tmp_path, key, mocklib, caps
     P.main(["sign", toy, "--key", key.priv])
     assert json.loads(capsys.readouterr().out)["keyid"] == key.kid
     P.verify(toy, trusted=(key.kid,))
+
+
+
+def attest(pack, failures=()):
+    """A pack check record for every arch of the pack, as pack check writes it on each arch's device."""
+    import hashlib
+    raw = P.read_container_v(open(pack, "rb"), os.path.getsize(pack))[3]
+    m = json.loads(raw)
+    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]}
+    open(pack + ".check.json", "w").write(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec)))
+
+
+def test_a_spec_pack_publishes_only_with_a_passing_check_of_its_manifest(tmp_path, key, mocklib):
+    pack, _ = spec_pack(tmp_path, key, mocklib, attested=False)
+    for fails in (None, ["t: seeds give the same tokens"]):
+        if fails:
+            attest(pack, fails)
+        with pytest.raises(I.IndexError_, match="no passing pack check"):
+            I.entries(pack, trusted=(key.kid,))
+    attest(pack)
+    assert I.entries(pack, trusted=(key.kid,))
+
+
+@pytest.mark.parametrize("mode,ok", [("sample", True), ("argmax", False), (None, False)])
+def test_pack_check_passes_a_round_that_samples_and_fails_one_that_ignores_or_refuses_it(tmp_path, key, mocklib, monkeypatch, mode, ok):
+    if mode:
+        monkeypatch.setenv("GCK_MOCK_SPEC", mode)
+    alone = lambda m: m["buckets"].append(dict(m["buckets"][0], id="target.mock.K1.2.256", ncol=2, batch=True, io=None))
+    p, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True, mutate=alone)
+    r = B.check(p, w, dw, trusted=(key.kid,), sku="mock")
+    assert r["pairs"] and (not r["failures"]) == ok, r

@@ -90,6 +90,44 @@ def manifest(spec, base, cuda=None):
     return m, list(blobs.values())
 
 
+SEEDS = (1, 2, 3)
+
+
+def check(pack, weights, drafter, trusted=None, n=32, sku=None):
+    """{arch, pairs, failures} on this device: each speculative pair the loader serves (per numerics) samples at temperature 1 what its
+    target alone samples, seed by seed, and the seeds differ. O(pairs x seeds x n) steps."""
+    from .api import Model
+    # ponytail: the pairs the loader picks per numerics, not every pair of the arch; check each when a pack serves a pair by policy
+    pairs, failures, arch = [], [], None
+    for numerics in ("invariant", "tolerance"):
+        runs = []
+        for d in (drafter, None):
+            try:
+                with Model(pack, weights, drafter=d, numerics=numerics, trusted=trusted, sku=sku) as mo:
+                    if d and not mo.backend.spec:
+                        break
+                    b = mo.backend.bucket
+                    try:
+                        runs.append((b["id"], [mo.generate([list(range(1, 9))], n, temperature=1.0, seed=s)[0] for s in SEEDS]))
+                    except RuntimeError as e:
+                        runs.append((b["id"], e))
+                    arch = b["requires"]["arch"]
+            except P.PackError:
+                break                    # the pack serves nothing at these numerics on this device
+        if len(runs) < 2 or runs[0][0] in pairs:
+            continue
+        (t, got), (_, ref) = runs
+        pairs.append(t)
+        if isinstance(got, Exception):
+            failures.append(f"{t}: a sampled request fails: {got}")
+        elif len({tuple(x) for x in got}) < len(SEEDS):
+            failures.append(f"{t}: seeds {SEEDS} give the same tokens: the round ignores sampling")
+        elif got != ref:
+            failures.append(f"{t}: a seeded sample differs from its target alone's (seed {SEEDS[[g == r for g, r in zip(got, ref)].index(False)]})")
+    P.need(pairs, "this device serves none of the pack's speculative pairs: nothing to check")
+    return dict(arch=arch, pairs=pairs, failures=failures)
+
+
 def build(spec_path, out, key=None, cuda=None, store=None):
     """Build the pack of the spec at spec_path into out (signed with key when given); returns the manifest bytes."""
     spec = json.load(open(spec_path))

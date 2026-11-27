@@ -185,6 +185,7 @@ GC_API int gc_layout_get(gc_handle *h, gc_layout *o) {
   l.flags = GC_L_DEVICE_ARGMAX | (h->spec ? GC_L_SPEC : GC_L_PAGED) |
             (!h->spec && getenv("GCK_MOCK_BOUNDED") ? GC_L_BOUNDED : 0);
 #ifndef GC_MOCK_ABI_12
+  if (h->spec && getenv("GCK_MOCK_SPEC")) l.flags |= GC_L_DEVICE_SAMPLE;
   if (!h->spec) {
     l.flags |= GC_L_DEVICE_SAMPLE | GC_L_DEVICE_BITMASK | GC_L_ASYNC | GC_L_FLAT;
     l.n_graph_buckets = 4;
@@ -238,7 +239,10 @@ static seqent *seq_of(gc_handle *h, uint64_t sid, int make) {
 
 static int spec_step(gc_handle *h, const gc_step_in *in, gc_step_out *o) {
   const gc_work *w = in->work[0];
-  if (in->n_work != 1 || !(w->flags & GC_W_GREEDY)) return fail(h, GC_E_UNSUPPORTED, "spec pack runs one greedy sequence");
+  const char *mode = getenv("GCK_MOCK_SPEC");   /* sample: a seeded draw per row; argmax: ignores GC_W_SAMPLE; unset: refuses it */
+  int samp = (w->flags & GC_W_SAMPLE) && mode && !strcmp(mode, "sample");
+  if (in->n_work != 1 || !((w->flags & GC_W_GREEDY) || ((w->flags & GC_W_SAMPLE) && mode)))
+    return fail(h, GC_E_UNSUPPORTED, "spec pack runs one greedy sequence");
   if (w->pos > h->nbuf || w->pos + w->n_tokens > SPECCTX) return fail(h, GC_E_STATE, "position not contiguous");
   memcpy(h->buf + w->pos, w->tokens, w->n_tokens * 4);
   h->nbuf = w->pos + w->n_tokens;
@@ -253,7 +257,7 @@ static int spec_step(gc_handle *h, const gc_step_in *in, gc_step_out *o) {
   for (uint32_t i = 0; i < k; i++) {
     float lg[VOCAB];
     for (int v = 0; v < VOCAB; v++) lg[v] = rowv(hh, v);
-    int t = argmax_masked(lg, NULL, 0);
+    int t = samp ? sample_row(lg, NULL, 0, w->temperature, w->top_p, w->top_k, w->seed, w->step_idx + i) : argmax_masked(lg, NULL, 0);
     o->tokens[i] = t;
     hh = fold(hh, t, n + i);
   }
