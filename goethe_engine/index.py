@@ -129,7 +129,7 @@ def entries(path, tier="base", min_engine=__version__, trusted=None):
     need(v == 3, f"{path}: pack {v}: this index lists pack 3")
     m = pack.check_manifest(raw)
     sig = json.loads(pack.read_capped(path + ".sig", sign.MAX_SIG))
-    by, out = {b["id"]: b for b in m["buckets"]}, []
+    by, out, ok = {b["id"]: b for b in m["buckets"]}, [], pack.checks(path, hashlib.sha256(raw).hexdigest())
     for vid in sorted({b["variant"] for b in m["buckets"] if b["role"] == "target"}):
         drafters = sorted({by[s["drafter"]]["variant"] for s in m.get("spec", []) if s.get("target") in by and s.get("drafter") in by
                            and by[s["target"]]["variant"] == vid})
@@ -139,6 +139,9 @@ def entries(path, tier="base", min_engine=__version__, trusted=None):
                      **({"with": [dict(role="drafter", variant=d, **{k: x for k, x in source(m, d).items() if k != "format"}) for d in drafters]}
                         if drafters else {}))
         for arch in sorted({b["requires"]["arch"] for b in m["buckets"] if b["variant"] == vid}):
+            c = ok.get(arch)
+            need(not drafters or (c and c["pairs"] and not c["failures"]),
+                 f"{path}: {vid} on {arch}: its speculative pairs have no passing pack check ({c['failures'] if c else 'none'}): run pack check on a {arch} device")
             out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier, file=os.path.basename(path),
                             manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine))
     return out

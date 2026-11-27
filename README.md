@@ -50,6 +50,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 | `pack plan` | what each variant downloads, from a pack's first bytes | 0, 1, 2 |
 | `pack build` | build a pack from a declarative pack spec | 0, 1, 2 |
 | `pack sign` | sign a pack's manifest (writes `PACK.sig`) | 0, 1, 2 |
+| `pack check` | prove on a device that a pack's speculative pairs sample (writes `PACK.check.json`) | 0, 1, 2 |
 
 ### `serve`
 
@@ -178,6 +179,17 @@ pack built and signed with one key is re-signed with another without a rebuild. 
 - `FILE`, `--key PEM` (required)
 
     goethe-engine pack sign model.gcpack --key pack_key.pem
+
+### `pack check`
+
+Runs, on the visible device, each speculative pair of a signed pack the loader serves (per numerics tier) at temperature 1 with seeds 1, 2
+and 3: a pair passes when each seed samples what its target alone samples and the seeds differ. Records the result per arch in
+`FILE.check.json`, bound to the manifest's sha256 (a run on another arch's device adds that arch). `index build` refuses a paired
+target on an arch without a passing record. Prints `{"pairs", "failures"}`; exit 1 when a pair fails.
+
+- `FILE`, `--weights TARGET DRAFTER` (required), `--sku S`
+
+    goethe-engine pack check model.gcpack --weights ./model ./model/mtp.safetensors
 ### Numerics tiers
 
 `--numerics` on `serve`, `pack verify` and `pack need` (default `invariant`). A tier picks the buckets whose measured contract matches.

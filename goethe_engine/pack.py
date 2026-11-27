@@ -495,6 +495,15 @@ def _open_signed(path, sig, domain, trusted):
         raise
 
 
+def checks(path, manifest_sha256):
+    """{arch: {pairs, failures}} of PATH.check.json (pack check) for this manifest; {} when absent or of another manifest."""
+    try:
+        r = json.loads(read_capped(path + ".check.json")) if os.path.lexists(path + ".check.json") else {}
+    except ValueError:
+        return {}
+    return r.get("arches", {}) if isinstance(r, dict) and r.get("manifest_sha256") == manifest_sha256 else {}
+
+
 def sign_pack(path, priv_path, out=None):
     """Write out (default PATH.sig): the signature over sha256(domain + manifest bytes) of the pack at path (its magic fixes the domain);
     returns the signer's key id."""
@@ -1161,10 +1170,14 @@ runs (signature and manifest only: no blob, no weights, no model load) asks whet
 prints {"runs": true|false, "sku": the SKU it would run or null, "device": name, "sms": N, "why": the reason or null}: exit 0 runs, 3 not.
 build reads a pack SPEC (JSON, data only; goethe_engine/build.py) and writes the pack to --out, signed with --key when given; it prints
 {"manifest_sha256", "out", "variants", "buckets"}.
+check runs the signed pack's speculative pairs this device serves with --weights TARGET DRAFTER and records in PACK.check.json, per arch,
+whether each samples at temperature 1 what its target alone samples; index build lists a pack's paired targets only on arches it passed;
+exit 0 passed, 1 failed.
 plan reads a PREFIX file and prints {"manifest_sha256", "variants": [{id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}]}:
 what each variant downloads and whether the visible device runs it (runs null without a visible device); no weights needed.
 """)
-    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build", "sign"))
+    ap.add_argument("cmd", choices=("verify", "show", "need", "runs", "plan", "build", "sign", "check"))
+    ap.add_argument("--weights", nargs="+", help="check: the target model, then its drafter")
     ap.add_argument("file")
     ap.add_argument("--sig")
     ap.add_argument("--store", help="pack 4 blob store directory (default $GOETHE_BLOB_STORE)")
@@ -1210,6 +1223,16 @@ def main(a):
             m = json.loads(raw)
             print(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), out=o.out, variants=sorted(m["variants"]), buckets=len(m["buckets"]))))
             return
+        if o.cmd == "check":
+            from .build import check
+            need(o.weights and len(o.weights) == 2, "check takes --weights TARGET DRAFTER")
+            with open(o.file, "rb") as f:
+                raw = read_container_v(f, os.path.getsize(o.file))[3]
+            r, rec = check(o.file, o.weights[0], o.weights[1], sku=o.sku), checks(o.file, hashlib.sha256(raw).hexdigest())
+            rec[r.pop("arch")] = r
+            _atomic(o.file + ".check.json", [(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec), indent=1, sort_keys=True) + "\n").encode()])
+            print(json.dumps(r))
+            sys.exit(1 if r["failures"] else 0)
         if o.cmd == "sign":
             need(o.key, "sign takes --key")
             print(json.dumps(dict(sig=o.file + ".sig", keyid=sign_pack(o.file, o.key))))
