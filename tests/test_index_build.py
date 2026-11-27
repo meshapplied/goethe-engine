@@ -47,6 +47,10 @@ def test_entries_per_arch_and_target_with_the_drafter_and_the_index_verifies_and
     vix, _ = I.verify(raw, sig, trusted=(key.kid,))
     hit = I.match_dir(vix, str(d), "sm_120a")
     assert hit and hit[0]["variant"] == "q4" and hit[0]["file"] == "toy.gcpack"
+    pl = {x["id"]: x for x in P.plan(P.check_manifest(P._open_signed(pack, None, None, (key.kid,))[4]))}["q4"]
+    assert [(e["max_ctx"], e["lanes"]) for e in vix["entries"]] == [(pl["max_ctx"], pl["lanes"])] * 2, "each entry carries its variant's plan numbers"
+    with pytest.raises(I.IndexError_, match="max_ctx and lanes"):
+        I.validate_entry(dict(vix["entries"][0], lanes=0), 0)
 
 
 def test_a_target_lists_only_the_drafters_paired_with_it(tmp_path, key, mocklib):
