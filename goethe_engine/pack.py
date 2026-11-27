@@ -775,6 +775,11 @@ def usable(m, b):
     return ""
 
 
+def lanes(b):
+    """Streams one step of bucket b serves: its columns for a batch bucket, else one (a verify or single-stream bucket)."""
+    return b["ncol"] if b.get("batch") else 1
+
+
 def spec_pairs(m, *, sku=None, dev=None, contract=None, ctx=None, want=None):
     """[(target, drafter, policy, name)] of the pack's speculative strategies this loader runs for the device or SKU, contract, ctx
     and numerics predicate, in preference order (tolerance first when want.prefer == 'tolerance', else manifest order); name = the
@@ -978,9 +983,11 @@ def pick_variant(m, files, role="target", allow_broken=False):
 
 
 def plan(m, dev=None):
-    """Per variant: {id, role, quant, source, files [{name, bytes}], max_ctx, runs, why}: the files a download of that variant fetches,
-    its longest context, and whether dev (a device record; None: not asked) runs one of its SKUs. Manifest only. O(variants x buckets)."""
+    """Per variant: {id, role, quant, source, files [{name, bytes}], max_ctx, lanes, runs, why}: the files a download of that variant fetches,
+    its longest context, the streams its fastest path serves (its speculative targets' when it has a pair, else its widest batch), and
+    whether dev (a device record; None: not asked) runs one of its SKUs. Manifest only. O(variants x buckets)."""
     roles, lim, out = {b["variant"]: b["role"] for b in m["buckets"]}, ctx_limit(m), []
+    by = {b["id"]: b for b in m["buckets"]}
     for vid in sorted(roles):
         v, bs = m["variants"][vid], [b for b in m["buckets"] if b["variant"] == vid]
         runs = why = None
@@ -992,7 +999,9 @@ def plan(m, dev=None):
                 runs, why = False, str(e)
         out.append(dict(id=vid, role=roles[vid], quant=(v.get("desc") or {}).get("quant"), source=v.get("source"),
                         files=[dict(name=m["model"]["weights"][i]["file"], bytes=m["model"]["weights"][i].get("bytes")) for i in v["weights"]],
-                        max_ctx=min([max(b["maxctx"] for b in bs)] + ([lim[0]] if lim else [])), runs=runs, why=why))
+                        max_ctx=min([max(b["maxctx"] for b in bs)] + ([lim[0]] if lim else [])),
+                        lanes=max([lanes(by[s["target"]]) for s in m.get("spec", []) if by[s["target"]]["variant"] == vid]
+                                  or [lanes(b) for b in bs]), runs=runs, why=why))
     return out
 
 

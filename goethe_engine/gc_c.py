@@ -267,7 +267,7 @@ class GcBackend:
                 why = []
                 for t, d, pol, name in P.spec_pairs(m, sku=sku, dev=dev, contract=contract, ctx=ctx, want=want):
                     try:
-                        P.need(B <= 1, f"the pair serves 1 stream, {B} lanes asked")
+                        P.need(B <= P.lanes(t), f"the pair serves {P.lanes(t)} stream(s), {B} lanes asked")
                         P.fit([t, d], 0, free, None, self.launch_ws + P.overhead(m, t["sku"]), t["id"])
                     except P.PackError as e:
                         why.append(f"{name}: {e}")
