@@ -1,0 +1,67 @@
+# Enforces the bot branch and pull request policy: bot-YYYY-MM-DD from dev, sub-branches from it, pull requests only into dev.
+name: bot-guard
+
+on:
+  create:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bot-guard-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.ref }}
+
+jobs:
+  branch:
+    if: github.event_name == 'create' && github.event.ref_type == 'branch' && github.actor == vars.BOT_LOGIN
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check name, date and ancestry; delete the branch on violation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.event.ref }}
+        run: |
+          set -euo pipefail
+          deny() { echo "::error::$1"; gh api -X DELETE "repos/$REPO/git/refs/heads/$REF"; exit 1; }
+          [[ "$REF" =~ ^bot-([0-9]{4}-[0-9]{2}-[0-9]{2})(/[a-z0-9._-]+)*$ ]] || deny "branch $REF does not match bot-YYYY-MM-DD[/name]"
+          day="${BASH_REMATCH[1]}"
+          root="bot-$day"
+          today=$(date -u +%F); yesterday=$(date -u -d yesterday +%F); tomorrow=$(date -u -d tomorrow +%F)
+          [[ "$day" == "$today" || "$day" == "$yesterday" || "$day" == "$tomorrow" ]] || deny "branch date $day is not today (UTC $today)"
+          if [[ "$REF" == "$root" ]]; then
+            status=$(gh api "repos/$REPO/compare/dev...$REF" --jq .status)
+            [[ "$status" == identical || "$status" == behind ]] || deny "$REF must be created from dev (compare status: $status)"
+          else
+            gh api "repos/$REPO/git/refs/heads/$root" >/dev/null 2>&1 || deny "$REF needs $root to exist first"
+            status=$(gh api "repos/$REPO/compare/$root...$REF" --jq .status)
+            [[ "$status" == identical || "$status" == ahead ]] || deny "$REF must branch from $root (compare status: $status)"
+          fi
+
+  pull-request:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check base, head and files of bot pull requests; close on violation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BOT: ${{ vars.BOT_LOGIN }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          [[ -n "$BOT" ]] || { echo "::error::repository variable BOT_LOGIN is not set"; exit 1; }
+          [[ "$AUTHOR" == "$BOT" ]] || { echo "not a bot pull request"; exit 0; }
+          deny() { echo "::error::$1"; gh pr close "$NUMBER" -R "$REPO" -c "bot-guard: $1"; exit 1; }
+          [[ "$BASE" == dev ]] || deny "bot pull requests may only target dev, not $BASE"
+          [[ "$HEAD_REPO" == "$REPO" ]] || deny "bot pull requests must come from $REPO"
+          [[ "$HEAD" =~ ^bot-[0-9]{4}-[0-9]{2}-[0-9]{2}(/[a-z0-9._-]+)*$ ]] || deny "head branch $HEAD is not a bot branch"
+          if gh api --paginate "repos/$REPO/pulls/$NUMBER/files" --jq '.[].filename' | grep -qE '^\.github/'; then
+            deny "bot pull requests may not change .github/"
+          fi
