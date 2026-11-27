@@ -137,6 +137,9 @@ def test_a_spec_pack_is_listed_only_on_the_arches_its_check_passed(tmp_path, key
     attest(pack, arches=("sm_120a",))
     left = []
     assert [e["arch"] for e in I.entries(pack, trusted=(key.kid,), left=left)] == ["sm_120a"] and left == ["q4 on sm_89: no passing pack check"]
+    assert [(e["arch"], e["tier"]) for e in I.entries(pack, trusted=(key.kid,), untested=True)] == [("sm_120a", "base"), ("sm_89", "untested")]
+    attest(pack, ["t: seeds give the same tokens"], arches=("sm_89",))
+    assert [(e["arch"], e["tier"]) for e in I.entries(pack, trusted=(key.kid,), untested=True)] == [("sm_120a", "untested")], "a failed check is never listed"
 
 
 def test_a_variant_whose_source_pins_no_revision_is_left_out(tmp_path, key, mocklib):

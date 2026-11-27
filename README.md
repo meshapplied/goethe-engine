@@ -94,7 +94,7 @@ only when its sources pin a revision; what is left out is named in the output (`
 formats in one variant, a current index that does not verify, a serial not above it.
 
 - `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--index F --sig F`
-  (the current index), `--drop F` (repeatable, with `--index`), `--tier T` (default base), `--min-engine V` (default this engine's version)
+  (the current index), `--drop F` (repeatable, with `--index`), `--untested` (an arch built but never checked is listed at tier `untested`; one whose check failed never is), `--tier T` (default base), `--min-engine V` (default this engine's version)
 
     goethe-engine index build --pack model.gcpack --serial 9 --expires 2027-03-01T00:00:00Z --key index_key.pem --out site/
 ### `pack match`
