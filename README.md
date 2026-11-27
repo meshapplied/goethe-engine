@@ -89,8 +89,8 @@ Writes `index.json` and `index.sig` into `--out` for the signed packs given with
 `--key`: one entry per (arch, target variant). An entry's `model` is that variant's `source` and files (name, bytes, sha256), its
 `structure` that variant's fingerprint, and `model.with` the drafters its speculative pairs name, each with its own source and files.
 With `--index F --sig F` (the current index) its entries for other pack files are kept, after it verifies, except those of each
-`--drop F` pack, and `--serial` must be above its own. A paired target is listed only on the arches its pack check passed; the others
-are left out and named in the output, and a pack with none is refused. The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two
+`--drop F` pack, and `--serial` must be above its own. A paired target is listed only on the arches its pack check passed, and a variant
+only when its sources pin a revision; what is left out is named in the output (`left_out`), and a pack with nothing to list is refused. The index is verified before anything is written. Exit 1: a pack older than abi minor 2, weights without sha256, files of two
 formats in one variant, a current index that does not verify, a serial not above it.
 
 - `--pack F` (repeatable), `--serial N`, `--expires YYYY-MM-DDTHH:MM:SSZ`, `--key PEM`, `--out DIR` (all required), `--index F --sig F`

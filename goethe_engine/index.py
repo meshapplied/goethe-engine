@@ -123,18 +123,24 @@ def source(m, vid):
 
 def entries(path, tier="base", min_engine=__version__, trusted=None, left=None):
     """The index entries of the pack at path, its signature (PATH.sig) checked against trusted: one per (arch, target variant), the model
-    being that variant's source, with the drafters its speculative pairs name under model.with; a paired target on an arch without a
-    passing pack check is left out (appended to left as (variant, arch)), and a pack left with none is refused. O(variants x buckets)."""
+    being that variant's source, with the drafters its speculative pairs name under model.with. Left out, each named in left: a variant
+    whose sources pin no revision (nothing a client could download), a paired target on an arch without a passing pack check. A pack
+    left with no entry is refused. O(variants x buckets)."""
     f, _, _, size, raw, _, v = pack._open_signed(path, None, None, trusted)
     f.close()
     need(v == 3, f"{path}: pack {v}: this index lists pack 3")
     m = pack.check_manifest(raw)
     sig = json.loads(pack.read_capped(path + ".sig", sign.MAX_SIG))
     by, out, ok = {b["id"]: b for b in m["buckets"]}, [], pack.checks(path, hashlib.sha256(raw).hexdigest())
+    left = [] if left is None else left
     for vid in sorted({b["variant"] for b in m["buckets"] if b["role"] == "target"}):
         drafters = sorted({by[s["drafter"]]["variant"] for s in m.get("spec", []) if s.get("target") in by and s.get("drafter") in by
                            and by[s["target"]]["variant"] == vid})
         src, st = source(m, vid), m["variants"][vid]["structure"]
+        unpinned = [s["hf_repo"] for s in [src] + [source(m, d) for d in drafters] if not s["revision"]]
+        if unpinned:
+            left.append(f"{vid}: {', '.join(unpinned)} pins no revision")
+            continue
         model = dict(hf_repo=src["hf_repo"], revision=src["revision"], format=src["format"], files=src["files"],
                      structure=[dict(variant=vid, sha256=st["sha256"], keys=st["keys"])],
                      **({"with": [dict(role="drafter", variant=d, **{k: x for k, x in source(m, d).items() if k != "format"}) for d in drafters]}
@@ -142,11 +148,11 @@ def entries(path, tier="base", min_engine=__version__, trusted=None, left=None):
         for arch in sorted({b["requires"]["arch"] for b in m["buckets"] if b["variant"] == vid}):
             c = ok.get(arch)
             if drafters and not (c and c["pairs"] and not c["failures"]):
-                (left if left is not None else []).append((vid, arch))
+                left.append(f"{vid} on {arch}: no passing pack check")
                 continue
             out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier, file=os.path.basename(path),
                             manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine))
-    need(out, f"{path}: no target has a passing pack check on any arch: run pack check on a device of one")
+    need(out, f"{path}: nothing to list ({'; '.join(left)}): pin the sources' revisions, or run pack check on a device of an arch")
     return out
 
 
@@ -269,7 +275,7 @@ def main(argv, trusted=None):
             left = []
             ix = build(a.pack, a.serial, a.expires, a.key, a.out, a.tier or "base", a.min_engine, trusted=trusted, base=base, drop=a.drop, left=left)
             print(json.dumps(dict(serial=ix["serial"], expires=ix["expires"], entries=len(ix["entries"]), out=a.out,
-                                  left_out=[f"{v} on {arch}: no passing pack check" for v, arch in left])))
+                                  left_out=left)))
             return 0
         need(a.index and a.sig, f"{a.cmd} needs --index and --sig")
         ix, kid = verify(pack.read_capped(a.index), pack.read_capped(a.sig, sign.MAX_SIG) if os.path.lexists(a.sig) else None,
