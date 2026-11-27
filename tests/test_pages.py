@@ -1,5 +1,7 @@
 """A page pack (window ring, recurrent state: no paged KV) serves many sequences: pages are allocated like KV blocks, a
 preempted sequence recomputes, the prefix cache is whole-page snapshots keyed by the exact tokens they followed."""
+from dataclasses import replace
+
 import pytest
 
 from conftest import FakePages, fake_greedy, run, toks
@@ -191,3 +193,88 @@ def fake_greedy_b(tokens, k):
         h = fold(h, t, len(toks_))
         toks_.append(t)
     return out
+
+
+@pytest.mark.parametrize("kind", ["pages", "bounded"])
+def test_async_chaining_with_snapshots(kind):
+    from conftest import FakeBounded
+
+    class AsyncSnap(FakePages if kind == "pages" else FakeBounded):
+        async_step = True
+
+        def __init__(self):
+            if kind == "pages":
+                super().__init__(seqs=2, spare=3, max_len=120)
+            else:
+                super().__init__(num_blocks=48, bs=4, seqs=2, spare=3)
+            self.q, self.last, self.chained = [], {}, 0
+
+        @property
+        def inflight_sids(self):
+            return {sid for _, s in self.q for sid in s}
+
+        def _run_one(self, work):
+            res = []
+            for w in work:
+                if w.prev_token:
+                    w = replace(w, tokens=[self.last[w.sid]])
+                    self.chained += 1
+                logits = super().step([w])
+                if w.want and w.greedy:
+                    t = int(logits[-1].argmax())
+                    self.last[w.sid] = t
+                    res.append([t])
+                else:
+                    res.append([])
+            return res
+
+        def step_begin(self, work):
+            res = self._run_one(work)
+            sids = {w.sid for w in work}
+            h = (len(self.q), True)
+            self.q.append((res, sids))
+            return h
+
+        def step_wait(self, handle):
+            res, _ = self.q.pop(0)
+            return res
+
+        def copy_blocks(self, pairs):
+            if kind == "pages":
+                assert not self.inflight_sids, "snapshot copy while sequence is inflight"
+            super().copy_blocks(pairs)
+
+        def save_state(self, sid, snap):
+            assert sid not in self.inflight_sids, "save_state while sequence is inflight"
+            super().save_state(sid, snap)
+
+    ref_fn = fake_greedy if kind == "pages" else fake_greedy_b
+    be = AsyncSnap()
+    e = Engine(be, Config(max_model_len=100, max_num_seqs=2))
+    # Prompt len 16 (bs=4 -> tail block 3 shared by snapshot at 15; step at 15->16 hits need > nb with ref > 1).
+    p1 = prompt(16)
+    e.add_request("a", p1, P(max_tokens=8))
+    a = toks(run(e))[("a", 0)]
+    assert a == ref_fn(p1, 8)
+    assert be.chained > 0, "async decode must chain with prefix_cache=True"
+    # Turn 2 resumes from the end-of-turn snapshot taken on reason=='length'.
+    p2 = p1 + a + [4, 5]
+    e.add_request("b", p2, P(max_tokens=6))
+    out = run(e)
+    st = [o for o in out if o.finished][0].stats
+    assert st["cached_tokens"] == len(p1) + len(a) - 1 and toks(out)[("b", 0)] == ref_fn(p2, 6)
+    e.kv.check([])
+
+    # EOS while next step is already inflight must skip snapshot (no race/corruption) and leak no blocks.
+    p3 = prompt(17, 2)
+    full3 = ref_fn(p3, 8)
+    e_eos = Engine(AsyncSnap(), Config(max_model_len=100, max_num_seqs=2), eos_ids={full3[2]})
+    e_eos.add_request("c", p3, P(max_tokens=8))
+    out_c = run(e_eos)
+    assert toks(out_c)[("c", 0)] == full3[:3]
+    assert [o for o in out_c if o.finished][0].finish_reason == "stop"
+    e_eos.kv.check([])
+    p4 = p3 + full3[:3] + [9, 8]
+    e_eos.add_request("d", p4, P(max_tokens=5))
+    assert toks(run(e_eos))[("d", 0)] == ref_fn(p4, 5)
+    e_eos.kv.check([])
