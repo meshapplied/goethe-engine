@@ -151,12 +151,17 @@ class FakeSpec(FakeBackend):
         self.spec_width, self.buf, self.n = width, [], 0
 
     def step(self, work):
-        assert len(work) == 1 and work[0].greedy
+        assert len(work) == 1 and (work[0].greedy or not work[0].spec), "a round takes argmaxes: never a sampled or masked row"
         w, = work
         self.buf = self.buf[:w.pos] + list(w.tokens)
         assert len(self.buf) == w.pos + len(w.tokens)
         if not w.want:
             return [[]]
+        if not w.greedy:
+            h = 7
+            for p, t in enumerate(self.buf):
+                h = fold(h, t, p)
+            return row(h).unsqueeze(0)
         self.n += 1
         k = 1 + self.n % self.spec_width if w.spec else 1
         out = fake_greedy(self.buf, k)

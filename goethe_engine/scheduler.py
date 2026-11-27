@@ -86,9 +86,15 @@ def chunk(s, need, snaps=False):
     return need - 1 if need > 1 and s.nout and strict(s) else need
 
 
+def plain(s):
+    """Greedy and unconstrained: the only request a device round that takes argmaxes serves exactly."""
+    return s.params.temperature == 0 and s.grammar is None
+
+
 class Scheduler:
-    def __init__(self, cfg, kv: KVManager, drafter=None, spec_round=False, vocab=1 << 30):
+    def __init__(self, cfg, kv: KVManager, drafter=None, spec_round=False, vocab=1 << 30, round_sample=False):
         self.cfg, self.kv, self.drafter, self.spec_round, self.vocab = cfg, kv, drafter, spec_round, vocab
+        self.round_sample = round_sample
         self.waiting, self.running = [], []
         self.preemptions = 0
 
@@ -172,7 +178,7 @@ class Scheduler:
                 continue
             if pairs:
                 copies += pairs
-            items.append(Item(s, n, t, spec_round and need == 1))
+            items.append(Item(s, n, t, spec_round and need == 1 and (self.round_sample or plain(s))))
             budget -= n
             i += 1
         if preempted or not self.waiting:

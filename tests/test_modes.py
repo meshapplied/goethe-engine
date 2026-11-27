@@ -49,6 +49,16 @@ def test_spec_round_backend_tokens_equal_greedy_and_truncate_at_stops(width):
     assert len(toks(run(e))[("l", 0)]) == 5
 
 
+def test_a_device_round_that_takes_argmaxes_serves_greedy_requests_only():
+    sp = P(temperature=1.0, seed=5, max_tokens=12)
+    e = Engine(FakeSpec(4), Config(max_model_len=150))
+    e.add_request("s", prompt(7), sp)
+    e.add_request("g", prompt(5), P(max_tokens=12))
+    got = toks(run(e))
+    assert got[("s", 0)] == alone(prompt(7), sp)[("r", 0)] != fake_greedy(prompt(7), 12)
+    assert got[("g", 0)] == fake_greedy(prompt(5), 12) and e.metrics()["spec_accepted"] > 0
+
+
 def test_linear_stream_backend_config_is_checked():
     for cfg in (Config(max_num_seqs=2, prefix_cache=False, max_model_len=100), Config(max_num_seqs=1, prefix_cache=True, max_model_len=100)):
         with pytest.raises(ValueError):

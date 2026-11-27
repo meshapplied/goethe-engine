@@ -11,7 +11,7 @@ def caps_of_bucket(b, spec=None):
              recurrent=("tree" if "tree" in rc else "chain" if "chain" in rc else rc[0] if rc else None),
              drafters=sc.get("drafter_roles", []))
     if spec:
-        c.update(round=spec["kind"], verify=max(sc.get("verify_widths") or [b["ncol"]]), logits=False)
+        c.update(round=spec["kind"], verify=max(sc.get("verify_widths") or [b["ncol"]]), logits=False, round_sample=sc.get("round_sample") is True)
     return c
 
 

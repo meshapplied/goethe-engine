@@ -1,6 +1,7 @@
 """The engine: add_request / abort / step, token level. Sampling, stop rules, grammar masks and speculative
 acceptance live here; scheduling in scheduler.py, KV bookkeeping in kv.py, GPU work behind Backend."""
 import random
+import sys
 from collections import deque
 from dataclasses import dataclass, field, replace
 
@@ -62,7 +63,10 @@ class Engine:
                 at[k], off = range(off, off + n), off + n
             self.cols = np.array([c for k in need for c in at[k]])
         self.kv = KVManager(g.num_blocks, g.block_size, cfg.prefix_cache, pages, bounded)
-        self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size)
+        self.sched = Scheduler(cfg, self.kv, drafter, bool(self.width), backend.vocab_size, self.caps["round_sample"])
+        if self.width and not self.caps["round_sample"]:
+            print("goethe-engine: speculative decoding serves greedy requests only: this pack's device round takes argmaxes "
+                  "(sampled and structured requests decode one token per step)", file=sys.stderr, flush=True)
         self.inbox, self.live, self.counter = deque(), {}, 0
         self.m = dict(steps=0, prompt_tokens=0, generation_tokens=0, prefix_hit_tokens=0, aborted=0, errors=0,
                       spec_drafted=0, spec_accepted=0, spec_invalid=0, spec_rounds=0)

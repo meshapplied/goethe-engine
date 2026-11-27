@@ -222,11 +222,12 @@ class TreeDrafter:
 
 # --- capabilities ---------------------------------------------------------------------------------------------------
 
-CAPS = dict(verify=None, tree=False, taps={}, recurrent=None, logits=True, round=None, drafters=None)
+CAPS = dict(verify=None, tree=False, taps={}, recurrent=None, logits=True, round=None, drafters=None, round_sample=False)
 # verify: most tokens one verify item may carry (None: any); tree: ancestor-mask verify; taps: target features
 # exported per row {name: width}; recurrent: None | "chain" (rolls back along a chain) | "tree" (state per node);
 # "step" (advances every step, no rollback); logits: host logits for sampled rows; round: device policy of a backend
-# that drafts and verifies on its own; drafters: drafter kinds a pack carries (None: drafters are host objects)
+# that drafts and verifies on its own; drafters: drafter kinds a pack carries (None: drafters are host objects);
+# round_sample: the device round samples and masks (spec_caps.round_sample); without it the round serves greedy requests only
 
 # algorithm -> what it needs; "layers": n distinct l_out taps (EAGLE-3: low, mid, high); drafter: the pack role kind
 ALGOS = {
