@@ -219,22 +219,25 @@ class _Chars:
         return "".join(chr(i) for i in ids if i < 1000)
 
 
-FMT = dict(head=1001, end=1002, parts={1003: "reasoning", 1004: "content", 1005: "tool"})
+FMT = dict(parts={1001: ("head", None), 1003: ("reasoning", 1002), 1004: ("content", 1002), 1005: ("tool", 1002)}, args="args")
+PAIRS = dict(parts={1006: ("reasoning", 1007), 1008: ("tool", 1009)}, args="arguments")     # open/close pairs, text between is content
 _s = lambda x: [ord(c) for c in x]
 
 
-@pytest.mark.parametrize("ids,want", [
-    ([1001, 1003, *_s("hm"), 1002, 1001, 1004, *_s("hi"), 1002], [("reasoning", "hm"), ("content", "hi")]),
-    ([1001, *_s("f"), 1005, *_s('{"name":"f","args":{"a":1}}'), 1002], [("tool", {"name": "f", "arguments": '{"a": 1}'})]),
-    ([1001, 1005, *_s('{"args":1}'), 1002], [("content", '{"args":1}')]),        # not a call: kept as text, never dropped
-    (_s("no markers"), [("content", "no markers")]),
+@pytest.mark.parametrize("fmt,ids,want", [
+    (FMT, [1001, 1003, *_s("hm"), 1002, 1001, 1004, *_s("hi"), 1002], [("reasoning", "hm"), ("content", "hi")]),
+    (FMT, [1001, *_s("f"), 1005, *_s('{"name":"f","args":{"a":1}}'), 1002], [("tool", {"name": "f", "arguments": '{"a": 1}'})]),
+    (FMT, [1001, 1005, *_s('{"args":1}'), 1002], [("content", '{"args":1}')]),        # not a call: kept as text, never dropped
+    (FMT, _s("no markers"), [("content", "no markers")]),
+    (PAIRS, [1006, *_s("hm"), 1007, *_s("ok "), 1008, *_s('{"name":"g","arguments":{}}'), 1009],
+     [("reasoning", "hm"), ("content", "ok "), ("tool", {"name": "g", "arguments": "{}"})]),
 ])
-def test_a_turn_reads_reasoning_content_and_whole_tool_calls_alike_streamed_or_not(ids, want):
+def test_a_turn_reads_reasoning_content_and_whole_tool_calls_alike_streamed_or_not(fmt, ids, want):
     from goethe_engine.tokenizer import Turn
     join = lambda ps: [(k, "".join(v for _, v in g)) if k != "tool" else (k, next(g)[1])
                        for k, g in __import__("itertools").groupby(ps, key=lambda p: p[0])]
-    t = Turn(_Chars(), FMT)
-    assert join(Turn(_Chars(), FMT).feed(ids, True)) == join(sum((t.feed([i]) for i in ids), []) + t.feed([], True)) == want
+    t = Turn(_Chars(), fmt)
+    assert join(Turn(_Chars(), fmt).feed(ids, True)) == join(sum((t.feed([i]) for i in ids), []) + t.feed([], True)) == want
 
 
 def test_a_choice_stops_on_content_only_and_keeps_one_call_when_asked():

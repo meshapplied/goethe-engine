@@ -3,9 +3,10 @@ wraps a Hugging Face tokenizer directory through transformers (optional dependen
 import json
 import os
 
-# Turn formats, one row per model family: a vocabulary holding a row's markers as single tokens reads its output by that row.
-TURNS = (dict(head="<|message_model|>", end="<|end_message|>",
-              parts={"<|content_thinking|>": "reasoning", "<|content_text|>": "content", "<|content_invoke_tool_json|>": "tool"}),)
+# Turn formats, one row per model family: opening marker -> (part, closing marker; None: until the next marker), and the call's arguments
+# key. A vocabulary holding a row's markers as single tokens reads its output by that row; text outside every part is content.
+TURNS = (dict(parts={"<|message_model|>": ("head", None), "<|content_thinking|>": ("reasoning", "<|end_message|>"),
+                     "<|content_text|>": ("content", "<|end_message|>"), "<|content_invoke_tool_json|>": ("tool", "<|end_message|>")}, args="args"),)
 
 
 class ByteTokenizer:
@@ -51,10 +52,9 @@ class HFTokenizer:
         # A generation ends on the tokenizer's eos and on every stop id the model declares.
         ids = ([] if e is None else [e]) + model_stop_ids(path)
         self.vocab_size, self.eos_ids = len(self.t), tuple(dict.fromkeys(ids))
-        tid = {s: self.t.convert_tokens_to_ids(s) for r in TURNS for s in (r["head"], r["end"], *r["parts"])}
-        ok = lambda s: isinstance(tid[s], int) and tid[s] != self.t.unk_token_id
-        self.turn = next((dict(head=tid[r["head"]], end=tid[r["end"]], parts={tid[k]: v for k, v in r["parts"].items()})
-                          for r in TURNS if all(map(ok, (r["head"], r["end"], *r["parts"])))), None)
+        tid = lambda s: self.t.convert_tokens_to_ids(s)
+        ok = lambda r: all(isinstance(tid(s), int) and tid(s) != self.t.unk_token_id for o, (_, c) in r["parts"].items() for s in (o, c) if s)
+        self.turn = next((dict(parts={tid(o): (k, c and tid(c)) for o, (k, c) in r["parts"].items()}, args=r["args"]) for r in TURNS if ok(r)), None)
 
     def encode(self, text):
         return self.t.encode(text, add_special_tokens=False)
@@ -103,44 +103,37 @@ class Turn:
     """Turn ids as (reasoning | content, text) pieces and whole (tool, call) parts; a call that does not parse stays content. O(1) per id."""
 
     def __init__(self, tok, fmt=None):
-        self.tok, self.fmt = tok, fmt
-        self._reset()
+        self.tok, self.parts, self.args = tok, (fmt or {}).get("parts", {}), (fmt or {}).get("args")
+        self._open(None, None)
 
-    def _reset(self):
-        self.kind, self.head, self.ts, self.call = None if self.fmt else "content", [], TextStream(self.tok), ""
+    def _open(self, kind, close):
+        self.kind, self.close, self.ts, self.call = kind, close, TextStream(self.tok), ""
 
     def feed(self, ids, final=False):
-        out, f = [], self.fmt
+        out = []
         for t in ids:
-            if f and (t == f["head"] or t == f["end"] or t in f["parts"]):
-                if t in f["parts"] and self.kind is None:
-                    self.head = []
-                self._close(out)
-                self.kind = f["parts"].get(t)
-            elif self.kind is None:
-                self.head.append(t)
+            if t in self.parts or (t == self.close and t is not None):
+                self._end(out)
+                self._open(*self.parts.get(t, (None, None)))
             else:
                 self._put(out, self.ts.feed([t]))
         if final:
-            self._close(out)
+            self._end(out)
         return [p for p in out if p[1]]
 
     def _put(self, out, s):
         if self.kind == "tool":
             self.call += s
-        else:
-            out.append((self.kind, s))
+        elif self.kind != "head":
+            out.append((self.kind or "content", s))
 
-    def _close(self, out):
-        if self.kind is None:
-            out.append(("content", self.tok.decode(self.head)))
-        else:
-            self._put(out, self.ts.flush())
+    def _end(self, out):
+        self._put(out, self.ts.flush())
         if self.kind == "tool":
             try:
                 j = json.loads(self.call)
-                ok = isinstance(j, dict) and isinstance(j.get("name"), str) and isinstance(j.get("args", {}), dict)
+                ok = isinstance(j, dict) and isinstance(j.get("name"), str) and isinstance(j.get(self.args, {}), dict)
             except ValueError:
                 ok = False
-            out.append(("tool", dict(name=j["name"], arguments=json.dumps(j.get("args", {}), ensure_ascii=False))) if ok else ("content", self.call))
-        self._reset()
+            out.append(("tool", dict(name=j["name"], arguments=json.dumps(j.get(self.args, {}), ensure_ascii=False))) if ok else ("content", self.call))
+        self._open(None, None)
