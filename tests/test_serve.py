@@ -263,3 +263,10 @@ def test_tools_are_refused_where_the_engine_cannot_read_calls_back(srv):
                        ("/v1/completions", dict(prompt="x", tools=[tool]))):
         st, j = call(base, path, body)
         assert st == 400 and j["error"]["code"] == "unsupported_parameter", (body, j)
+
+
+def test_turn_reports_the_parts_of_the_models_turn_format(monkeypatch):
+    from goethe_engine import cli, tokenizer
+    for fmt, want in ((FMT, dict(reasoning=True, tools=True)), (dict(parts={1004: ("content", 1002)}, args="args"), dict(reasoning=False, tools=False)), (None, dict(reasoning=False, tools=False))):
+        monkeypatch.setattr(tokenizer, "HFTokenizer", lambda d, fmt=fmt: type("T", (), dict(turn=fmt))())
+        assert cli.turn("x") == want

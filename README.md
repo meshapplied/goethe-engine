@@ -40,6 +40,7 @@ ABI and the GPU before it loads anything, and refuses the pack if any check fail
 |---|---|---|
 | `serve` | OpenAI-compatible server for a pack and its weights | 0, 1, 2 |
 | `worker` | worker protocol v1 over a unix socket | 0, 2 |
+| `turn` | what a model's turn holds (reasoning, tool calls), by its turn format | 0, 1, 2 |
 | `index verify` | check a signed pack index | 0, 1, 2 |
 | `index build` | write and sign a pack index from signed packs | 0, 1, 2 |
 | `pack match` | pick the pack for a model directory from an index | 0, 1, 2, 3 |
@@ -72,6 +73,15 @@ Worker protocol v1 (`goethe_engine/spec/proto/worker.proto`). Needs `[worker]`.
 - `--socket PATH` (required), `--device N` (default 0)
 
     goethe-engine worker --socket /tmp/ge.sock
+
+### `turn`
+
+Prints `{"reasoning", "tools"}` for a Hugging Face tokenizer directory: whether the turn format the engine reads the model's output by
+(one row per model family) has a reasoning part and a tool-call part; both false when no row matches its vocabulary. Needs `[serve]`.
+
+- `DIR` (required)
+
+    goethe-engine turn ./model
 
 ### `index verify`
 
