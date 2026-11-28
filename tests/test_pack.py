@@ -30,6 +30,17 @@ def test_other_majors_refused_newer_minor_read():
         P.validate(dict(schema=P.SCHEMA, abi="3.7.0"))  # a newer minor parses; this one lacks its fields
 
 
+@pytest.mark.parametrize("abi", ["3.0.0", "3.1.0", "3.2.0"])
+def test_every_published_abi_minor_still_loads(tmp_path, key, mocklib, abi):
+    """Each ABI 3 minor a published pack uses (a new published minor is added here); a reader that stops loading one fails."""
+    def fields(m):
+        m["model"]["name"] = "toy"
+        for v in m["variants"].values():
+            v.update(desc=dict(quant="q4_0"), source=dict(hf_repo="org/toy", revision="0" * 40))
+    pack, _, _ = toy_pack(str(tmp_path), key, mocklib, abi=abi, mutate=fields)
+    assert P.verify(pack, trusted=(key.kid,))["abi"] == abi
+
+
 # --- fail-closed load: signature, key, hashes, ABI, arch, runtime
 
 def test_toy_pack_loads_and_verifies(toy, key):

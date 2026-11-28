@@ -83,6 +83,7 @@ def validate_entry(e, i):
     need(isinstance(e.get("sig"), dict) and e["sig"].get("schema") == sign.SCHEMA, f"{w}: sig is not a gc-sig-1 object")
     need(isinstance(e.get("size"), int) and e["size"] >= 0, f"{w}: size")
     vtuple(e.get("min_engine"), f"{w}: min_engine")
+    need(all(e.get(k) is None or (isinstance(e[k], int) and e[k] >= 1) for k in ("max_ctx", "lanes")), f"{w}: max_ctx and lanes are integers >= 1")
 
 
 def verify(raw, sig, last_serial=0, now=None, trusted=None):
@@ -125,13 +126,15 @@ def entries(path, tier="base", min_engine=__version__, trusted=None, left=None, 
     """The index entries of the pack at path, its signature (PATH.sig) checked against trusted: one per (arch, target variant), the model
     being that variant's source, with the drafters its speculative pairs name under model.with. Left out, each named in left: a variant
     whose sources pin no revision (nothing a client could download), a paired target on an arch without a passing pack check (with
-    untested, listed at tier "untested" instead, so a client can say so). A pack left with no entry is refused. O(variants x buckets)."""
+    untested, listed at tier "untested" instead, so a client can say so). Each entry carries its variant's max_ctx and lanes (pack plan), so a
+    client sizes the model before it downloads the pack. A pack left with no entry is refused. O(variants x buckets)."""
     f, _, _, size, raw, _, v = pack._open_signed(path, None, None, trusted)
     f.close()
     need(v == 3, f"{path}: pack {v}: this index lists pack 3")
     m = pack.check_manifest(raw)
     sig = json.loads(pack.read_capped(path + ".sig", sign.MAX_SIG))
     by, out, ok = {b["id"]: b for b in m["buckets"]}, [], pack.checks(path, hashlib.sha256(raw).hexdigest())
+    plan = {x["id"]: x for x in pack.plan(m)}
     left = [] if left is None else left
     for vid in sorted({b["variant"] for b in m["buckets"] if b["role"] == "target"}):
         drafters = sorted({by[s["drafter"]]["variant"] for s in m.get("spec", []) if s.get("target") in by and s.get("drafter") in by
@@ -151,8 +154,12 @@ def entries(path, tier="base", min_engine=__version__, trusted=None, left=None, 
             if not checked and (not untested or (c and c["failures"])):   # a failed check is never listed
                 left.append(f"{vid} on {arch}: no passing pack check")
                 continue
+            if c and c.get("engine"):   # a pack runs on the engine that checked it; an older one is a claim nothing proved
+                need(vtuple(min_engine, "--min-engine") >= vtuple(c["engine"], "pack check engine"),
+                     f"{path}: --min-engine {min_engine} is below goethe-engine {c['engine']}, which ran its pack check on {arch}")
             out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier if checked else "untested", file=os.path.basename(path),
-                            manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine))
+                            manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine,
+                            max_ctx=plan[vid]["max_ctx"], lanes=plan[vid]["lanes"]))
     need(out, f"{path}: nothing to list ({'; '.join(left)}): pin the sources' revisions, or run pack check on a device of an arch")
     return out
 

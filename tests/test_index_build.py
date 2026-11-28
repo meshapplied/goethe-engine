@@ -47,6 +47,10 @@ def test_entries_per_arch_and_target_with_the_drafter_and_the_index_verifies_and
     vix, _ = I.verify(raw, sig, trusted=(key.kid,))
     hit = I.match_dir(vix, str(d), "sm_120a")
     assert hit and hit[0]["variant"] == "q4" and hit[0]["file"] == "toy.gcpack"
+    pl = {x["id"]: x for x in P.plan(P.check_manifest(P._open_signed(pack, None, None, (key.kid,))[4]))}["q4"]
+    assert [(e["max_ctx"], e["lanes"]) for e in vix["entries"]] == [(pl["max_ctx"], pl["lanes"])] * 2, "each entry carries its variant's plan numbers"
+    with pytest.raises(I.IndexError_, match="max_ctx and lanes"):
+        I.validate_entry(dict(vix["entries"][0], lanes=0), 0)
 
 
 def test_a_target_lists_only_the_drafters_paired_with_it(tmp_path, key, mocklib):
@@ -117,13 +121,14 @@ def test_pack_sign_writes_a_signature_that_verifies(tmp_path, key, mocklib, caps
 
 
 
-def attest(pack, failures=(), arches=None):
-    """A pack check record for each arch of the pack (or those given), as pack check writes it on each arch's device."""
+def attest(pack, failures=(), arches=None, engine=None):
+    """A pack check record for each arch of the pack (or those given), as pack check writes it on each arch's device (engine: the
+    goethe-engine that ran it; records from before 0.3.12 name none)."""
     import hashlib
     raw = P.read_container_v(open(pack, "rb"), os.path.getsize(pack))[3]
     m = json.loads(raw)
-    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures)) for b in m["buckets"]
-           if arches is None or b["requires"]["arch"] in arches}
+    rec = {b["requires"]["arch"]: dict(pairs=[s["target"] for s in m["spec"]], failures=list(failures), **({"engine": engine} if engine else {}))
+           for b in m["buckets"] if arches is None or b["requires"]["arch"] in arches}
     open(pack + ".check.json", "w").write(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec)))
 
 
@@ -140,6 +145,26 @@ def test_a_spec_pack_is_listed_only_on_the_arches_its_check_passed(tmp_path, key
     assert [(e["arch"], e["tier"]) for e in I.entries(pack, trusted=(key.kid,), untested=True)] == [("sm_120a", "base"), ("sm_89", "untested")]
     attest(pack, ["t: seeds give the same tokens"], arches=("sm_89",))
     assert [(e["arch"], e["tier"]) for e in I.entries(pack, trusted=(key.kid,), untested=True)] == [("sm_120a", "untested")], "a failed check is never listed"
+
+
+def test_min_engine_is_never_below_the_engine_that_ran_the_pack_check(tmp_path, key, mocklib):
+    pack, _ = spec_pack(tmp_path, key, mocklib, attested=False)
+    attest(pack, engine="0.3.12")
+    with pytest.raises(I.IndexError_, match="below goethe-engine 0.3.12, which ran its pack check on sm_120a"):
+        I.entries(pack, trusted=(key.kid,), min_engine="0.3.11")
+    assert {e["min_engine"] for e in I.entries(pack, trusted=(key.kid,), min_engine="0.3.12")} == {"0.3.12"}
+    attest(pack)
+    assert {e["min_engine"] for e in I.entries(pack, trusted=(key.kid,), min_engine="0.3.0")} == {"0.3.0"}, "a record naming no engine leaves the flag"
+
+
+def test_pack_check_records_the_engine_that_ran_it(tmp_path, key, mocklib, monkeypatch):
+    from goethe_engine import __version__
+    pack, w, dw = toy_pack(str(tmp_path), key, mocklib, spec=True)
+    monkeypatch.setattr(B, "check", lambda *a, **k: dict(arch="sm_120a", pairs=["t"], failures=[]))
+    with pytest.raises(SystemExit) as done:
+        P.main(["check", pack, "--weights", w, dw])
+    assert done.value.code == 0
+    assert json.load(open(pack + ".check.json"))["arches"]["sm_120a"] == dict(pairs=["t"], failures=[], engine=__version__)
 
 
 def test_a_variant_whose_source_pins_no_revision_is_left_out(tmp_path, key, mocklib):

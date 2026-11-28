@@ -1229,7 +1229,9 @@ def main(a):
             with open(o.file, "rb") as f:
                 raw = read_container_v(f, os.path.getsize(o.file))[3]
             r, rec = check(o.file, o.weights[0], o.weights[1], sku=o.sku), checks(o.file, hashlib.sha256(raw).hexdigest())
-            rec[r.pop("arch")] = r
+            from . import __version__
+            arch = r.pop("arch")
+            rec[arch] = dict(r, engine=__version__)
             _atomic(o.file + ".check.json", [(json.dumps(dict(manifest_sha256=hashlib.sha256(raw).hexdigest(), arches=rec), indent=1, sort_keys=True) + "\n").encode()])
             print(json.dumps(r))
             sys.exit(1 if r["failures"] else 0)
