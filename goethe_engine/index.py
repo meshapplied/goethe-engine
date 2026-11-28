@@ -154,6 +154,9 @@ def entries(path, tier="base", min_engine=__version__, trusted=None, left=None, 
             if not checked and (not untested or (c and c["failures"])):   # a failed check is never listed
                 left.append(f"{vid} on {arch}: no passing pack check")
                 continue
+            if c and c.get("engine"):   # a pack runs on the engine that checked it; an older one is a claim nothing proved
+                need(vtuple(min_engine, "--min-engine") >= vtuple(c["engine"], "pack check engine"),
+                     f"{path}: --min-engine {min_engine} is below goethe-engine {c['engine']}, which ran its pack check on {arch}")
             out.append(dict(model=model, arch=arch, abi_major=3, runtime=m["runtime"], tier=tier if checked else "untested", file=os.path.basename(path),
                             manifest_sha256=hashlib.sha256(raw).hexdigest(), sig=sig, size=size, min_engine=min_engine,
                             max_ctx=plan[vid]["max_ctx"], lanes=plan[vid]["lanes"]))
